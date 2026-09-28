@@ -46,7 +46,7 @@ export default function Home() {
           <h1 className="display h1">
             Permanent capital.
             <br />
-            Firm commitments.
+            <em>Firm</em> commitments.
           </h1>
           <p className="lede">
             The $PENIS Endowment holds $PENIS forever and spends only the PUMP it earns, on buybacks, liquidity and
@@ -66,6 +66,7 @@ export default function Home() {
         <section id="how" className="row">
           <h2 className="row-label">How it works</h2>
           <div className="row-body">
+            <h3 className="statement">Landlords lend their rent. The endowment keeps the building.</h3>
             <p>
               The largest holders, the landlords, lend the endowment their PUMP rewards. The endowment turns that
               income into $PENIS it can never sell.
@@ -90,10 +91,22 @@ export default function Home() {
         <section className="row">
           <h2 className="row-label">How it spends</h2>
           <div className="row-body">
+            <h3 className="statement">It reads the market, then spends.</h3>
             <p>
-              Each day it reads two numbers on-chain: how deep the trading pool is, and how much PUMP it earned, which
-              tracks volume. It splits the day&rsquo;s income by fixed, public rules.
+              First it accumulates. Once it holds a fifth of all $PENIS, it becomes a thermostat: each day it reads how
+              deep the trading pool is and how much PUMP it earned, which tracks volume, and splits the day&rsquo;s
+              income by fixed, public rules.
             </p>
+            <div className="figures">
+              <div className="figure">
+                <span className="figure-value">200,000,000</span>
+                <span className="figure-label">$PENIS to accumulate first</span>
+              </div>
+              <div className="figure">
+                <span className="figure-value">20%</span>
+                <span className="figure-label">of all $PENIS, held forever</span>
+              </div>
+            </div>
             <table className="table">
               <thead>
                 <tr>
@@ -123,6 +136,7 @@ export default function Home() {
         <section className="row">
           <h2 className="row-label">Guarantees</h2>
           <div className="row-body">
+            <h3 className="statement">Written into the contract, not promised in a thread.</h3>
             <ul className="plain-list">
               <li>
                 <strong>It never sells</strong>
@@ -147,9 +161,19 @@ export default function Home() {
           </div>
         </section>
 
+        <section className="band">
+          <blockquote>
+            Trading creates rent. <span>Rent keeps supply off the market.</span>
+          </blockquote>
+          <Link href="/thesis" className="muted">
+            Read the landlord thesis
+          </Link>
+        </section>
+
         <section id="coin" className="row">
           <h2 className="row-label">The coin</h2>
           <div className="row-body">
+            <h3 className="statement">$PENIS pays rent in PUMP.</h3>
             <p>
               $PENIS is a meme coin on Solana, launched on stonk.fun. Every trade pays a fee, and holders receive it as
               PUMP. It is the oldest joke there is with the best possible ticker, and a penis that pays you in PUMP.
@@ -187,6 +211,7 @@ export default function Home() {
         <section id="status" className="row">
           <h2 className="row-label">Status</h2>
           <div className="row-body">
+            <h3 className="statement">Built, tested, and waiting on the landlords.</h3>
             <p>
               The contract is written and tested. Delegation opens once the landlords agree on the final rules,
               starting with the founding landlords and small caps. The leaderboard and the full ledger go live the same
