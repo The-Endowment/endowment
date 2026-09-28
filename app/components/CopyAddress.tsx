@@ -16,17 +16,11 @@ export function CopyAddress({ address }: { address: string }) {
   }
 
   return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+    <>
       <span className="address">{address}</span>
-      <button
-        type="button"
-        onClick={copy}
-        className="chip"
-        style={{ cursor: "pointer", background: "transparent", minHeight: 32 }}
-        aria-label="Copy the $PENIS mint address"
-      >
+      <button type="button" onClick={copy} className="copy" aria-label="Copy the $PENIS mint address">
         {copied ? "Copied" : "Copy"}
       </button>
-    </span>
+    </>
   );
 }
