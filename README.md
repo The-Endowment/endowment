@@ -25,7 +25,7 @@ The endowment's own $PENIS earns PUMP dividends too. They land directly in the P
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Opt-in, sweeps, pause, permanent vaults | ✅ Built and tested locally |
-| 1 | Buybacks (PUMP → $PENIS via PumpSwap) | In progress |
+| 1 | Buybacks (PUMP → $PENIS in the Raydium PENIS/PUMP pool) | In progress |
 | 2 | Web app: delegate/revoke, dashboard, leaderboard, ledger | Planned |
 | 3 | Thermostat: liquidity adds, marketing stream, timelocked parameters | Planned (after an external audit) |
 
