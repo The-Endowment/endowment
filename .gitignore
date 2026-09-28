@@ -1,0 +1,7 @@
+.vercel
+.DS_Store
+node_modules/
+target/
+.anchor/
+.env*
+*.keypair.json
