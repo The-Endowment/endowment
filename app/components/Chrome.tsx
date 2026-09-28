@@ -28,7 +28,7 @@ export function SiteFooter() {
   return (
     <footer className="site-footer">
       <div className="wrap footer-inner">
-        <span>Independent of the coin&rsquo;s creators. Not financial advice. Not yet audited.</span>
+        <span>Independent of the coin&rsquo;s creators. Not financial advice.</span>
         <span className="footer-links">
           <a href={links.x}>X</a>
           <a href={links.github}>Source code</a>

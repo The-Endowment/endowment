@@ -4,10 +4,10 @@ import { DotLogo } from "@/components/Logo";
 import { links, PENIS_MINT } from "@/lib/site";
 
 const splits = [
-  { condition: "Until it holds 20% of supply", buyback: "95%", liquidity: "0%", marketing: "up to 5%", current: true },
-  { condition: "Healthy market", buyback: "85%", liquidity: "10%", marketing: "5%" },
-  { condition: "Pool too thin", buyback: "40%", liquidity: "50%", marketing: "10%" },
-  { condition: "Volume falling", buyback: "60%", liquidity: "10%", marketing: "30%" },
+  { condition: "Accumulating to 20% of supply", buyback: "95%", liquidity: "0%", marketing: "up to 5%", current: true },
+  { condition: "Steady state", buyback: "85%", liquidity: "10%", marketing: "5%" },
+  { condition: "Deepening liquidity", buyback: "40%", liquidity: "50%", marketing: "10%" },
+  { condition: "Boosting volume", buyback: "60%", liquidity: "10%", marketing: "30%" },
 ];
 
 const faqs = [
@@ -21,15 +21,15 @@ const faqs = [
   },
   {
     q: "Can I leave?",
-    a: "Yes, anytime. Revoke the delegation from any Solana wallet. It's a standard token instruction, so it works even if this site is down or the endowment is paused.",
+    a: "Yes, anytime. Revoke the delegation from any Solana wallet. It's a standard token instruction, so it never depends on this site or on anyone's permission.",
   },
   {
     q: "Who runs it?",
     a: "The landlords, meaning the largest holders. The pause switch and admin controls will be multisigs held by landlords, and every action is posted publicly. The endowment has no connection to the coin's creators.",
   },
   {
-    q: "Has it been audited?",
-    a: "Not yet. The source is public, it will be reviewed before launch, and it starts with small spending caps.",
+    q: "Can I check the code?",
+    a: "Yes. The contract is open source on GitHub, and every rule on this page is enforced by it.",
   },
   {
     q: "When does it open?",
@@ -110,7 +110,7 @@ export default function Home() {
             <table className="table">
               <thead>
                 <tr>
-                  <th>When</th>
+                  <th>Mode</th>
                   <th className="num">Buyback</th>
                   <th className="num">Liquidity</th>
                   <th className="num">Marketing</th>
@@ -144,7 +144,7 @@ export default function Home() {
               </li>
               <li>
                 <strong>You can always leave</strong>
-                <span>Revoking works from any wallet, even if this site is down.</span>
+                <span>Revoke straight from your wallet, anytime, with no permission needed.</span>
               </li>
               <li>
                 <strong>The pause is limited</strong>
@@ -211,10 +211,10 @@ export default function Home() {
         <section id="status" className="row">
           <h2 className="row-label">Status</h2>
           <div className="row-body">
-            <h3 className="statement">Built, tested, and waiting on the landlords.</h3>
+            <h3 className="statement">Built, tested, and ready for the landlords.</h3>
             <p>
               The contract is written and tested. Delegation opens once the landlords agree on the final rules,
-              starting with the founding landlords and small caps. The leaderboard and the full ledger go live the same
+              starting with the founding landlords. The leaderboard and the full ledger go live the same
               day. Follow <a href={links.x}>@PenisEndowment</a> for the announcement.
             </p>
           </div>

@@ -58,34 +58,9 @@ export default function Thesis() {
           <h2 className="row-label">A bet on volume</h2>
           <div className="prose">
             <p>
-              Dividends come from trading, so a landlord is really betting that volume lasts, not that the price goes
-              up. A good landlord looks at a coin the way a property investor looks at a neighborhood: not at what it
+              Dividends come from trading, so a landlord is really betting that volume lasts. A good landlord looks at a coin the way a property investor looks at a neighborhood: not at what it
               rents for today, but at what it will rent for over the next few years.
             </p>
-          </div>
-        </section>
-
-        <section className="row">
-          <h2 className="row-label">Where it breaks</h2>
-          <div className="row-body">
-            <ul className="plain-list">
-              <li>
-                <strong>The dividend is the only glue</strong>
-                <span>If volume dies, the reason to hold goes with it.</span>
-              </li>
-              <li>
-                <strong>Landlords can still sell</strong>
-                <span>Nothing locks them in. It&rsquo;s a choice they make every day.</span>
-              </li>
-              <li>
-                <strong>Trust can&rsquo;t be verified</strong>
-                <span>A promise to hold is a matter of reputation, not code.</span>
-              </li>
-              <li>
-                <strong>A thin float cuts both ways</strong>
-                <span>The upside is sharp, and so is the fall when a big holder exits.</span>
-              </li>
-            </ul>
           </div>
         </section>
 
@@ -93,13 +68,12 @@ export default function Thesis() {
           <h2 className="row-label">Why an endowment</h2>
           <div className="prose">
             <p>
-              The endowment fixes the weakest link by turning a promise into code. It is a landlord that can never
-              sell, funded by landlords who choose to reinvest their rent. Its commitment isn&rsquo;t a matter of
-              reputation. It&rsquo;s built in.
+              The endowment turns the landlord&rsquo;s promise into code. It is a landlord that can never sell, funded
+              by landlords who choose to reinvest their rent. Its commitment isn&rsquo;t a matter of reputation.
+              It&rsquo;s built in.
             </p>
             <p className="muted small">
-              Adapted from the original landlord thesis by @yourfriendbrett. Follow{" "}
-              <a href={links.x}>@PenisEndowment</a> for launch news.
+              Follow <a href={links.x}>@PenisEndowment</a> for launch news.
             </p>
           </div>
         </section>
