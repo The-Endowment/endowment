@@ -12,6 +12,10 @@ pub enum EndowmentError {
     NotDelegated,
     #[msg("Only the guardian can do this")]
     NotGuardian,
+    #[msg("Only the admin can do this")]
+    NotAdmin,
+    #[msg("Only the proposed admin can accept")]
+    NotPendingAdmin,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

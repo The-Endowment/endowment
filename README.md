@@ -17,7 +17,8 @@ The endowment's own $PENIS earns PUMP dividends too. They land directly in the P
 - **No way out for $PENIS.** No instruction transfers tokens out of the $PENIS vault.
 - **Landlord exposure is limited.** A landlord's only exposure is PUMP above their baseline in the one delegated account.
 - **Only the upgrade authority can initialize,** so nobody can front-run deployment.
-- **The guardian can only pause.** A pause blocks sweeps and expires on its own after 7 days. The guardian can't move funds.
+- **The guardian can only pause.** A pause blocks sweeps and expires on its own after 7 days. The guardian can't move funds, and only the admin can lift a pause early.
+- **Keys can be rotated.** The admin can replace the guardian. The admin role changes hands in two steps, and the new key must sign to accept. Both roles are meant to be Squads multisigs.
 
 ## Status
 
@@ -45,7 +46,7 @@ Layout:
 programs/endowment/src/
   lib.rs            instruction entrypoints
   state.rs          Config and Landlord accounts, sweep math
-  instructions/     initialize, register_landlord, sweep, deregister_landlord, pause
+  instructions/     initialize, register_landlord, sweep, deregister_landlord, pause, roles
 programs/endowment/tests/
   test_endowment.rs end-to-end tests: opt-in, sweeps, revoke, pause
 ```

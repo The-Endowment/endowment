@@ -5,6 +5,8 @@ use anchor_lang::prelude::*;
 pub struct Config {
     /// Proposes bounded parameter changes.
     pub admin: Pubkey,
+    /// Proposed next admin; must sign `accept_admin`. Default = none.
+    pub pending_admin: Pubkey,
     /// Can pause cranks for at most MAX_PAUSE_SECONDS. Cannot move funds.
     pub guardian: Pubkey,
     pub pump_mint: Pubkey,

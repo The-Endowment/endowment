@@ -246,19 +246,61 @@ impl Env {
         send(&mut self.svm, &[ix], &cranker, &[&cranker])
     }
 
-    fn set_pause(&mut self, signer: &Keypair, pause: bool) -> bool {
-        let accounts = endowment::accounts::SetPause {
-            guardian: signer.pubkey(),
-            config: self.config,
-        }
-        .to_account_metas(None);
-        let data = if pause {
-            endowment::instruction::Pause {}.data()
-        } else {
-            endowment::instruction::Unpause {}.data()
-        };
-        let ix = Instruction::new_with_bytes(endowment::id(), &data, accounts);
+    fn pause(&mut self, signer: &Keypair) -> bool {
+        let ix = Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::Pause {}.data(),
+            endowment::accounts::Pause { guardian: signer.pubkey(), config: self.config }.to_account_metas(None),
+        );
         send(&mut self.svm, &[ix], signer, &[signer])
+    }
+
+    fn unpause(&mut self, signer: &Keypair) -> bool {
+        let ix = Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::Unpause {}.data(),
+            endowment::accounts::Unpause { admin: signer.pubkey(), config: self.config }.to_account_metas(None),
+        );
+        send(&mut self.svm, &[ix], signer, &[signer])
+    }
+
+    fn admin_ix(&self, signer: &Keypair, data: Vec<u8>) -> Instruction {
+        Instruction::new_with_bytes(
+            endowment::id(),
+            &data,
+            endowment::accounts::AdminOnly { admin: signer.pubkey(), config: self.config }.to_account_metas(None),
+        )
+    }
+
+    fn set_guardian(&mut self, signer: &Keypair, new_guardian: Pubkey) -> bool {
+        let ix = self.admin_ix(signer, endowment::instruction::SetGuardian { new_guardian }.data());
+        send(&mut self.svm, &[ix], signer, &[signer])
+    }
+
+    fn propose_admin(&mut self, signer: &Keypair, new_admin: Pubkey) -> bool {
+        let ix = self.admin_ix(signer, endowment::instruction::ProposeAdmin { new_admin }.data());
+        send(&mut self.svm, &[ix], signer, &[signer])
+    }
+
+    fn accept_admin(&mut self, signer: &Keypair) -> bool {
+        let ix = Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::AcceptAdmin {}.data(),
+            endowment::accounts::AcceptAdmin { new_admin: signer.pubkey(), config: self.config }
+                .to_account_metas(None),
+        );
+        send(&mut self.svm, &[ix], signer, &[signer])
+    }
+
+    fn config_state(&self) -> Config {
+        let account = self.svm.get_account(&self.config).unwrap();
+        Config::try_deserialize(&mut account.data.as_slice()).unwrap()
+    }
+
+    fn funded(&mut self) -> Keypair {
+        let kp = Keypair::new();
+        self.svm.airdrop(&kp.pubkey(), 1_000_000_000).unwrap();
+        kp
     }
 
     fn warp(&mut self, seconds: i64) {
@@ -379,20 +421,81 @@ fn guardian_pause_blocks_sweeps_and_expires() {
     assert!(send(&mut env.svm, &ixs, &owner, &[&owner]));
     env.airdrop_pump(&account, 50);
 
-    let stranger = Keypair::new();
-    env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
-    assert!(!env.set_pause(&stranger, true));
+    let stranger = env.funded();
+    assert!(!env.pause(&stranger));
 
     let guardian = env.guardian.insecure_clone();
-    assert!(env.set_pause(&guardian, true));
+    assert!(env.pause(&guardian));
     assert!(!env.sweep(&owner.pubkey(), &account));
 
     env.warp(MAX_PAUSE_SECONDS + 1);
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &env.pump_vault), 50);
+}
 
-    assert!(env.set_pause(&guardian, true));
-    assert!(env.set_pause(&guardian, false));
+#[test]
+fn guardian_pauses_but_only_admin_unpauses_early() {
+    let mut env = Env::new();
+    env.initialize();
+    let (owner, account) = env.new_landlord(0);
+    let ixs = [env.approve_ix(&owner.pubkey(), &account), env.register_ix(&owner.pubkey(), &account)];
+    assert!(send(&mut env.svm, &ixs, &owner, &[&owner]));
+
+    let guardian = env.guardian.insecure_clone();
+    let admin = env.deployer.insecure_clone();
+    assert!(env.pause(&guardian));
+    assert!(!env.unpause(&guardian));
     env.airdrop_pump(&account, 5);
+    assert!(!env.sweep(&owner.pubkey(), &account));
+
+    assert!(env.unpause(&admin));
     assert!(env.sweep(&owner.pubkey(), &account));
+    assert_eq!(token_balance(&env.svm, &env.pump_vault), 5);
+}
+
+#[test]
+fn admin_rotates_the_guardian() {
+    let mut env = Env::new();
+    env.initialize();
+    let old_guardian = env.guardian.insecure_clone();
+    let admin = env.deployer.insecure_clone();
+    let new_guardian = env.funded();
+
+    let stranger = env.funded();
+    assert!(!env.set_guardian(&stranger, stranger.pubkey()));
+    assert!(!env.set_guardian(&old_guardian, new_guardian.pubkey()));
+
+    assert!(env.set_guardian(&admin, new_guardian.pubkey()));
+    assert_eq!(env.config_state().guardian, new_guardian.pubkey());
+    assert!(!env.pause(&old_guardian));
+    assert!(env.pause(&new_guardian));
+}
+
+#[test]
+fn admin_handover_is_two_step() {
+    let mut env = Env::new();
+    env.initialize();
+    let old_admin = env.deployer.insecure_clone();
+    let new_admin = env.funded();
+    let stranger = env.funded();
+
+    // Only the admin can propose, and only the proposed key can accept.
+    assert!(!env.propose_admin(&stranger, stranger.pubkey()));
+    assert!(!env.accept_admin(&new_admin));
+    assert!(env.propose_admin(&old_admin, new_admin.pubkey()));
+    assert_eq!(env.config_state().admin, old_admin.pubkey());
+    assert!(!env.accept_admin(&stranger));
+
+    // Proposing the default key cancels.
+    assert!(env.propose_admin(&old_admin, Pubkey::default()));
+    assert!(!env.accept_admin(&new_admin));
+
+    assert!(env.propose_admin(&old_admin, new_admin.pubkey()));
+    assert!(env.accept_admin(&new_admin));
+    let config = env.config_state();
+    assert_eq!((config.admin, config.pending_admin), (new_admin.pubkey(), Pubkey::default()));
+
+    // The old admin has lost its rights; the new one has them.
+    assert!(!env.set_guardian(&old_admin, old_admin.pubkey()));
+    assert!(env.set_guardian(&new_admin, new_admin.pubkey()));
 }

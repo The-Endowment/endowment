@@ -42,11 +42,23 @@ pub mod endowment {
         instructions::sweep::handle_sweep(ctx)
     }
 
-    pub fn pause(ctx: Context<SetPause>) -> Result<()> {
+    pub fn pause(ctx: Context<Pause>) -> Result<()> {
         instructions::pause::handle_pause(ctx)
     }
 
-    pub fn unpause(ctx: Context<SetPause>) -> Result<()> {
+    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
         instructions::pause::handle_unpause(ctx)
+    }
+
+    pub fn set_guardian(ctx: Context<AdminOnly>, new_guardian: Pubkey) -> Result<()> {
+        instructions::roles::handle_set_guardian(ctx, new_guardian)
+    }
+
+    pub fn propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        instructions::roles::handle_propose_admin(ctx, new_admin)
+    }
+
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::roles::handle_accept_admin(ctx)
     }
 }

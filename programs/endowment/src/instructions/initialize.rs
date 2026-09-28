@@ -75,6 +75,7 @@ pub fn handle_initialize(
 
     ctx.accounts.config.set_inner(Config {
         admin,
+        pending_admin: Pubkey::default(),
         guardian,
         pump_mint: ctx.accounts.pump_mint.key(),
         penis_mint: ctx.accounts.penis_mint.key(),

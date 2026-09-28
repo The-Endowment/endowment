@@ -23,3 +23,18 @@ pub struct Swept {
 pub struct PauseChanged {
     pub paused_until: i64,
 }
+
+#[event]
+pub struct GuardianChanged {
+    pub guardian: Pubkey,
+}
+
+#[event]
+pub struct AdminProposed {
+    pub pending_admin: Pubkey,
+}
+
+#[event]
+pub struct AdminAccepted {
+    pub admin: Pubkey,
+}
