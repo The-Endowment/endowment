@@ -2,6 +2,8 @@ pub mod constants;
 pub mod error;
 pub mod events;
 pub mod instructions;
+pub mod math;
+pub mod raydium;
 pub mod state;
 
 use anchor_lang::prelude::*;
@@ -26,8 +28,34 @@ pub mod endowment {
         admin: Pubkey,
         guardian: Pubkey,
         supply_target_bps: u16,
+        pool: Pubkey,
+        max_buy_per_tx: u64,
+        max_buy_per_day: u64,
+        max_price_impact_bps: u16,
     ) -> Result<()> {
-        instructions::initialize::handle_initialize(ctx, admin, guardian, supply_target_bps)
+        instructions::initialize::handle_initialize(
+            ctx,
+            admin,
+            guardian,
+            supply_target_bps,
+            pool,
+            max_buy_per_tx,
+            max_buy_per_day,
+            max_price_impact_bps,
+        )
+    }
+
+    pub fn buyback(ctx: Context<Buyback>, amount_in: u64, min_out: u64) -> Result<()> {
+        instructions::buyback::handle_buyback(ctx, amount_in, min_out)
+    }
+
+    pub fn set_buyback_limits(
+        ctx: Context<AdminOnly>,
+        max_buy_per_tx: u64,
+        max_buy_per_day: u64,
+        max_price_impact_bps: u16,
+    ) -> Result<()> {
+        instructions::roles::handle_set_buyback_limits(ctx, max_buy_per_tx, max_buy_per_day, max_price_impact_bps)
     }
 
     pub fn register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {

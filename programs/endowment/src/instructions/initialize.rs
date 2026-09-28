@@ -4,7 +4,12 @@ use anchor_spl::{
     token_interface::{Mint, TokenAccount, TokenInterface},
 };
 
-use crate::{constants::*, error::EndowmentError, program::Endowment, state::Config};
+use crate::{
+    constants::*,
+    error::EndowmentError,
+    program::Endowment,
+    state::{validate_limits, Config},
+};
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -67,7 +72,12 @@ pub fn handle_initialize(
     admin: Pubkey,
     guardian: Pubkey,
     supply_target_bps: u16,
+    pool: Pubkey,
+    max_buy_per_tx: u64,
+    max_buy_per_day: u64,
+    max_price_impact_bps: u16,
 ) -> Result<()> {
+    validate_limits(max_buy_per_tx, max_buy_per_day, max_price_impact_bps)?;
     require!(
         (MIN_SUPPLY_TARGET_BPS..=MAX_SUPPLY_TARGET_BPS).contains(&supply_target_bps),
         EndowmentError::SupplyTargetOutOfBounds
@@ -85,6 +95,16 @@ pub fn handle_initialize(
         landlord_count: 0,
         bump: ctx.bumps.config,
         authority_bump: ctx.bumps.authority,
+        // The pool is only trusted after `buyback` checks that it is owned by
+        // Raydium CPMM and holds exactly these two mints.
+        pool,
+        max_buy_per_tx,
+        max_buy_per_day,
+        max_price_impact_bps,
+        day_start: 0,
+        bought_today: 0,
+        total_pump_spent: 0,
+        total_penis_bought: 0,
     });
     Ok(())
 }

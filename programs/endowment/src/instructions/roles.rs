@@ -3,8 +3,8 @@ use anchor_lang::prelude::*;
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{AdminAccepted, AdminProposed, GuardianChanged},
-    state::Config,
+    events::{AdminAccepted, AdminProposed, BuybackLimitsChanged, GuardianChanged},
+    state::{validate_limits, Config},
 };
 
 #[derive(Accounts)]
@@ -30,6 +30,22 @@ pub struct AcceptAdmin<'info> {
             && config.pending_admin == new_admin.key() @ EndowmentError::NotPendingAdmin,
     )]
     pub config: Account<'info, Config>,
+}
+
+/// Adjusts buyback limits within the hard-coded bounds.
+pub fn handle_set_buyback_limits(
+    ctx: Context<AdminOnly>,
+    max_buy_per_tx: u64,
+    max_buy_per_day: u64,
+    max_price_impact_bps: u16,
+) -> Result<()> {
+    validate_limits(max_buy_per_tx, max_buy_per_day, max_price_impact_bps)?;
+    let config = &mut ctx.accounts.config;
+    config.max_buy_per_tx = max_buy_per_tx;
+    config.max_buy_per_day = max_buy_per_day;
+    config.max_price_impact_bps = max_price_impact_bps;
+    emit!(BuybackLimitsChanged { max_buy_per_tx, max_buy_per_day, max_price_impact_bps });
+    Ok(())
 }
 
 /// Immediate: the guardian can only pause, so rotating it is low risk.

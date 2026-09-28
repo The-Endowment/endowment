@@ -1,3 +1,4 @@
+pub mod buyback;
 pub mod deregister_landlord;
 pub mod initialize;
 pub mod pause;
@@ -5,6 +6,7 @@ pub mod register_landlord;
 pub mod roles;
 pub mod sweep;
 
+pub use buyback::*;
 pub use deregister_landlord::*;
 pub use initialize::*;
 pub use pause::*;

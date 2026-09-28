@@ -19,12 +19,36 @@ pub struct Config {
     pub landlord_count: u32,
     pub bump: u8,
     pub authority_bump: u8,
+
+    /// The Raydium CPMM PENIS/PUMP pool buybacks trade against.
+    pub pool: Pubkey,
+    /// Buyback limits, in PUMP base units, bounded by `validate_limits`.
+    pub max_buy_per_tx: u64,
+    pub max_buy_per_day: u64,
+    /// Slippage a single buyback may cause, beyond fees.
+    pub max_price_impact_bps: u16,
+    /// Rolling 24-hour buyback window.
+    pub day_start: i64,
+    pub bought_today: u64,
+    pub total_pump_spent: u64,
+    pub total_penis_bought: u64,
 }
 
 impl Config {
     pub fn is_paused(&self, now: i64) -> bool {
         now < self.paused_until
     }
+}
+
+pub fn validate_limits(max_buy_per_tx: u64, max_buy_per_day: u64, max_price_impact_bps: u16) -> Result<()> {
+    use crate::{constants::*, error::EndowmentError};
+    require!(
+        max_buy_per_tx > 0
+            && max_buy_per_tx <= max_buy_per_day
+            && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&max_price_impact_bps),
+        EndowmentError::InvalidBuybackLimits
+    );
+    Ok(())
 }
 
 #[account]

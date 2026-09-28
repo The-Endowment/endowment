@@ -18,6 +18,7 @@ The endowment's own $PENIS earns PUMP dividends too. They land directly in the P
 - **Landlord exposure is limited.** A landlord's only exposure is PUMP above their baseline in the one delegated account.
 - **Only the upgrade authority can initialize,** so nobody can front-run deployment.
 - **The guardian can only pause.** A pause blocks sweeps and expires on its own after 7 days. The guardian can't move funds, and only the admin can lift a pause early.
+- **Buybacks are bounded.** Anyone can trigger a buyback, but PUMP can only go to the configured Raydium PENIS/PUMP pool and the $PENIS can only land in the $PENIS vault. Each buy is capped per transaction and per 24 hours. A fill is rejected if it is worse than `spot × (1 − 3% transfer fee) × (1 − pool fee − max price impact)`, where the price-impact allowance defaults to 1% with a hard ceiling of 3%.
 - **Keys can be rotated.** The admin can replace the guardian. The admin role changes hands in two steps, and the new key must sign to accept. Both roles are meant to be Squads multisigs.
 
 ## Status
@@ -25,7 +26,7 @@ The endowment's own $PENIS earns PUMP dividends too. They land directly in the P
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Opt-in, sweeps, pause, permanent vaults | ✅ Built and tested locally |
-| 1 | Buybacks (PUMP → $PENIS in the Raydium PENIS/PUMP pool) | In progress |
+| 1 | Buybacks (PUMP → $PENIS in the Raydium PENIS/PUMP pool) | ✅ Built and tested against mainnet pool state |
 | 2 | Web app: delegate/revoke, dashboard, leaderboard, ledger | Planned |
 | 3 | Thermostat: liquidity adds, marketing stream, timelocked parameters | Planned (after an external audit) |
 
@@ -46,9 +47,12 @@ Layout:
 programs/endowment/src/
   lib.rs            instruction entrypoints
   state.rs          Config and Landlord accounts, sweep math
-  instructions/     initialize, register_landlord, sweep, deregister_landlord, pause, roles
+  instructions/     initialize, register_landlord, sweep, deregister_landlord, pause, roles, buyback
+  raydium.rs        Raydium CPMM account views and swap CPI (layouts from idls/raydium_cp_swap.json)
+  math.rs           buyback price floor and daily window
 programs/endowment/tests/
-  test_endowment.rs end-to-end tests: opt-in, sweeps, revoke, pause
+  test_endowment.rs end-to-end tests: opt-in, sweeps, revoke, pause, roles, buybacks
+  fixtures/         mainnet snapshots of the Raydium CPMM program and the PENIS/PUMP pool
 ```
 
 Follow [@PenisEndowment](https://x.com/PenisEndowment).
