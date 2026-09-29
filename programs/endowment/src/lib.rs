@@ -15,33 +15,24 @@ pub use state::*;
 
 declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
 
-/// The $PENIS Endowment.
+/// Endowments for dividend-paying meme coins.
 ///
-/// There is deliberately no instruction that transfers tokens out of the
-/// $PENIS vault or the liquidity (LP) vault. Landlords can always leave by
-/// revoking their token delegation directly with the token program.
+/// One shared contract hosts any number of endowments, one per (coin, creator).
+/// Each endowment collects the dividend its landlords delegate, plus its own
+/// dividends, and spends it buying its coin, which it holds forever.
+///
+/// There is deliberately no instruction that transfers tokens out of any
+/// endowment's coin vault or liquidity (LP) vault. Landlords can always leave
+/// by revoking their token delegation directly with the token program.
+/// Endowments are isolated from each other: every account an instruction
+/// touches is derived from, or checked against, that endowment's config.
 #[program]
 pub mod endowment {
     use super::*;
 
-    pub fn initialize(
-        ctx: Context<Initialize>,
-        admin: Pubkey,
-        guardian: Pubkey,
-        pool: Pubkey,
-        max_buy_per_tx: u64,
-        max_buy_per_day: u64,
-        max_price_impact_bps: u16,
-    ) -> Result<()> {
-        instructions::initialize::handle_initialize(
-            ctx,
-            admin,
-            guardian,
-            pool,
-            max_buy_per_tx,
-            max_buy_per_day,
-            max_price_impact_bps,
-        )
+    /// Permissionless: creates an endowment for a coin and its dividend asset.
+    pub fn create_endowment(ctx: Context<CreateEndowment>, params: CreateParams) -> Result<()> {
+        instructions::create_endowment::handle_create_endowment(ctx, params)
     }
 
     /// Landlords.
@@ -78,7 +69,7 @@ pub mod endowment {
         instructions::close_contributions::handle_close_contributions(ctx)
     }
 
-    /// Guardian and admin.
+    /// Guardian and admin, per endowment.
     pub fn pause(ctx: Context<Pause>) -> Result<()> {
         instructions::pause::handle_pause(ctx)
     }

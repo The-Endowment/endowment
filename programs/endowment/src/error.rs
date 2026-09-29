@@ -2,11 +2,11 @@ use anchor_lang::prelude::*;
 
 #[error_code]
 pub enum EndowmentError {
-    #[msg("Only the program's upgrade authority can initialize")]
-    NotUpgradeAuthority,
+    #[msg("The coin and dividend mints must differ")]
+    SameMint,
     #[msg("The endowment is paused")]
     Paused,
-    #[msg("The PUMP account is not delegated to the endowment")]
+    #[msg("The dividend account is not delegated to the endowment")]
     NotDelegated,
     #[msg("Only the guardian can do this")]
     NotGuardian,
@@ -18,7 +18,7 @@ pub enum EndowmentError {
     Overflow,
     #[msg("Buyback limits are outside the hard-coded bounds")]
     InvalidBuybackLimits,
-    #[msg("Nothing to buy: the PUMP vault is empty or today's cap is used up")]
+    #[msg("Nothing to buy: the dividend vault is empty or today's cap is used up")]
     NothingToBuy,
     #[msg("Buyback exceeds the daily cap")]
     DailyCapReached,
@@ -36,7 +36,7 @@ pub enum EndowmentError {
     InvalidBuyParams,
     #[msg("Activation thresholds are outside the hard-coded bounds")]
     InvalidActivation,
-    #[msg("Landlord sweeps are not active: not enough $PENIS is committed")]
+    #[msg("Landlord sweeps are not active: not enough of the coin is committed")]
     NotActive,
     #[msg("Landlord contributions are closed")]
     ContributionsClosed,
@@ -50,8 +50,14 @@ pub enum EndowmentError {
     CountTooSoon,
     #[msg("Not every landlord has been counted yet")]
     CountIncomplete,
-    #[msg("Invalid landlord or $PENIS account in the count")]
+    #[msg("Invalid landlord or coin account in the count")]
     InvalidCountAccount,
-    #[msg("The $PENIS vault would shrink")]
+    #[msg("The coin vault would shrink")]
     VaultWouldShrink,
+    #[msg("Donation must be 0, 10, 20 or 30 bps, and only in the flagship's dividend asset")]
+    InvalidDonation,
+    #[msg("The contribution cap must be greater than zero")]
+    InvalidContributionCap,
+    #[msg("Not the flagship endowment's dividend vault")]
+    WrongFlagshipVault,
 }

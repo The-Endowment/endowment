@@ -12,25 +12,31 @@ use crate::{
 pub struct DeregisterLandlord<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
+        bump = config.bump,
+    )]
     pub config: Account<'info, Config>,
     #[account(
         mut,
         close = owner,
-        seeds = [LANDLORD_SEED, owner.key().as_ref()],
+        seeds = [LANDLORD_SEED, config.key().as_ref(), owner.key().as_ref()],
         bump = landlord.bump,
         has_one = owner,
+        has_one = config,
     )]
     pub landlord: Account<'info, Landlord>,
 }
 
 pub fn handle_deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {
     let landlord = &ctx.accounts.landlord;
+    let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     config.landlord_count = config.landlord_count.saturating_sub(1);
 
     // Keep an open count finishable and honest: a landlord still expected
-    // leaves the expected set; one already counted takes its $PENIS back out.
+    // leaves the expected set; one already counted takes its coin back out.
     let count = &mut config.count;
     if count.open {
         if landlord.counted_in(count.round) {
@@ -43,6 +49,7 @@ pub fn handle_deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()
     }
 
     emit!(LandlordDeregistered {
+        config: config_key,
         owner: ctx.accounts.owner.key(),
         total_contributed: landlord.total_contributed,
     });

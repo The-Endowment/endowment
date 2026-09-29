@@ -33,11 +33,12 @@ pub fn min_acceptable_out(
     u64::try_from(after_transfer_fee * allowance / BPS).ok()
 }
 
-/// How much PUMP one buyback spends, decided by the contract: whatever the
-/// vault holds (leaving room for the tip), capped per transaction and by
+/// How much of the dividend one buyback spends, decided by the contract:
+/// whatever the vault holds (leaving room for the tip and any donation, both
+/// charged on top as `extra_bps` of the amount), capped per transaction and by
 /// what's left of today's cap.
-pub fn buy_amount(vault_balance: u64, tip_bps: u16, max_per_tx: u64, left_today: u64) -> u64 {
-    let spendable = (vault_balance as u128 * BPS / (BPS + tip_bps as u128)) as u64;
+pub fn buy_amount(vault_balance: u64, extra_bps: u16, max_per_tx: u64, left_today: u64) -> u64 {
+    let spendable = (vault_balance as u128 * BPS / (BPS + extra_bps as u128)) as u64;
     spendable.min(max_per_tx).min(left_today)
 }
 
@@ -96,6 +97,8 @@ mod tests {
         assert_eq!(buy_amount(10_025, 25, 4_000, u64::MAX), 4_000);
         assert_eq!(buy_amount(10_025, 25, 4_000, 1_500), 1_500);
         assert_eq!(buy_amount(0, 25, 4_000, 1_500), 0);
+        // A 25 bps tip plus a 30 bps donation: 10,055 covers 10,000 + 25 + 30.
+        assert_eq!(buy_amount(10_055, 55, u64::MAX, u64::MAX), 10_000);
     }
 
     #[test]

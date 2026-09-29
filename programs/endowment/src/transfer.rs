@@ -1,7 +1,8 @@
-//! PUMP transfers that keep working if PUMP's transfer hook is ever switched on.
+//! Dividend transfers that keep working if the dividend mint's transfer hook is
+//! ever switched on.
 //!
-//! The PUMP mint carries a Token-2022 `TransferHook` extension whose program is
-//! currently unset. While it is unset, a transfer is a plain `transfer_checked`.
+//! A Token-2022 dividend mint may carry a `TransferHook` extension (PUMP's
+//! program is currently unset). While it is unset, a transfer is a plain `transfer_checked`.
 //! If it is ever set, Token-2022 calls the hook program during every transfer and
 //! needs the hook's extra accounts in the instruction: the hook program, its
 //! `extra-account-metas` validation account, and whatever that account lists.
