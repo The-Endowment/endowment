@@ -8,25 +8,34 @@
 //! when anyone left uncounted counts zero.
 //!
 //! Each landlord counts for the smaller of its coin balance now and its balance
-//! at its previous count (zero at its first), and only while its dividend
-//! account still delegates to the endowment and it holds the minimum stake. So:
-//! - coin must be held from one count to the next to count; coin moved into a
-//!   landlord wallet (bought, borrowed or shuffled) adds nothing until the
-//!   following count, and a drop counts at once;
-//! - moving coin from one landlord wallet to another mid-count never makes it
-//!   count twice in that count, because the receiving wallet can only be credited
-//!   what it held at its previous count.
+//! at its previous read (zero at its first), and only while its dividend
+//! account still delegates to the endowment and it holds the round's minimum
+//! stake. So coin must be held from one count to the next to count; coin moved
+//! into a landlord wallet adds nothing until the following count, and a drop
+//! counts at once.
 //!
-//! Between counts, anyone can `refresh_landlords`: a decrease-only re-read that
-//! lowers each landlord's recorded balance to what it holds now. Coin cycled
-//! between two landlord wallets (so each holds it whenever it is counted) keeps
-//! counting twice only if it also sits in each wallet at every refresh. The
-//! automation refreshes every landlord at random times each day, reading many
-//! landlords in one transaction, where the same coin can't be in two wallets at
-//! once. What remains is an attacker who moves coin between wallets that happen
-//! to be read in different transactions, paying the coin's transfer fee (3% for
-//! $PENIS) on every move, with every move on-chain and every landlord's raw
-//! balance published each round in `LandlordCounted`.
+//! Anti-shuffle: the refresher attestation. On its own, the rule above lets one
+//! holding be counted in several wallets: count A, move the coin to B, count B,
+//! move it back before A's next read, so each wallet shows it at each of its own
+//! reads. Each endowment therefore names a `refresher` (a timelocked parameter).
+//! Between counts the refresher re-reads every landlord (`refresh_landlords`),
+//! at times the landlords don't choose, and a landlord only counts if it was so
+//! re-read since its last count read:
+//! - the refresh is decrease-only: each landlord's recorded balance drops to
+//!   what it holds at that moment, and a landlord found not delegated loses its
+//!   record (so approving just for the count, then revoking, counts nothing);
+//! - coin can be in only one wallet at the moment a refresh transaction reads
+//!   them, so a holding X counts at most once per refresh transaction the
+//!   attacker can react between: at most X times the number of refresh
+//!   transactions in a pass (one, for a pass of up to 20 landlords, or sent as a
+//!   single bundle) and, since every hop pays the coin's transfer fee and shows
+//!   on-chain, only as far as the attacker can predict the refresher's timing;
+//! - with no refresher set (or one that never runs) nobody counts, so the
+//!   endowment can't switch on: the defence fails safe.
+//! The refresher can't raise anyone's count or move anything; it can only
+//! withhold attestation, which is no worse than not running the count. A creator
+//! who is its own refresher can of course attest a shuffle it runs itself:
+//! the guarantee is as good as the refresher, which is public on-chain.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::Mint;
@@ -34,7 +43,7 @@ use anchor_spl::token_interface::Mint;
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{CommitmentCounted, CountStarted, LandlordCounted},
+    events::{CommitmentCounted, CountStarted, LandlordCounted, LandlordsAttested},
     state::{Config, CountRound, Landlord},
     transfer::read_token_account,
 };
@@ -64,6 +73,7 @@ pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
     );
 
     let round = config.count.round.checked_add(1).ok_or(EndowmentError::Overflow)?;
+    let min_stake = config.min_stake(supply);
     config.count = CountRound {
         round,
         open: true,
@@ -72,6 +82,7 @@ pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
         expected: config.landlord_count,
         counted: 0,
         committed: 0,
+        min_stake,
     };
     emit!(CountStarted { config: config_key, round, expected: config.landlord_count, supply });
     Ok(())
@@ -79,7 +90,8 @@ pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
 
 /// Remaining accounts, three per landlord, any number of landlords, any order:
 /// the landlord record (writable), its registered coin account and its
-/// registered dividend account (either may be closed).
+/// registered dividend account (either may be closed). A landlord record that
+/// was closed since the batch was built is skipped.
 #[derive(Accounts)]
 pub struct CountLandlords<'info> {
     #[account(
@@ -88,6 +100,59 @@ pub struct CountLandlords<'info> {
         bump = config.bump,
     )]
     pub config: Box<Account<'info, Config>>,
+}
+
+/// A landlord's coin balance and whether its dividend account delegates to the
+/// endowment. A coin account that isn't the owner's any more (legacy SPL Token
+/// lets an owner reassign it) holds nothing for this landlord.
+fn read_landlord(
+    landlord: &Landlord,
+    coin_info: &AccountInfo,
+    dividend_info: &AccountInfo,
+    coin_mint: &Pubkey,
+    authority: &Pubkey,
+) -> Result<(u64, bool)> {
+    let balance = match read_token_account(coin_info)? {
+        Some(coin) => {
+            require_keys_eq!(coin.mint, *coin_mint, EndowmentError::InvalidCountAccount);
+            if coin.owner == landlord.owner {
+                coin.amount
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
+    let delegated = read_token_account(dividend_info)?
+        .map(|d| d.owner == landlord.owner && d.delegates_to(authority))
+        .unwrap_or(false);
+    Ok((balance, delegated))
+}
+
+/// This endowment's landlord at `info`, at its canonical address, with its
+/// registered accounts; `None` if the record has been closed.
+fn load_landlord<'info>(
+    info: &'info AccountInfo<'info>,
+    coin_info: &AccountInfo,
+    dividend_info: &AccountInfo,
+    config_key: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<Option<Account<'info, Landlord>>> {
+    require!(info.is_writable, EndowmentError::InvalidCountAccount);
+    if info.data_is_empty() && *info.owner == anchor_lang::system_program::ID {
+        return Ok(None);
+    }
+    let landlord: Account<Landlord> = Account::try_from(info)?;
+    require_keys_eq!(landlord.config, *config_key, EndowmentError::InvalidCountAccount);
+    let canonical = Pubkey::create_program_address(
+        &[LANDLORD_SEED, config_key.as_ref(), landlord.owner.as_ref(), &[landlord.bump]],
+        program_id,
+    )
+    .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
+    require_keys_eq!(info.key(), canonical, EndowmentError::InvalidCountAccount);
+    require_keys_eq!(coin_info.key(), landlord.coin_account, EndowmentError::InvalidCountAccount);
+    require_keys_eq!(dividend_info.key(), landlord.dividend_account, EndowmentError::InvalidCountAccount);
+    Ok(Some(landlord))
 }
 
 pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>) -> Result<()> {
@@ -105,49 +170,33 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
         program_id,
     )
     .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
-    let min_stake = config.min_stake(config.count.supply);
-    let (round, coin_mint) = (config.count.round, config.coin_mint);
+    let (round, coin_mint, min_stake) = (config.count.round, config.coin_mint, config.count.min_stake);
 
     for triple in accounts.chunks(3) {
         let (landlord_info, coin_info, dividend_info) = (&triple[0], &triple[1], &triple[2]);
-        require!(landlord_info.is_writable, EndowmentError::InvalidCountAccount);
-        let mut landlord: Account<Landlord> = Account::try_from(landlord_info)?;
-        // This endowment's landlord, at its canonical address.
-        require_keys_eq!(landlord.config, config_key, EndowmentError::InvalidCountAccount);
-        let canonical = Pubkey::create_program_address(
-            &[LANDLORD_SEED, config_key.as_ref(), landlord.owner.as_ref(), &[landlord.bump]],
-            program_id,
-        )
-        .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
-        require_keys_eq!(landlord_info.key(), canonical, EndowmentError::InvalidCountAccount);
-        require_keys_eq!(coin_info.key(), landlord.coin_account, EndowmentError::InvalidCountAccount);
-        require_keys_eq!(dividend_info.key(), landlord.dividend_account, EndowmentError::InvalidCountAccount);
+        let Some(mut landlord) = load_landlord(landlord_info, coin_info, dividend_info, &config_key, program_id)?
+        else {
+            continue;
+        };
         // Part of this round, and not counted in it yet.
         require!(config.expects(&landlord), EndowmentError::NotInCount);
 
-        let balance = match read_token_account(coin_info)? {
-            Some(coin) => {
-                require_keys_eq!(coin.mint, coin_mint, EndowmentError::InvalidCountAccount);
-                require_keys_eq!(coin.owner, landlord.owner, EndowmentError::InvalidCountAccount);
-                coin.amount
-            }
-            None => 0,
-        };
-        let delegated = read_token_account(dividend_info)?
-            .map(|d| d.owner == landlord.owner && d.delegates_to(&authority))
-            .unwrap_or(false);
-
+        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
         let held = landlord.held(balance);
-        let counted = if delegated && held >= min_stake { held } else { 0 };
+        let counted = if landlord.attested && delegated && held >= min_stake { held } else { 0 };
 
-        landlord.snapshot = balance;
-        landlord.snapshot_valid = true;
+        // The next count credits at most this, and only after a fresh attestation.
+        landlord.snapshot = if delegated { balance } else { 0 };
+        landlord.snapshot_valid = delegated;
+        landlord.attested = false;
         landlord.counted_round = round;
         landlord.counted_amount = counted;
         landlord.exit(program_id)?;
 
         config.count.counted = config.count.counted.checked_add(1).ok_or(EndowmentError::Overflow)?;
-        config.count.committed = config.count.committed.checked_add(counted).ok_or(EndowmentError::Overflow)?;
+        // Saturating: the result is capped at 100% anyway, and an overflow must
+        // never block the rest of the round (R2-CNT-11).
+        config.count.committed = config.count.committed.saturating_add(counted);
         emit!(LandlordCounted {
             config: config_key,
             round,
@@ -160,44 +209,68 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
     Ok(())
 }
 
-/// Remaining accounts, two per landlord, any number, any order: the landlord
-/// record (writable) and its registered coin account (may be closed).
+/// Remaining accounts, three per landlord, any number, any order: the landlord
+/// record (writable), its registered coin account and its registered dividend
+/// account (either may be closed). Closed landlord records are skipped.
 #[derive(Accounts)]
 pub struct RefreshLandlords<'info> {
     #[account(
+        mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
     pub config: Box<Account<'info, Config>>,
+    /// Anyone. When it is the endowment's refresher, the landlords read are
+    /// attested (see the module docs).
+    pub caller: Signer<'info>,
 }
 
-/// Permissionless, decrease-only: lowers each landlord's recorded balance to what
-/// it holds now, so the next count credits no more than that. It can never raise
-/// anything, so calling it is always safe, as often as anyone likes.
+/// Decrease-only: lowers each landlord's recorded balance to what it holds now,
+/// and drops the record of any landlord no longer delegated, so the next count
+/// credits no more than that. Anyone may call it, as often as they like: it can
+/// never raise anything. Only the refresher's calls also attest.
 pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'info>>) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let program_id = ctx.program_id;
     let accounts = ctx.remaining_accounts;
-    let coin_mint = ctx.accounts.config.coin_mint;
-    require!(!accounts.is_empty() && accounts.len() % 2 == 0, EndowmentError::InvalidCountAccount);
+    let config = &mut ctx.accounts.config;
+    let coin_mint = config.coin_mint;
+    let refresher = config.params.refresher;
+    let attest = refresher != Pubkey::default() && ctx.accounts.caller.key() == refresher;
+    require!(!accounts.is_empty() && accounts.len() % 3 == 0, EndowmentError::InvalidCountAccount);
 
-    for pair in accounts.chunks(2) {
-        let (landlord_info, coin_info) = (&pair[0], &pair[1]);
-        require!(landlord_info.is_writable, EndowmentError::InvalidCountAccount);
-        let mut landlord: Account<Landlord> = Account::try_from(landlord_info)?;
-        require_keys_eq!(landlord.config, config_key, EndowmentError::InvalidCountAccount);
-        require_keys_eq!(coin_info.key(), landlord.coin_account, EndowmentError::InvalidCountAccount);
-        let balance = match read_token_account(coin_info)? {
-            Some(coin) => {
-                require_keys_eq!(coin.mint, coin_mint, EndowmentError::InvalidCountAccount);
-                coin.amount
-            }
-            None => 0,
+    let authority = Pubkey::create_program_address(
+        &[AUTHORITY_SEED, config_key.as_ref(), &[config.authority_bump]],
+        program_id,
+    )
+    .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
+
+    let mut attested: u32 = 0;
+    for triple in accounts.chunks(3) {
+        let (landlord_info, coin_info, dividend_info) = (&triple[0], &triple[1], &triple[2]);
+        let Some(mut landlord) = load_landlord(landlord_info, coin_info, dividend_info, &config_key, program_id)?
+        else {
+            continue;
         };
-        if landlord.snapshot_valid && balance < landlord.snapshot {
-            landlord.snapshot = balance;
-            landlord.exit(program_id)?;
+        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
+        if delegated {
+            landlord.snapshot = landlord.snapshot.min(balance);
+        } else {
+            landlord.snapshot = 0;
+            landlord.snapshot_valid = false;
         }
+        if attest {
+            landlord.attested = delegated;
+            attested += u32::from(delegated);
+        } else if !delegated {
+            landlord.attested = false;
+        }
+        landlord.exit(program_id)?;
+    }
+    if attest {
+        config.last_attested_at = now;
+        emit!(LandlordsAttested { config: config_key, landlords: attested, at: now });
     }
     Ok(())
 }
@@ -219,7 +292,7 @@ pub fn handle_finish_count(ctx: Context<FinishCount>) -> Result<()> {
     require!(!config.is_paused(now), EndowmentError::Paused);
     require!(config.count.open, EndowmentError::NoOpenCount);
     let complete = config.count.counted >= config.count.expected;
-    let timed_out = now.saturating_sub(config.count.started_at) >= COUNT_TIMEOUT_SECS;
+    let timed_out = now.saturating_sub(config.count_clock_start()) >= COUNT_TIMEOUT_SECS;
     require!(complete || timed_out, EndowmentError::CountIncomplete);
 
     let count = config.count;

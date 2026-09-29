@@ -9,20 +9,18 @@ use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
     token::Token,
     token_2022::Token2022,
-    token_interface::{Mint, TokenAccount, TokenInterface},
+    token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
 };
 
 use crate::{
     constants::*,
     error::EndowmentError,
     events::{Bought, MilestoneReached},
+    health::{ensure_tradeable, is_frozen, TradeAccounts},
     math::{impact_cap, lp_tokens_for, min_acceptable_out, refill, spendable, split_buy, spot_price_x32, zap_swap_amount},
-    raydium::{
-        pool_fee_bps, twap_price_x32, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR,
-        SWAP_BASE_INPUT_DISCRIMINATOR,
-    },
+    raydium::{twap_price_x32, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR, SWAP_BASE_INPUT_DISCRIMINATOR},
     state::Config,
-    transfer::{capped_transfer_fee_bps, hook_enabled, read_token_account, transfer_checked_with_hook},
+    transfer::read_token_account,
 };
 
 /// Permissionless: anyone may crank a buyback for an endowment, and is paid a
@@ -36,8 +34,8 @@ use crate::{
 /// part of each buyback becomes liquidity whose LP tokens land in an
 /// authority-owned account that nothing can withdraw from.
 ///
-/// Remaining accounts: dividend transfer-hook extras for the tip and donation.
-/// (Unused today: buybacks refuse to run while either mint's hook is set.)
+/// Buybacks refuse to run while either mint has a transfer hook set (see
+/// `health::ensure_tradeable`), so the tip and donation are plain transfers.
 #[derive(Accounts)]
 pub struct Buyback<'info> {
     #[account(
@@ -105,13 +103,15 @@ pub struct Buyback<'info> {
     #[account(mut)]
     pub lp_mint: UncheckedAccount<'info>,
     /// CHECK: the authority's LP token account (its associated token account for
-    /// the LP mint); checked in the handler. Must exist once the milestone is
-    /// reached. No instruction can move tokens out of it.
+    /// the LP mint); checked in the handler. While it doesn't exist, the
+    /// liquidity share is spent buying instead. No instruction can move tokens
+    /// out of it.
     #[account(mut)]
     pub lp_vault: UncheckedAccount<'info>,
     /// CHECK: the flagship endowment's dividend vault. Only touched, and then
-    /// checked against its derived address, when this endowment donates.
-    #[account(mut)]
+    /// checked against its derived address (and required writable), when this
+    /// endowment donates; read-only otherwise, so buybacks of endowments that
+    /// don't donate don't contend for it.
     pub flagship_dividend_vault: UncheckedAccount<'info>,
 
     pub dividend_token_program: Interface<'info, TokenInterface>,
@@ -187,55 +187,67 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     let lp_view = read_token_account(&a.lp_vault)?;
     let lp_after = lp_view.as_ref().map(|t| t.amount).unwrap_or(0);
     require!(lp_after >= lp_before, EndowmentError::CpiInvariant);
+    let authority = a.authority.key();
     for vault in [a.dividend_vault.to_account_info(), a.coin_vault.to_account_info()] {
         let view = read_token_account(&vault)?.ok_or(EndowmentError::CpiInvariant)?;
-        require!(view.delegate.is_none() && view.close_authority.is_none(), EndowmentError::CpiInvariant);
+        require!(
+            view.owner == authority && view.delegate.is_none() && view.close_authority.is_none(),
+            EndowmentError::CpiInvariant
+        );
     }
     if let Some(view) = lp_view {
-        require!(view.delegate.is_none() && view.close_authority.is_none(), EndowmentError::CpiInvariant);
+        require!(
+            view.owner == authority && view.delegate.is_none() && view.close_authority.is_none(),
+            EndowmentError::CpiInvariant
+        );
     }
 
     let bump = [a.config.authority_bump];
     let seeds = Config::authority_seeds(&config_key, &bump);
 
+    let pay = |to: AccountInfo<'info>, amount: u64| {
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                a.dividend_token_program.key(),
+                TransferChecked {
+                    from: a.dividend_vault.to_account_info(),
+                    mint: a.dividend_mint.to_account_info(),
+                    to,
+                    authority: a.authority.to_account_info(),
+                },
+                &[&seeds],
+            ),
+            amount,
+            a.dividend_mint.decimals,
+        )
+    };
+
     // 4. Tip the caller, on what was actually spent.
     let tip = (spent as u128 * a.config.params.tip_bps as u128 / 10_000) as u64;
     if tip > 0 {
-        transfer_checked_with_hook(
-            &a.dividend_token_program.to_account_info(),
-            &a.dividend_vault.to_account_info(),
-            &a.dividend_mint.to_account_info(),
-            &a.caller_dividend_account.to_account_info(),
-            &a.authority.to_account_info(),
-            ctx.remaining_accounts,
-            tip,
-            a.dividend_mint.decimals,
-            &[&seeds],
-        )?;
+        pay(a.caller_dividend_account.to_account_info(), tip)?;
     }
 
-    // 5. Send the donation, if this endowment chose one, to the flagship's dividend vault.
-    let donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
+    // 5. Send the donation, if this endowment chose one, to the flagship's
+    //    dividend vault, while it exists and isn't frozen (the donor's buybacks
+    //    never depend on the flagship's state).
+    let mut donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
     if donation > 0 {
         let (flagship_authority, _) =
-            Pubkey::find_program_address(&[AUTHORITY_SEED, FLAGSHIP_CONFIG.as_ref()], ctx.program_id);
+            Pubkey::find_program_address(&[AUTHORITY_SEED, flagship_config().as_ref()], ctx.program_id);
         let expected = get_associated_token_address_with_program_id(
             &flagship_authority,
             &a.dividend_mint.key(),
             &a.dividend_token_program.key(),
         );
-        require_keys_eq!(a.flagship_dividend_vault.key(), expected, EndowmentError::WrongFlagshipVault);
-        transfer_checked_with_hook(
-            &a.dividend_token_program.to_account_info(),
-            &a.dividend_vault.to_account_info(),
-            &a.dividend_mint.to_account_info(),
-            &a.flagship_dividend_vault.to_account_info(),
-            &a.authority.to_account_info(),
-            ctx.remaining_accounts,
-            donation,
-            a.dividend_mint.decimals,
-            &[&seeds],
-        )?;
+        let vault = &a.flagship_dividend_vault;
+        require_keys_eq!(vault.key(), expected, EndowmentError::WrongFlagshipVault);
+        if read_token_account(vault)?.is_some() && !is_frozen(vault)? {
+            require!(vault.is_writable, EndowmentError::WrongFlagshipVault);
+            pay(vault.to_account_info(), donation)?;
+        } else {
+            donation = 0;
+        }
     }
 
     // 6. Accounting.
@@ -288,42 +300,47 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         config.last_buy_at == 0 || now.saturating_sub(config.last_buy_at) >= params.min_buy_interval_secs,
         EndowmentError::BuyTooSoon
     );
-    // Raydium can't pass transfer-hook accounts, so a hooked mint can't trade.
-    require!(
-        !hook_enabled(&a.dividend_mint.to_account_info())? && !hook_enabled(&a.coin_mint.to_account_info())?,
-        EndowmentError::TransferHookEnabled
-    );
-
-    // Every Raydium account must belong to the configured pool, in whichever
-    // order the pool holds the two mints.
-    let pool = PoolView::parse(&a.pool_state.try_borrow_data()?)?;
-    let dividend_index = pool.index_of(&config.dividend_mint)?;
-    let coin_index = pool.index_of(&config.coin_mint)?;
-    require_keys_eq!(a.amm_config.key(), pool.amm_config, EndowmentError::WrongPool);
+    // Tradeable at all: hooks off, fees within their caps, the configured pool,
+    // swaps enabled, nothing frozen. Sweeps run the same checks.
+    let t = ensure_tradeable(
+        config,
+        &TradeAccounts {
+            dividend_mint: &a.dividend_mint.to_account_info(),
+            coin_mint: &a.coin_mint.to_account_info(),
+            pool_state: &a.pool_state.to_account_info(),
+            amm_config: &a.amm_config.to_account_info(),
+            pool_dividend_vault: &a.pool_dividend_vault.to_account_info(),
+            pool_coin_vault: &a.pool_coin_vault.to_account_info(),
+            vaults: [&a.dividend_vault.to_account_info(), &a.coin_vault.to_account_info()],
+        },
+        epoch,
+    )?;
+    let (pool, dividend_index, coin_index) = (&t.pool, t.dividend_index, t.coin_index);
+    let (pool_fee, dividend_fee, coin_fee) = (t.pool_fee, t.dividend_fee, t.coin_fee);
     require_keys_eq!(a.observation_state.key(), pool.observation, EndowmentError::WrongPool);
-    require_keys_eq!(a.pool_dividend_vault.key(), pool.vaults[dividend_index], EndowmentError::WrongPool);
-    require_keys_eq!(a.pool_coin_vault.key(), pool.vaults[coin_index], EndowmentError::WrongPool);
     require_keys_eq!(a.lp_mint.key(), pool.lp_mint, EndowmentError::WrongPool);
     let expected_lp_vault =
         get_associated_token_address_with_program_id(&a.authority.key(), &pool.lp_mint, &a.lp_token_program.key());
     require_keys_eq!(a.lp_vault.key(), expected_lp_vault, EndowmentError::WrongPool);
-    require!(pool.swaps_enabled(), EndowmentError::PoolSwapDisabled);
+    let lp_vault_ready = read_token_account(&a.lp_vault)?
+        .map(|v| v.mint == pool.lp_mint && v.owner == a.authority.key())
+        .unwrap_or(false);
 
-    // Fees, all capped: a raised fee halts buybacks instead of lowering the floor.
-    let pool_fee = pool_fee_bps(&a.amm_config.try_borrow_data()?, pool.creator_fee_enabled)?;
-    require!(pool_fee <= MAX_POOL_FEE_BPS, EndowmentError::FeeTooHigh);
-    let dividend_fee = capped_transfer_fee_bps(&a.dividend_mint.to_account_info(), epoch)?;
-    let coin_fee = capped_transfer_fee_bps(&a.coin_mint.to_account_info(), epoch)?;
-
-    // Price: the TWAP is the reference; the spot price may not be much worse.
+    // Price: the TWAP is the reference, from recorded history only; the spot
+    // price may not be far from it in either direction.
     let reserve_dividend = pool.reserve(dividend_index, a.pool_dividend_vault.amount)?;
     let reserve_coin = pool.reserve(coin_index, a.pool_coin_vault.amount)?;
     let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
     let twap_price_x32 =
-        twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, spot, now as u64)?;
-    // Fewer coin per dividend at spot than at the TWAP means the coin got pricier.
+        twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, now as u64)?;
+    // Fewer coin per dividend at spot than at the TWAP means the coin got pricier;
+    // more means the TWAP lags a fall, and the floor would be too loose.
     require!(
         spot * 10_000 >= twap_price_x32 * (10_000 - MAX_SPOT_ABOVE_TWAP_BPS as u128),
+        EndowmentError::PriceAboveTwap
+    );
+    require!(
+        spot * 10_000 <= twap_price_x32 * (10_000 + MAX_SPOT_ABOVE_TWAP_BPS as u128),
         EndowmentError::PriceAboveTwap
     );
 
@@ -342,11 +359,10 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         .min(allowance)
         .min(impact_cap(reserve_dividend, params.max_price_impact_bps));
 
-    // After the milestone, split into buying and liquidity (liquidity waits while
-    // the pool has deposits disabled).
-    let (to_buy, to_liquidity) = if config.milestone_reached {
-        let (to_buy, to_liquidity) = split_buy(amount, params.buy_bps);
-        (to_buy, if pool.deposits_enabled() { to_liquidity } else { 0 })
+    // After the milestone, split into buying and liquidity. While the pool has
+    // deposits disabled or the LP vault doesn't exist yet, it all buys.
+    let (to_buy, to_liquidity) = if config.milestone_reached && pool.deposits_enabled() && lp_vault_ready {
+        split_buy(amount, params.buy_bps)
     } else {
         (amount, 0)
     };
@@ -438,7 +454,6 @@ fn swap_base_input(ctx: &Context<Buyback>, config_key: &Pubkey, amount_in: u64, 
 /// amounts are too small to mint any LP.
 fn deposit_liquidity(ctx: &Context<Buyback>, config_key: &Pubkey, plan: &Plan, coin_budget: u64) -> Result<()> {
     let a = &ctx.accounts;
-    require!(a.lp_vault.lamports() > 0, EndowmentError::WrongPool);
 
     // Reserves after our own swap, as Raydium will see them.
     let pool = PoolView::parse(&a.pool_state.try_borrow_data()?)?;

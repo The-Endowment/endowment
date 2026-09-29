@@ -93,8 +93,9 @@ pub struct CountStarted {
 }
 
 /// One landlord's line in the public tally. `raw_balance` is its coin balance at
-/// the moment it was read; comparing it round to round shows coin moving between
-/// landlord wallets.
+/// the moment it was read. The same figures are stored on the landlord record
+/// (`counted_round`, `counted_amount`, `snapshot`), which is the authoritative
+/// source; events are a convenience.
 #[event]
 pub struct LandlordCounted {
     pub config: Pubkey,
@@ -140,6 +141,22 @@ pub struct ParamsCancelled {
 #[event]
 pub struct Retired {
     pub config: Pubkey,
+}
+
+/// Retiring waits out the same timelock as parameter changes.
+#[event]
+pub struct RetireProposed {
+    pub config: Pubkey,
+    pub effective_at: i64,
+}
+
+/// A refresh pass by the endowment's refresher: every landlord it read is now
+/// eligible to count at its next count read (if still delegated and holding).
+#[event]
+pub struct LandlordsAttested {
+    pub config: Pubkey,
+    pub landlords: u32,
+    pub at: i64,
 }
 
 #[event]

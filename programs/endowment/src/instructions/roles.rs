@@ -5,7 +5,7 @@ use crate::{
     error::EndowmentError,
     events::{
         AdminAccepted, AdminProposed, AdminRenounced, GuardianChanged, ParamsApplied, ParamsCancelled,
-        ParamsProposed, Retired,
+        ParamsProposed, RetireProposed, Retired,
     },
     state::{Config, Params, PendingParams},
 };
@@ -19,18 +19,22 @@ pub struct AdminOnly<'info> {
         bump = config.bump,
         has_one = admin @ EndowmentError::NotAdmin,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 }
 
-/// Permissionless: applies a proposed parameter change once its timelock ends.
+/// Applies a proposed parameter change once its timelock ends: only the admin
+/// for the first PARAM_APPLY_GRACE_SECONDS (so the admin can still cancel, or
+/// cancel and renounce, without being raced), then anyone, until the proposal
+/// expires PARAM_EXPIRY_SECONDS after maturing.
 #[derive(Accounts)]
 pub struct ApplyParams<'info> {
+    pub caller: Signer<'info>,
     #[account(
         mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 }
 
 #[derive(Accounts)]
@@ -43,7 +47,7 @@ pub struct AcceptAdmin<'info> {
         constraint = config.pending_admin != Pubkey::default()
             && config.pending_admin == new_admin.key() @ EndowmentError::NotPendingAdmin,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 }
 
 /// Proposes a full new parameter set, within the hard-coded bounds. It takes
@@ -60,10 +64,13 @@ pub fn handle_propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<
     Ok(())
 }
 
+/// Cancels a pending parameter change and any pending retirement.
 pub fn handle_cancel_params(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
-    require!(ctx.accounts.config.pending.effective_at != 0, EndowmentError::NoPendingParams);
-    ctx.accounts.config.pending = PendingParams::default();
+    let config = &mut ctx.accounts.config;
+    require!(config.pending.effective_at != 0 || config.retire_at != 0, EndowmentError::NoPendingParams);
+    config.pending = PendingParams::default();
+    config.retire_at = 0;
     emit!(ParamsCancelled { config: config_key });
     Ok(())
 }
@@ -75,6 +82,15 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
     let pending = config.pending;
     require!(pending.effective_at != 0, EndowmentError::NoPendingParams);
     require!(now >= pending.effective_at, EndowmentError::TimelockNotElapsed);
+    require!(
+        now <= pending.effective_at.saturating_add(PARAM_EXPIRY_SECONDS),
+        EndowmentError::ProposalExpired
+    );
+    require!(
+        now >= pending.effective_at.saturating_add(PARAM_APPLY_GRACE_SECONDS)
+            || ctx.accounts.caller.key() == config.admin,
+        EndowmentError::ApplyGrace
+    );
     config.params = pending.params;
     config.pending = PendingParams::default();
     // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
@@ -87,24 +103,38 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
 }
 
 /// One-way: stops landlord sweeps and new registrations for good. It never moves
-/// funds and doesn't change how buybacks spend what the vault holds.
+/// funds and doesn't change how buybacks spend what the vault holds. Timelocked
+/// like a parameter change: the first call proposes it (announced by an event),
+/// a call after PARAM_TIMELOCK_SECONDS carries it out, and `cancel_params`
+/// withdraws it in between.
 pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    if !config.retired {
-        config.retired = true;
-        emit!(Retired { config: config_key });
+    if config.retired {
+        return Ok(());
     }
+    if config.retire_at == 0 {
+        config.retire_at = now + PARAM_TIMELOCK_SECONDS;
+        emit!(RetireProposed { config: config_key, effective_at: config.retire_at });
+        return Ok(());
+    }
+    require!(now >= config.retire_at, EndowmentError::RetireNotReady);
+    config.retired = true;
+    config.retire_at = 0;
+    emit!(Retired { config: config_key });
     Ok(())
 }
 
 /// One-way: gives up the admin role for good, freezing every parameter as it
 /// stands. It also clears the guardian and any pending change, so no key is left
 /// that can pause or reconfigure the endowment. It requires production
-/// activation thresholds, so sweeps can't be frozen on.
+/// activation thresholds, so sweeps can't be frozen on, and no pending change
+/// (cancel it first), so nothing half-decided is left behind.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
+    require!(config.pending.effective_at == 0 && config.retire_at == 0, EndowmentError::PendingChange);
     require!(
         config.retired
             || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS

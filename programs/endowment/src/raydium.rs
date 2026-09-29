@@ -8,7 +8,10 @@
 
 use anchor_lang::prelude::*;
 
-use crate::{constants::TWAP_WINDOW_SECONDS, error::EndowmentError};
+use crate::{
+    constants::{MAX_STRETCH_SHARE_BPS, RAYDIUM_OBSERVATION_COALESCE_SECONDS, TWAP_WINDOW_SECONDS},
+    error::EndowmentError,
+};
 
 pub const CPMM_PROGRAM_ID: Pubkey = pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
 pub const CPMM_AUTH_SEED: &[u8] = b"vault_and_lp_mint_auth_seed";
@@ -125,30 +128,38 @@ pub fn pool_fee_bps(amm_config: &[u8], creator_fee_enabled: bool) -> Result<u64>
 }
 
 /// Time-weighted average price of `token_index` in units of the other token
-/// (Q32.32), over at least `TWAP_WINDOW_SECONDS` up to `now`.
+/// (Q32.32), from the pool's recorded price history only.
 ///
-/// Raydium records, on each swap, the price *before* that swap multiplied by the
-/// seconds since the last record (`last_update_timestamp`). So:
-/// - a swap earlier in the same transaction, or the same second, adds nothing
-///   to the average: the time since the last record is zero;
-/// - the stretch since the last record is weighted at the current spot price,
-///   which has held since then (only swaps move a CPMM price, and every swap
-///   updates the record).
+/// How Raydium records prices: each observation holds a timestamp and a
+/// cumulative price. A swap at least 15 seconds after the latest observation's
+/// timestamp opens a new one; a swap sooner than that adds to the latest one's
+/// cumulative (and `last_update_timestamp`) without moving its timestamp. Each
+/// addition is the price *before* that swap times the seconds since the last
+/// addition. So:
+/// - a swap earlier in the same transaction, or the same second, adds nothing;
+/// - a stretch between records is priced at the moment it closes, so a token
+///   transfer straight into a pool vault (which moves the price but records
+///   nothing) just before a swap colours the whole stretch before it.
 ///
-/// Moving the average by x% therefore means holding the price x%·(window /
-/// seconds held) away from fair value across real seconds, against arbitrage.
-///
-/// The start of the window is the newest observation at least one full window
-/// old. Older observations may include up to Raydium's 15-second coalescing
-/// interval beyond their timestamp; over a 10-minute window that misattributes
-/// at most 2.5% of the window's weight, and only to prices that actually held.
-pub fn twap_price_x32(
-    observation: &[u8],
-    pool: &Pubkey,
-    token_index: usize,
-    spot_price_x32: u128,
-    now: u64,
-) -> Result<u128> {
+/// Therefore:
+/// - the average ends at the latest record (`last_update_timestamp`, when its
+///   cumulative is exact). Nothing after it is extrapolated, so moving the spot
+///   price without a swap moves the average not at all (the spot band in
+///   `buyback` then refuses the buy);
+/// - each older record's cumulative runs somewhere between 0 and
+///   `RAYDIUM_OBSERVATION_COALESCE_SECONDS` (14 s) past its timestamp. Taking
+///   the timestamp itself (as round 1 did) biased the average low by up to
+///   14 s / span whenever swaps had coalesced into the starting record, which an
+///   attacker can arrange (F-01). Records are taken as of the middle of that
+///   range instead: no bias either way, and at most ±7 s / span of error at the
+///   start (±0.4% over the 30-minute window), within the floor's drift allowance;
+/// - it walks back through the records until it has `TWAP_WINDOW_SECONDS` of
+///   weight, where no single stretch weighs more than `MAX_STRETCH_SHARE_BPS` of
+///   the window: a longer stretch counts at its own average price, for that
+///   capped time. One coloured stretch is at most half the average, so the spot
+///   band catches it, and a long quiet stretch (whose price is the pool's price
+///   now) needs no more history than any other to average over.
+pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now: u64) -> Result<u128> {
     require!(
         observation.len() == OBSERVATION_STATE_LEN && observation[..8] == OBSERVATION_DISCRIMINATOR,
         EndowmentError::InvalidPoolData
@@ -162,44 +173,43 @@ pub fn twap_price_x32(
         let at = OBSERVATIONS_OFFSET + OBSERVATION_LEN * i;
         (u64_at(observation, at), u128_at(observation, at + 8 + 16 * token_index))
     };
-    let last_update = u64_at(observation, LAST_UPDATE_OFFSET);
     let (latest_ts, latest_cum) = cumulative(latest);
+    let last_update = u64_at(observation, LAST_UPDATE_OFFSET);
     // Legacy accounts may not have recorded `last_update_timestamp`.
-    let last_update = if last_update == 0 { latest_ts } else { last_update };
-    require!(last_update <= now, EndowmentError::InvalidPoolData);
+    let end = if last_update == 0 { latest_ts } else { last_update };
+    require!(end >= latest_ts && end <= now, EndowmentError::InvalidPoolData);
 
-    // Cumulative price up to now: the latest record, plus the current spot price
-    // for the seconds since (zero if a swap already happened this second).
-    let since_update = now - last_update;
-    let cum_now = latest_cum.wrapping_add(spot_price_x32.wrapping_mul(since_update as u128));
-
-    // The newest point at least a window old: the latest record itself (as of
-    // `last_update`) if that's old enough, else walk back through the ring buffer.
-    let cutoff = now.checked_sub(TWAP_WINDOW_SECONDS).ok_or(EndowmentError::TwapUnavailable)?;
-    let (base_ts, base_cum) = if last_update <= cutoff {
-        (last_update, latest_cum)
-    } else {
-        let mut found = None;
-        for step in 1..OBSERVATION_NUM {
-            let i = (latest + OBSERVATION_NUM - step) % OBSERVATION_NUM;
-            let (ts, cum) = cumulative(i);
-            if ts == 0 || ts > latest_ts {
-                // Empty slot, or wrapped around to entries newer than `latest`: no older history.
-                break;
-            }
-            if ts <= cutoff {
-                found = Some((ts, cum));
-                break;
-            }
+    let cap = TWAP_WINDOW_SECONDS * MAX_STRETCH_SHARE_BPS / 10_000;
+    // The newer end of the stretch being added: its timestamp, cumulative time
+    // (the latest record is exact as of `end`), and weighted price and weight so far.
+    let (mut newer_ts, mut newer_time, mut newer_cum) = (latest_ts, end, latest_cum);
+    let (mut weighted, mut weight) = (0u128, 0u64);
+    for step in 1..OBSERVATION_NUM {
+        let i = (latest + OBSERVATION_NUM - step) % OBSERVATION_NUM;
+        let (ts, cum) = cumulative(i);
+        if ts == 0 || ts >= newer_ts {
+            // Empty slot, or wrapped around to newer entries: no older history.
+            break;
         }
-        found.ok_or(EndowmentError::TwapUnavailable)?
-    };
-
-    let elapsed = now - base_ts;
-    require!(elapsed >= TWAP_WINDOW_SECONDS, EndowmentError::TwapUnavailable);
-    let twap = cum_now.wrapping_sub(base_cum) / elapsed as u128;
-    require!(twap > 0, EndowmentError::TwapUnavailable);
-    Ok(twap)
+        let time = (ts + RAYDIUM_OBSERVATION_COALESCE_SECONDS / 2).min(newer_time);
+        let seconds = newer_time - time;
+        let delta = newer_cum.wrapping_sub(cum);
+        let (add, secs) = if seconds > cap {
+            // Its average price, for the capped time.
+            ((delta / seconds as u128).checked_mul(cap as u128).ok_or(EndowmentError::TwapUnavailable)?, cap)
+        } else {
+            (delta, seconds)
+        };
+        weighted = weighted.checked_add(add).ok_or(EndowmentError::TwapUnavailable)?;
+        weight += secs;
+        if weight >= TWAP_WINDOW_SECONDS {
+            let twap = weighted / weight as u128;
+            require!(twap > 0, EndowmentError::TwapUnavailable);
+            return Ok(twap);
+        }
+        (newer_ts, newer_time, newer_cum) = (ts, time, cum);
+    }
+    err!(EndowmentError::TwapUnavailable)
 }
 
 #[cfg(test)]
@@ -222,35 +232,105 @@ mod tests {
         data
     }
 
+    /// Records every `gap` seconds from `from`, at a constant price per record
+    /// (the price of the stretch each record closes), each cumulative exact as
+    /// of `coalesced` seconds after its timestamp.
+    fn history(prices: &[u128], from: u64, gap: u64, coalesced: u64) -> (Vec<(usize, u64, u128)>, u64) {
+        let mut entries = vec![(0, from, prices[0] * coalesced as u128)];
+        let mut cum = prices[0] * coalesced as u128;
+        let mut exact = from + coalesced;
+        for (i, &p) in prices.iter().enumerate().skip(1) {
+            let ts = from + gap * i as u64;
+            cum += p * (ts + coalesced - exact) as u128;
+            exact = ts + coalesced;
+            entries.push((i, ts, cum));
+        }
+        (entries, exact)
+    }
+
     const P: u128 = 7 << 32;
 
     #[test]
-    fn twap_averages_recorded_prices_over_the_window() {
+    fn twap_averages_recorded_prices_and_ignores_the_spot_price() {
         let pool = Pubkey::new_unique();
-        // Price 7 from t=1,000 to t=2,000, then 9 until the last update at t=2,500.
-        let data = observation(&pool, 2, 2_500, &[(0, 1_000, 0), (1, 2_000, 7 * 1_000 << 32), (2, 2_000, (7 * 1_000 + 9 * 500) << 32)]);
-        // At t=2,500, with a manipulated spot of 100 this very second: it gets no weight.
-        let twap = twap_price_x32(&data, &pool, 0, 100 << 32, 2_500).unwrap();
-        // Window base is the newest record ≤ 1,900: t=1,000. (7,000 + 4,500) / 1,500 = 7.67.
-        assert_eq!(twap, ((7 * 1_000 + 9 * 500) << 32) / 1_500);
+        // Price 7 every 100 s from t=1,000 to 3,800, then a stretch closed at 9.
+        let mut prices = vec![P; 29];
+        prices.push(9 << 32);
+        let (entries, end) = history(&prices, 1_000, 100, 0);
+        let data = observation(&pool, 29, end, &entries);
+        // Long after, whatever the pool's price now: only the record counts.
+        let twap = twap_price_x32(&data, &pool, 0, end + 100_000).unwrap();
+        // Span ends at 3,900; the newest start at least 1,800 back is the record
+        // at 2,000, taken as of 2,007: (18 × 100 × 7 + 100 × 9) / 1,893.
+        assert_eq!(twap, ((1_800 * 7 + 900) << 32) / 1_893);
     }
 
     #[test]
-    fn twap_weights_the_current_price_for_the_seconds_since_the_last_update() {
+    fn f01_a_coalesced_base_record_no_longer_biases_the_twap_low() {
         let pool = Pubkey::new_unique();
-        let data = observation(&pool, 0, 1_000, &[(0, 1_000, 0)]);
-        // Nothing traded for 1,000 seconds: the average is the spot price that held.
-        assert_eq!(twap_price_x32(&data, &pool, 0, P, 2_000).unwrap(), P);
+        let bound = P * 7 / TWAP_WINDOW_SECONDS as u128;
+        // Constant price, every record's cumulative running 14 s past its timestamp
+        // (the attacker's case: round 1 read this 14 s / span low).
+        let (entries, end) = history(&[P; 40], 1_000, 60, 14);
+        let data = observation(&pool, 39, end, &entries);
+        let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
+        assert!(P - twap <= bound, "{twap}");
+        // Nothing coalesced: it reads at most as far high.
+        let (entries, end) = history(&[P; 40], 1_000, 60, 0);
+        let data = observation(&pool, 39, end, &entries);
+        let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
+        assert!(twap >= P && twap - P <= bound, "{twap}");
     }
 
     #[test]
-    fn twap_needs_a_full_window_of_history_and_the_right_pool() {
+    fn a_long_quiet_stretch_needs_no_more_history_than_the_window() {
         let pool = Pubkey::new_unique();
-        let data = observation(&pool, 0, 1_000, &[(0, 1_000, 0)]);
-        assert!(twap_price_x32(&data, &pool, 0, P, 1_500).is_err());
-        assert!(twap_price_x32(&data, &Pubkey::new_unique(), 0, P, 2_000).is_err());
+        // A day with no swap, then one: the day counts for half the window, at
+        // its own price, and 15 minutes of earlier history fill the rest.
+        let (mut entries, _) = history(&[P; 10], 1_000, 100, 0);
+        let day_end = 1_000 + 9 * 100 + 86_400;
+        entries.push((10, day_end, entries[9].2 + 8 * (1 << 32) * 86_400));
+        let data = observation(&pool, 10, day_end, &entries);
+        let twap = twap_price_x32(&data, &pool, 0, day_end).unwrap();
+        assert!(twap > (15 << 32) / 2 - P / 100 && twap < (15 << 32) / 2 + P / 100, "{twap}");
+    }
+
+    #[test]
+    fn r2cc01_one_long_stretch_closed_at_a_moved_price_is_at_most_half_the_weight() {
+        let pool = Pubkey::new_unique();
+        // A quiet pool: records every 100 s at 7, then an hour with no swap, then
+        // coin sent straight into the pool and a swap that prices the hour at 14,
+        // and a second swap 15 s later.
+        let (mut entries, _) = history(&[P; 90], 1_000, 100, 0);
+        let hour_end = 1_000 + 89 * 100 + 3_600;
+        let mut cum = entries[89].2 + 2 * P * 3_600;
+        entries.push((90, hour_end, cum));
+        cum += 2 * P * 15;
+        entries.push((91, hour_end + 15, cum));
+        let data = observation(&pool, 91, hour_end + 15, &entries);
+        let twap = twap_price_x32(&data, &pool, 0, hour_end + 15).unwrap();
+        // The hour counts for at most half the 30-minute window: ≤ (7 + 14) / 2.
+        assert!(twap <= P * 3 / 2 + P / 50, "{twap}");
+        assert!(twap > P * 3 / 2 - P / 50, "{twap}");
+    }
+
+    #[test]
+    fn twap_needs_enough_history_and_the_right_pool() {
+        let pool = Pubkey::new_unique();
+        let (entries, end) = history(&[P; 5], 1_000, 100, 0);
+        let data = observation(&pool, 4, end, &entries);
+        // 400 s of history is not a window.
+        assert!(twap_price_x32(&data, &pool, 0, end).is_err());
+        let (entries, end) = history(&[P; 30], 1_000, 100, 0);
+        let data = observation(&pool, 29, end, &entries);
+        assert!(twap_price_x32(&data, &pool, 0, end).is_ok());
+        assert!(twap_price_x32(&data, &pool, 0, end - 1).is_err(), "a record from the future");
+        assert!(twap_price_x32(&data, &Pubkey::new_unique(), 0, end).is_err());
         let mut short = data.clone();
         short.pop();
-        assert!(twap_price_x32(&short, &pool, 0, P, 2_000).is_err());
+        assert!(twap_price_x32(&short, &pool, 0, end).is_err());
+        // One record, however old, spans nothing.
+        let data = observation(&pool, 0, 1_000, &[(0, 1_000, 0)]);
+        assert!(twap_price_x32(&data, &pool, 0, 100_000).is_err());
     }
 }

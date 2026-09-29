@@ -1,8 +1,10 @@
 pub mod constants;
 pub mod error;
 pub mod events;
+pub mod health;
 pub mod instructions;
 pub mod math;
+pub mod mint_policy;
 pub mod raydium;
 pub mod state;
 pub mod transfer;
@@ -75,12 +77,14 @@ pub mod endowment {
         instructions::count::handle_finish_count(ctx)
     }
 
-    /// Decrease-only re-read of landlords' balances between counts.
+    /// Decrease-only re-read of landlords' balances between counts. When the
+    /// endowment's refresher signs, it also attests them (see `count`).
     pub fn refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'info>>) -> Result<()> {
         instructions::count::handle_refresh_landlords(ctx)
     }
 
-    /// Parameters: proposed by the admin, applied by anyone after 72 hours.
+    /// Parameters: proposed by the admin, applied after 72 hours (by the admin
+    /// for the first day, then by anyone, until the proposal expires).
     pub fn propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<()> {
         instructions::roles::handle_propose_params(ctx, params)
     }
@@ -102,6 +106,7 @@ pub mod endowment {
         instructions::pause::handle_unpause(ctx)
     }
 
+    /// Timelocked: the first call proposes, a call 72 hours later retires.
     pub fn retire(ctx: Context<AdminOnly>) -> Result<()> {
         instructions::roles::handle_retire(ctx)
     }

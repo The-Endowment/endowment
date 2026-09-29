@@ -1,12 +1,16 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+use anchor_spl::{
+    associated_token::get_associated_token_address_with_program_id,
+    token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
+};
 
 use crate::{
     constants::*,
     error::EndowmentError,
     events::Swept,
+    health::{ensure_tradeable, TradeAccounts},
+    raydium::CPMM_PROGRAM_ID,
     state::{Config, Landlord},
-    transfer::hook_enabled,
 };
 
 /// Permissionless: anyone may crank a sweep. Funds can only move from the
@@ -15,8 +19,11 @@ use crate::{
 /// baseline: a dip below it sweeps nothing and leaves it where it is.
 ///
 /// Sweeps keep running after the milestone; they stop for good only if the admin
-/// retires the endowment. They fail closed if the dividend mint's transfer hook
-/// is ever switched on, since buybacks can't spend such a dividend through Raydium.
+/// retires the endowment. They run only while the endowment is active and a count
+/// has finished recently (`Config::sweeps_on`), and they fail closed whenever a
+/// buyback couldn't run (`health::ensure_tradeable`): a transfer hook switched
+/// on, either mint's transfer fee above the cap, the pool's swaps disabled or
+/// its fee above the cap, or a vault frozen. Dividends then stay with landlords.
 #[derive(Accounts)]
 pub struct Sweep<'info> {
     #[account(
@@ -38,7 +45,11 @@ pub struct Sweep<'info> {
 
     #[account(address = config.dividend_mint)]
     pub dividend_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(mut, address = landlord.dividend_account)]
+    #[account(
+        mut,
+        address = landlord.dividend_account,
+        constraint = dividend_account.owner == landlord.owner @ EndowmentError::NotDelegated,
+    )]
     pub dividend_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
@@ -48,20 +59,56 @@ pub struct Sweep<'info> {
     )]
     pub dividend_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// What a buyback would trade through; read only, to check it can.
+    #[account(address = config.coin_mint)]
+    pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CHECK: the endowment's coin vault, at its derived address; only its
+    /// frozen state is read.
+    #[account(
+        address = get_associated_token_address_with_program_id(
+            &authority.key(),
+            &config.coin_mint,
+            coin_mint.to_account_info().owner,
+        ) @ EndowmentError::WrongPool,
+    )]
+    pub coin_vault: UncheckedAccount<'info>,
+    /// CHECK: the endowment's pool; parsed by `ensure_tradeable`.
+    #[account(address = config.pool @ EndowmentError::WrongPool, owner = CPMM_PROGRAM_ID)]
+    pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: the pool's AMM config; checked against the pool.
+    #[account(owner = CPMM_PROGRAM_ID)]
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: the pool's dividend vault; checked against the pool.
+    pub pool_dividend_vault: UncheckedAccount<'info>,
+    /// CHECK: the pool's coin vault; checked against the pool.
+    pub pool_coin_vault: UncheckedAccount<'info>,
+
     pub dividend_token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &ctx.accounts.config;
     require!(!config.is_paused(now), EndowmentError::Paused);
     require!(!config.retired, EndowmentError::Retired);
     require!(config.active, EndowmentError::NotActive);
-    require!(
-        !hook_enabled(&ctx.accounts.dividend_mint.to_account_info())?,
-        EndowmentError::TransferHookEnabled
-    );
+    require!(config.sweeps_on(now), EndowmentError::CountStale);
+    let a = &ctx.accounts;
+    ensure_tradeable(
+        config,
+        &TradeAccounts {
+            dividend_mint: &a.dividend_mint.to_account_info(),
+            coin_mint: &a.coin_mint.to_account_info(),
+            pool_state: &a.pool_state.to_account_info(),
+            amm_config: &a.amm_config.to_account_info(),
+            pool_dividend_vault: &a.pool_dividend_vault.to_account_info(),
+            pool_coin_vault: &a.pool_coin_vault.to_account_info(),
+            vaults: [&a.dividend_vault.to_account_info(), &a.coin_vault.to_account_info()],
+        },
+        clock.epoch,
+    )?;
 
     let dividend_account = &ctx.accounts.dividend_account;
     require!(
@@ -99,6 +146,7 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     landlord.last_sweep_at = now;
     let config = &mut ctx.accounts.config;
     config.total_swept = config.total_swept.checked_add(received).ok_or(EndowmentError::Overflow)?;
+    config.last_sweep_at = now;
 
     emit!(Swept {
         config: config_key,

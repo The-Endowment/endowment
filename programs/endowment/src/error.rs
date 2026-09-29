@@ -84,4 +84,18 @@ pub enum EndowmentError {
     NotPrunable,
     #[msg("Parameters are outside the hard-coded bounds")]
     InvalidParams,
+    #[msg("A vault is frozen, so buybacks can't run")]
+    VaultFrozen,
+    #[msg("No commitment count has finished recently")]
+    CountStale,
+    #[msg("This parameter proposal has expired")]
+    ProposalExpired,
+    #[msg("Only the admin can apply a proposal in its first day")]
+    ApplyGrace,
+    #[msg("Cancel pending changes before renouncing")]
+    PendingChange,
+    #[msg("The retirement timelock has not elapsed")]
+    RetireNotReady,
+    #[msg("This mint has an authority or extension the endowment can't accept")]
+    UnsafeMint,
 }

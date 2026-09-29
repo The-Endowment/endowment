@@ -24,6 +24,11 @@ pub struct Params {
     pub deactivate_bps: u16,
     /// Minimum share of supply a landlord must hold to register and be counted.
     pub min_stake_bps: u16,
+    /// The key whose refreshes make landlords eligible to count (see
+    /// `refresh_landlords`). It can't move funds or raise anyone's count: it
+    /// only confirms, at times nobody else chooses, what each landlord holds.
+    /// `Pubkey::default()` = none, so nobody counts and sweeps stay off.
+    pub refresher: Pubkey,
 }
 
 impl Params {
@@ -68,6 +73,9 @@ pub struct CountRound {
     pub counted: u32,
     /// Sum of what the counted landlords count for.
     pub committed: u64,
+    /// The minimum stake for this round, fixed when it began, so a parameter
+    /// change mid-round can't treat landlords in one round differently.
+    pub min_stake: u64,
 }
 
 /// A parameter change waiting out the timelock.
@@ -111,8 +119,11 @@ pub struct Config {
 
     /// Unix timestamp; everything but leaving is blocked while `now < paused_until`.
     pub paused_until: i64,
-    /// One-way: no more sweeps or registrations. Set only by the admin.
+    /// One-way: no more sweeps or registrations. Set only by the admin, after
+    /// the parameter timelock (`retire_at`).
     pub retired: bool,
+    /// When a proposed retirement can take effect; 0 = none proposed.
+    pub retire_at: i64,
     /// One-way: set when `total_coin_bought` reaches `contribution_cap`.
     pub milestone_reached: bool,
 
@@ -123,6 +134,9 @@ pub struct Config {
     pub last_count_at: i64,
     pub last_count_bps: u16,
     pub last_committed: u64,
+    /// Last refresh by the refresher, and last sweep, for monitoring.
+    pub last_attested_at: i64,
+    pub last_sweep_at: i64,
 
     /// Registered landlords (no limit).
     pub landlord_count: u32,
@@ -171,6 +185,24 @@ impl Config {
         now < self.paused_until
     }
 
+    /// Sweeps run only while active, and (outside a 0-threshold test window)
+    /// only while a count has finished recently: a count nobody runs can't keep
+    /// an endowment switched on.
+    pub fn sweeps_on(&self, now: i64) -> bool {
+        self.active
+            && (self.params.activate_bps == 0 || now.saturating_sub(self.last_count_at) <= ACTIVE_MAX_AGE_SECS)
+    }
+
+    /// When the open round's timeout clock started: its start, or the end of a
+    /// pause that overlapped it, so a pause can't run the clock out.
+    pub fn count_clock_start(&self) -> i64 {
+        if self.paused_until > self.count.started_at {
+            self.paused_until
+        } else {
+            self.count.started_at
+        }
+    }
+
     /// Hysteresis: on at or above `activate_bps`, off below `deactivate_bps`,
     /// unchanged in between.
     pub fn apply_committed_bps(&mut self, committed_bps: u16) {
@@ -213,10 +245,11 @@ impl Config {
 pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pubkey) -> Result<()> {
     require!(ALLOWED_DONATION_BPS.contains(&donation_bps), EndowmentError::InvalidDonation);
     if donation_bps > 0 {
-        // Only the flagship's dividend asset can be donated, and the flagship
-        // doesn't donate to itself.
+        // Only once the flagship's address is fixed, only in the flagship's
+        // dividend asset, and the flagship never donates to itself.
+        require!(flagship_is_set(), EndowmentError::InvalidDonation);
         require_keys_eq!(*dividend_mint, FLAGSHIP_DIVIDEND_MINT, EndowmentError::InvalidDonation);
-        require_keys_neq!(*config, FLAGSHIP_CONFIG, EndowmentError::InvalidDonation);
+        require_keys_neq!(*config, flagship_config(), EndowmentError::InvalidDonation);
     }
     Ok(())
 }
@@ -247,11 +280,18 @@ pub struct Landlord {
     /// The last round this landlord was counted in, and what it counted for.
     pub counted_round: u64,
     pub counted_amount: u64,
-    /// Coin balance read at this landlord's last count. The next count credits
-    /// at most this, so coin must be held from one count to the next to count.
+    /// Coin balance read at this landlord's last count, lowered by any later
+    /// refresh that found less. The next count credits at most this, so coin
+    /// must be held from one count to the next to count.
     pub snapshot: u64,
-    /// False until the landlord's first count (which therefore counts zero).
+    /// True once a count (or refresh) has read this landlord while delegated.
+    /// Cleared whenever it's found not delegated, so re-approving costs a round.
     pub snapshot_valid: bool,
+    /// Set when the endowment's refresher has read this landlord since its last
+    /// count read. A landlord only counts if so: the refresher's reads land at
+    /// times the landlord doesn't choose, so coin can't be shown to it in two
+    /// wallets, and a delegation held only around count time is caught.
+    pub attested: bool,
 
     /// Room for future fields without a migration.
     pub reserved: [u8; 64],
@@ -264,8 +304,10 @@ impl Landlord {
         balance.saturating_sub(self.baseline).min(delegated)
     }
 
-    /// What this landlord counts for, given its coin balance now: the smaller of
-    /// that and its balance at its previous count (zero at its first count).
+    /// What this landlord's coin balance now is worth, before the delegation,
+    /// attestation and minimum-stake checks: the smaller of that and its
+    /// recorded balance (zero at its first count, or after it was found not
+    /// delegated).
     pub fn held(&self, balance: u64) -> u64 {
         if self.snapshot_valid {
             balance.min(self.snapshot)
@@ -296,6 +338,7 @@ mod tests {
             counted_amount: 0,
             snapshot: 0,
             snapshot_valid: false,
+            attested: false,
             reserved: [0; 64],
         }
     }
@@ -312,6 +355,7 @@ mod tests {
             activate_bps: 3_000,
             deactivate_bps: 2_500,
             min_stake_bps: 10,
+            refresher: Pubkey::new_unique(),
         }
     }
 
@@ -417,6 +461,27 @@ mod tests {
     }
 
     #[test]
+    fn the_flagship_config_is_the_pda_of_its_coin_and_creator() {
+        let (expected, _) = Pubkey::find_program_address(
+            &[b"config", FLAGSHIP_COIN_MINT.as_ref(), FLAGSHIP_CREATOR.as_ref()],
+            &crate::ID,
+        );
+        assert_eq!(flagship_config(), expected);
+    }
+
+    #[cfg(not(feature = "test-flagship"))]
+    #[test]
+    fn no_donation_while_the_flagship_creator_is_a_placeholder() {
+        assert!(!flagship_is_set());
+        let instance = Pubkey::new_unique();
+        assert!(validate_donation(0, &FLAGSHIP_DIVIDEND_MINT, &instance).is_ok());
+        for bps in [10, 20, 30] {
+            assert!(validate_donation(bps, &FLAGSHIP_DIVIDEND_MINT, &instance).is_err());
+        }
+    }
+
+    #[cfg(feature = "test-flagship")]
+    #[test]
     fn donation_is_one_of_the_fixed_rates_and_only_in_the_flagship_asset() {
         let other = Pubkey::new_unique();
         let instance = Pubkey::new_unique();
@@ -428,7 +493,28 @@ mod tests {
         assert!(validate_donation(0, &other, &instance).is_ok());
         assert!(validate_donation(10, &other, &instance).is_err());
         // The flagship never donates to itself.
-        assert!(validate_donation(10, &FLAGSHIP_DIVIDEND_MINT, &FLAGSHIP_CONFIG).is_err());
-        assert!(validate_donation(0, &FLAGSHIP_DIVIDEND_MINT, &FLAGSHIP_CONFIG).is_ok());
+        assert!(validate_donation(10, &FLAGSHIP_DIVIDEND_MINT, &flagship_config()).is_err());
+        assert!(validate_donation(0, &FLAGSHIP_DIVIDEND_MINT, &flagship_config()).is_ok());
+    }
+
+    #[test]
+    fn a_stale_count_switches_sweeps_off() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.active = true;
+        config.params.activate_bps = 3_000;
+        config.last_count_at = 1_000;
+        assert!(config.sweeps_on(1_000 + ACTIVE_MAX_AGE_SECS));
+        assert!(!config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS));
+        config.params.activate_bps = 0;
+        assert!(config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS), "not in a 0-threshold test window");
+    }
+
+    #[test]
+    fn a_pause_restarts_the_count_timeout_clock() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.count.started_at = 100;
+        assert_eq!(config.count_clock_start(), 100);
+        config.paused_until = 5_000;
+        assert_eq!(config.count_clock_start(), 5_000);
     }
 }

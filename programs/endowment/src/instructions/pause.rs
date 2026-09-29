@@ -11,7 +11,7 @@ pub struct Pause<'info> {
         bump = config.bump,
         has_one = guardian @ EndowmentError::NotGuardian,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 }
 
 #[derive(Accounts)]
@@ -23,7 +23,7 @@ pub struct Unpause<'info> {
         bump = config.bump,
         has_one = admin @ EndowmentError::NotAdmin,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 }
 
 /// A circuit breaker, not a switch: a pause lasts MAX_PAUSE_SECONDS and can't be

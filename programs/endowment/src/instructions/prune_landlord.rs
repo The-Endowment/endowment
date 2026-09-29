@@ -48,10 +48,15 @@ pub struct PruneLandlord<'info> {
 
 pub fn handle_prune_landlord(ctx: Context<PruneLandlord>) -> Result<()> {
     let authority = ctx.accounts.authority.key();
+    let owner = ctx.accounts.landlord.owner;
+    // An account reassigned to someone else (legacy SPL Token allows it) no
+    // longer holds or delegates anything for this landlord.
     let delegated = read_token_account(&ctx.accounts.dividend_account)?
-        .map(|t| t.delegates_to(&authority))
+        .map(|t| t.owner == owner && t.delegates_to(&authority))
         .unwrap_or(false);
-    let held = read_token_account(&ctx.accounts.coin_account)?.map(|t| t.amount).unwrap_or(0);
+    let held = read_token_account(&ctx.accounts.coin_account)?
+        .map(|t| if t.owner == owner { t.amount } else { 0 })
+        .unwrap_or(0);
     let config = &mut ctx.accounts.config;
     let staked = held >= config.min_stake(ctx.accounts.coin_mint.supply);
     require!(!delegated || !staked, EndowmentError::NotPrunable);

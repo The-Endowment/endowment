@@ -8,12 +8,15 @@ use crate::{
     constants::*,
     error::EndowmentError,
     events::EndowmentCreated,
+    mint_policy::{check_coin_mint, check_dividend_mint},
     raydium::{PoolView, CPMM_PROGRAM_ID},
     state::{validate_donation, Config, CountRound, CreateParams, PendingParams},
 };
 
 /// Permissionless: anyone can create an endowment for any coin that trades
-/// against its dividend asset in a Raydium CPMM pool.
+/// against its dividend asset in a Raydium CPMM pool, if both mints pass the
+/// mint policy (`mint_policy`): in short, nobody may be able to mint, freeze,
+/// pause or take back the coin.
 ///
 /// The instance's address includes the creator, so nobody can occupy or
 /// front-run another creator's endowment: a squatter only ever creates a
@@ -74,6 +77,8 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     let coin_mint = ctx.accounts.coin_mint.key();
     let dividend_mint = ctx.accounts.dividend_mint.key();
     require_keys_neq!(coin_mint, dividend_mint, EndowmentError::SameMint);
+    check_coin_mint(&ctx.accounts.coin_mint.to_account_info())?;
+    check_dividend_mint(&ctx.accounts.dividend_mint.to_account_info())?;
 
     // The pool must trade exactly this coin against exactly this dividend asset,
     // in either order.
@@ -82,7 +87,12 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     let dividend_index = pool.index_of(&dividend_mint)?;
     require!(coin_index != dividend_index, EndowmentError::WrongPool);
 
-    create.params.validate(create.donation_bps)?;
+    let mut params = create.params;
+    // The refresher defaults to the creator, like the admin and guardian.
+    if params.refresher == Pubkey::default() {
+        params.refresher = ctx.accounts.creator.key();
+    }
+    params.validate(create.donation_bps)?;
     validate_donation(create.donation_bps, &dividend_mint, &ctx.accounts.config.key())?;
     require!(create.contribution_cap > 0, EndowmentError::InvalidContributionCap);
 
@@ -101,20 +111,23 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         pool: ctx.accounts.pool_state.key(),
         bump: ctx.bumps.config,
         authority_bump: ctx.bumps.authority,
-        params: create.params,
+        params,
         pending: PendingParams::default(),
         donation_bps: create.donation_bps,
         contribution_cap: create.contribution_cap,
         paused_until: 0,
         retired: false,
+        retire_at: 0,
         milestone_reached: false,
         active: false,
         last_count_at: 0,
         last_count_bps: 0,
         last_committed: 0,
+        last_attested_at: 0,
+        last_sweep_at: 0,
         landlord_count: 0,
         count: CountRound::default(),
-        buy_allowance: create.params.max_buy_per_tx,
+        buy_allowance: params.max_buy_per_tx,
         allowance_updated_at: now,
         last_buy_at: 0,
         total_swept: 0,

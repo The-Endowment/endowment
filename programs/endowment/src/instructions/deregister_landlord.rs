@@ -19,7 +19,7 @@ pub struct DeregisterLandlord<'info> {
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     #[account(
         mut,
         close = owner,
@@ -28,7 +28,7 @@ pub struct DeregisterLandlord<'info> {
         has_one = owner,
         has_one = config,
     )]
-    pub landlord: Account<'info, Landlord>,
+    pub landlord: Box<Account<'info, Landlord>>,
 }
 
 pub fn handle_deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {

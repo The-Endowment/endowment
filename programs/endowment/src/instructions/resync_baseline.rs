@@ -18,7 +18,7 @@ pub struct ResyncBaseline<'info> {
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     #[account(
         mut,
         seeds = [LANDLORD_SEED, config.key().as_ref(), owner.key().as_ref()],
@@ -26,9 +26,12 @@ pub struct ResyncBaseline<'info> {
         has_one = owner,
         has_one = config,
     )]
-    pub landlord: Account<'info, Landlord>,
-    #[account(address = landlord.dividend_account)]
-    pub dividend_account: InterfaceAccount<'info, TokenAccount>,
+    pub landlord: Box<Account<'info, Landlord>>,
+    #[account(
+        address = landlord.dividend_account,
+        constraint = dividend_account.owner == owner.key() @ crate::error::EndowmentError::NotDelegated,
+    )]
+    pub dividend_account: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 pub fn handle_resync_baseline(ctx: Context<ResyncBaseline>) -> Result<()> {
