@@ -153,6 +153,14 @@ fn send(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair, signers: &[&Key
         Ok(meta) => {
             LAST_ERR.with(|c| c.set(None));
             LAST_CU.with(|c| c.set(meta.compute_units_consumed));
+            // CU_LOG=1: print compute used per successful endowment instruction,
+            // to compare builds (see scripts/test.sh).
+            if std::env::var("CU_LOG").is_ok() {
+                if let Some(ix) = ixs.iter().find(|ix| ix.program_id == endowment::id()) {
+                    let disc: String = ix.data.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                    println!("CU_OK {disc} {}", meta.compute_units_consumed);
+                }
+            }
         }
         Err(failed) => {
             // Captured by the test harness; shown only when a test fails.

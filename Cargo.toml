@@ -9,6 +9,10 @@ edition = "2021"
 rust-version = "1.89.0"
 
 [profile.release]
+# Optimize for size: about 11% smaller than opt-level 3 (less rent for the
+# program account) for roughly 10-35% more compute per instruction. "z" is
+# smaller still but overflows the 4 KB SBF stack frame in `buyback`.
+opt-level = "s"
 overflow-checks = true
 lto = "fat"
 codegen-units = 1
