@@ -1,6 +1,8 @@
 # The $PENIS Endowment
 
-Permanent capital for buybacks, liquidity, and growth. The only holder that can never pull out.
+Permanent capital. The only holder that can never pull out.
+
+Website: [penis-endowment.vercel.app](https://penis-endowment.vercel.app) ([source](https://github.com/The-PENIS-Endowment/website))
 
 The endowment is a Solana program that holds $PENIS forever and spends only the PUMP it earns. Landlords (large holders) opt in by delegating their PUMP rewards to it, and nothing else.
 
@@ -23,14 +25,14 @@ The endowment's own $PENIS earns PUMP dividends too. They land directly in the P
 
 ## Status
 
-| Phase | Scope | State |
-|---|---|---|
-| 1 | Opt-in, sweeps, pause, permanent vaults | ✅ Built and tested locally |
-| 1 | Buybacks (PUMP → $PENIS in the Raydium PENIS/PUMP pool) | ✅ Built and tested against mainnet pool state |
-| 2 | Web app: delegate/revoke, dashboard, leaderboard, ledger | Planned |
-| 3 | Thermostat: liquidity adds, marketing stream, timelocked parameters | Planned (after an external audit) |
+Pre-launch, in testing.
 
-Not deployed to mainnet. Not audited.
+| Scope | State |
+|---|---|
+| Opt-in, sweeps, pause, permanent vaults | ✅ Built and tested |
+| Buybacks (PUMP → $PENIS in the Raydium PENIS/PUMP pool) | ✅ Built and tested against mainnet pool state |
+| v1 rules: activation threshold (on at 30% committed, off below 25%), contributions close at 200M, post-200M split between buybacks and permanently locked liquidity | In progress |
+| Test period with small caps, then the upgrade key is destroyed | Planned |
 
 ## Development
 
