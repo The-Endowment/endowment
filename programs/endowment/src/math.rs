@@ -33,6 +33,35 @@ pub fn min_acceptable_out(
     u64::try_from(after_transfer_fee * allowance / BPS).ok()
 }
 
+/// How much PUMP one buyback spends, decided by the contract: whatever the
+/// vault holds (leaving room for the tip), capped per transaction and by
+/// what's left of today's cap.
+pub fn buy_amount(vault_balance: u64, tip_bps: u16, max_per_tx: u64, left_today: u64) -> u64 {
+    let spendable = (vault_balance as u128 * BPS / (BPS + tip_bps as u128)) as u64;
+    spendable.min(max_per_tx).min(left_today)
+}
+
+/// Splits a buyback: `buy_bps` buys $PENIS; the rest becomes liquidity, half
+/// of it swapped to $PENIS first. Returns (pump_to_swap, pump_to_deposit, liquidity_swap_share).
+pub fn split_buy(amount_in: u64, buy_bps: u16) -> (u64, u64, u64) {
+    let buy_part = (amount_in as u128 * buy_bps as u128 / BPS) as u64;
+    let lp_part = amount_in - buy_part;
+    let lp_swap = lp_part / 2;
+    (buy_part + lp_swap, lp_part - lp_swap, lp_swap)
+}
+
+/// LP tokens to request so Raydium's rounded-up deposit fits within what we
+/// have. `penis_net` is $PENIS available after its transfer fee.
+pub fn lp_tokens_for(pump: u64, penis_net: u64, reserve_pump: u64, reserve_penis: u64, lp_supply: u64) -> u64 {
+    if reserve_pump == 0 || reserve_penis == 0 || lp_supply == 0 {
+        return 0;
+    }
+    let by_pump = pump as u128 * lp_supply as u128 / reserve_pump as u128;
+    let by_penis = penis_net as u128 * lp_supply as u128 / reserve_penis as u128;
+    // One unit of headroom for Raydium's ceiling rounding.
+    (by_pump.min(by_penis).saturating_sub(1)).min(u64::MAX as u128) as u64
+}
+
 /// Starts a new 24-hour window once the current one has elapsed.
 /// Returns (day_start, bought_today).
 pub fn roll_day(day_start: i64, bought_today: u64, now: i64) -> (i64, u64) {
@@ -58,6 +87,32 @@ mod tests {
     fn rejects_empty_pools_and_impossible_allowances() {
         assert_eq!(min_acceptable_out(1_000, 0, 70_000_000, 25, 300, 100), None);
         assert_eq!(min_acceptable_out(1_000, 1, 1, 9_950, 0, 100), None);
+    }
+
+    #[test]
+    fn buy_amount_leaves_room_for_the_tip_and_respects_caps() {
+        // 10,025 in the vault at a 25 bps tip: 10,000 spent + 25 tip.
+        assert_eq!(buy_amount(10_025, 25, u64::MAX, u64::MAX), 10_000);
+        assert_eq!(buy_amount(10_025, 25, 4_000, u64::MAX), 4_000);
+        assert_eq!(buy_amount(10_025, 25, 4_000, 1_500), 1_500);
+        assert_eq!(buy_amount(0, 25, 4_000, 1_500), 0);
+    }
+
+    #[test]
+    fn split_sends_the_liquidity_share_half_to_the_swap() {
+        assert_eq!(split_buy(1_000, 10_000), (1_000, 0, 0));
+        // 70% buy: 700 buys, 300 to liquidity (150 swapped, 150 deposited).
+        assert_eq!(split_buy(1_000, 7_000), (850, 150, 150));
+        assert_eq!(split_buy(1_001, 0), (500, 501, 500));
+    }
+
+    #[test]
+    fn lp_request_fits_both_sides() {
+        // Pool 1,000 PUMP : 7,000 PENIS, 100 LP supply. 10 PUMP + 70 PENIS → 1 LP, minus headroom.
+        assert_eq!(lp_tokens_for(100, 700, 1_000, 7_000, 1_000), 99);
+        // The scarcer side limits it.
+        assert_eq!(lp_tokens_for(100, 350, 1_000, 7_000, 1_000), 49);
+        assert_eq!(lp_tokens_for(100, 700, 0, 7_000, 1_000), 0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod instructions;
 pub mod math;
 pub mod raydium;
 pub mod state;
+pub mod transfer;
 
 use anchor_lang::prelude::*;
 
@@ -17,8 +18,8 @@ declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
 /// The $PENIS Endowment.
 ///
 /// There is deliberately no instruction that transfers tokens out of the
-/// $PENIS vault. Landlords can always leave by revoking their token
-/// delegation directly with the token program.
+/// $PENIS vault or the liquidity (LP) vault. Landlords can always leave by
+/// revoking their token delegation directly with the token program.
 #[program]
 pub mod endowment {
     use super::*;
@@ -27,7 +28,6 @@ pub mod endowment {
         ctx: Context<Initialize>,
         admin: Pubkey,
         guardian: Pubkey,
-        supply_target_bps: u16,
         pool: Pubkey,
         max_buy_per_tx: u64,
         max_buy_per_day: u64,
@@ -37,7 +37,6 @@ pub mod endowment {
             ctx,
             admin,
             guardian,
-            supply_target_bps,
             pool,
             max_buy_per_tx,
             max_buy_per_day,
@@ -45,8 +44,47 @@ pub mod endowment {
         )
     }
 
-    pub fn buyback(ctx: Context<Buyback>, amount_in: u64, min_out: u64) -> Result<()> {
-        instructions::buyback::handle_buyback(ctx, amount_in, min_out)
+    /// Landlords.
+    pub fn register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
+        instructions::register_landlord::handle_register_landlord(ctx)
+    }
+
+    pub fn deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {
+        instructions::deregister_landlord::handle_deregister_landlord(ctx)
+    }
+
+    /// Permissionless cranks.
+    pub fn sweep<'info>(ctx: Context<'info, Sweep<'info>>) -> Result<()> {
+        instructions::sweep::handle_sweep(ctx)
+    }
+
+    pub fn buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) -> Result<()> {
+        instructions::buyback::handle_buyback(ctx, min_out)
+    }
+
+    pub fn begin_count(ctx: Context<BeginCount>) -> Result<()> {
+        instructions::count::handle_begin_count(ctx)
+    }
+
+    pub fn count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>) -> Result<()> {
+        instructions::count::handle_count_landlords(ctx)
+    }
+
+    pub fn finish_count(ctx: Context<FinishCount>) -> Result<()> {
+        instructions::count::handle_finish_count(ctx)
+    }
+
+    pub fn close_contributions(ctx: Context<CloseContributions>) -> Result<()> {
+        instructions::close_contributions::handle_close_contributions(ctx)
+    }
+
+    /// Guardian and admin.
+    pub fn pause(ctx: Context<Pause>) -> Result<()> {
+        instructions::pause::handle_pause(ctx)
+    }
+
+    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
+        instructions::pause::handle_unpause(ctx)
     }
 
     pub fn set_buyback_limits(
@@ -58,24 +96,20 @@ pub mod endowment {
         instructions::roles::handle_set_buyback_limits(ctx, max_buy_per_tx, max_buy_per_day, max_price_impact_bps)
     }
 
-    pub fn register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
-        instructions::register_landlord::handle_register_landlord(ctx)
+    pub fn set_buy_params(ctx: Context<AdminOnly>, buy_bps: u16, min_buy_interval_secs: i64, tip_bps: u16) -> Result<()> {
+        instructions::roles::handle_set_buy_params(ctx, buy_bps, min_buy_interval_secs, tip_bps)
     }
 
-    pub fn deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {
-        instructions::deregister_landlord::handle_deregister_landlord(ctx)
+    pub fn set_activation(ctx: Context<AdminOnly>, activate_bps: u16, deactivate_bps: u16) -> Result<()> {
+        instructions::roles::handle_set_activation(ctx, activate_bps, deactivate_bps)
     }
 
-    pub fn sweep(ctx: Context<Sweep>) -> Result<()> {
-        instructions::sweep::handle_sweep(ctx)
+    pub fn retire(ctx: Context<AdminOnly>) -> Result<()> {
+        instructions::roles::handle_retire(ctx)
     }
 
-    pub fn pause(ctx: Context<Pause>) -> Result<()> {
-        instructions::pause::handle_pause(ctx)
-    }
-
-    pub fn unpause(ctx: Context<Unpause>) -> Result<()> {
-        instructions::pause::handle_unpause(ctx)
+    pub fn renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
+        instructions::roles::handle_renounce_admin(ctx)
     }
 
     pub fn set_guardian(ctx: Context<AdminOnly>, new_guardian: Pubkey) -> Result<()> {

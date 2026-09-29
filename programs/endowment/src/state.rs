@@ -1,9 +1,11 @@
 use anchor_lang::prelude::*;
 
+use crate::{constants::*, error::EndowmentError};
+
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
-    /// Proposes bounded parameter changes.
+    /// Adjusts bounded parameters. Can be renounced for good.
     pub admin: Pubkey,
     /// Proposed next admin; must sign `accept_admin`. Default = none.
     pub pending_admin: Pubkey,
@@ -11,8 +13,6 @@ pub struct Config {
     pub guardian: Pubkey,
     pub pump_mint: Pubkey,
     pub penis_mint: Pubkey,
-    /// Accumulation target as basis points of $PENIS supply.
-    pub supply_target_bps: u16,
     /// Unix timestamp; cranks are blocked while `now < paused_until`.
     pub paused_until: i64,
     pub total_swept: u64,
@@ -32,21 +32,84 @@ pub struct Config {
     pub bought_today: u64,
     pub total_pump_spent: u64,
     pub total_penis_bought: u64,
+
+    /// Buyback pacing and the crank tip.
+    pub min_buy_interval_secs: i64,
+    pub last_buy_at: i64,
+    pub tip_bps: u16,
+    pub total_tips: u64,
+
+    /// Landlord sweeps run only while `active`. See `CommitmentCount`.
+    pub activate_bps: u16,
+    pub deactivate_bps: u16,
+    pub active: bool,
+    pub count: CommitmentCount,
+
+    /// One-way: once set, landlord sweeps are closed forever.
+    pub contribution_cap: u64,
+    pub closed: bool,
+    /// After `closed`, the share of each buyback that buys $PENIS; the rest
+    /// becomes permanently locked liquidity.
+    pub buy_bps: u16,
+    pub total_liquidity_pump: u64,
+    pub total_lp_tokens: u64,
+}
+
+/// A daily, permissionless count of how much $PENIS the registered landlords hold.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, Debug, PartialEq)]
+pub struct CommitmentCount {
+    /// Increments each time a count starts; landlords remember the last round they were counted in.
+    pub round: u64,
+    pub open: bool,
+    pub started_at: i64,
+    /// Landlords that must be counted before the round can finish.
+    pub expected: u32,
+    pub counted: u32,
+    pub committed: u64,
+    /// Result of the last finished round.
+    pub last_committed_bps: u16,
+    pub last_finished_at: i64,
 }
 
 impl Config {
     pub fn is_paused(&self, now: i64) -> bool {
         now < self.paused_until
     }
+
+    /// Hysteresis: on at or above `activate_bps`, off below `deactivate_bps`,
+    /// unchanged in between.
+    pub fn apply_committed_bps(&mut self, committed_bps: u16) {
+        if committed_bps >= self.activate_bps {
+            self.active = true;
+        } else if committed_bps < self.deactivate_bps {
+            self.active = false;
+        }
+    }
 }
 
 pub fn validate_limits(max_buy_per_tx: u64, max_buy_per_day: u64, max_price_impact_bps: u16) -> Result<()> {
-    use crate::{constants::*, error::EndowmentError};
     require!(
         max_buy_per_tx > 0
             && max_buy_per_tx <= max_buy_per_day
             && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&max_price_impact_bps),
         EndowmentError::InvalidBuybackLimits
+    );
+    Ok(())
+}
+
+pub fn validate_activation(activate_bps: u16, deactivate_bps: u16) -> Result<()> {
+    require!(
+        activate_bps <= MAX_ACTIVATION_BPS && deactivate_bps <= activate_bps,
+        EndowmentError::InvalidActivation
+    );
+    Ok(())
+}
+
+pub fn validate_buy_params(buy_bps: u16, min_buy_interval_secs: i64, tip_bps: u16) -> Result<()> {
+    let (lo, hi) = MIN_BUY_INTERVAL_BOUNDS;
+    require!(
+        buy_bps <= 10_000 && (lo..=hi).contains(&min_buy_interval_secs) && tip_bps <= MAX_TIP_BPS,
+        EndowmentError::InvalidBuyParams
     );
     Ok(())
 }
@@ -63,6 +126,22 @@ pub struct Landlord {
     pub registered_at: i64,
     pub last_sweep_at: i64,
     pub bump: u8,
+    /// The owner's $PENIS associated token account, counted toward the activation threshold.
+    pub penis_account: Pubkey,
+    /// The last commitment round this landlord was counted in (or joined during).
+    pub counted_round: u64,
+    /// $PENIS counted for this landlord in `counted_round`.
+    pub counted_balance: u64,
+    /// The round that was open when this landlord registered (0 if none).
+    pub joined_round: u64,
+}
+
+impl Landlord {
+    /// Whether this landlord was actually counted in `round` (as opposed to
+    /// having joined during it).
+    pub fn counted_in(&self, round: u64) -> bool {
+        round != 0 && self.counted_round == round && self.joined_round != round
+    }
 }
 
 impl Landlord {
@@ -88,6 +167,10 @@ mod tests {
             registered_at: 0,
             last_sweep_at: 0,
             bump: 0,
+            penis_account: Pubkey::default(),
+            counted_round: 0,
+            counted_balance: 0,
+            joined_round: 0,
         }
     }
 
@@ -104,5 +187,22 @@ mod tests {
     #[test]
     fn capped_by_remaining_delegation() {
         assert_eq!(landlord(0).sweepable(500, 120), (120, 0));
+    }
+
+    #[test]
+    fn activation_has_hysteresis() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.activate_bps = 3_000;
+        config.deactivate_bps = 2_500;
+        config.apply_committed_bps(2_999);
+        assert!(!config.active);
+        config.apply_committed_bps(3_000);
+        assert!(config.active);
+        config.apply_committed_bps(2_600);
+        assert!(config.active, "between the lines, state is unchanged");
+        config.apply_committed_bps(2_499);
+        assert!(!config.active);
+        config.apply_committed_bps(2_900);
+        assert!(!config.active, "between the lines, state is unchanged");
     }
 }

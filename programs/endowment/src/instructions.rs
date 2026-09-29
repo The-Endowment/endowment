@@ -1,4 +1,6 @@
 pub mod buyback;
+pub mod close_contributions;
+pub mod count;
 pub mod deregister_landlord;
 pub mod initialize;
 pub mod pause;
@@ -7,6 +9,8 @@ pub mod roles;
 pub mod sweep;
 
 pub use buyback::*;
+pub use close_contributions::*;
+pub use count::*;
 pub use deregister_landlord::*;
 pub use initialize::*;
 pub use pause::*;

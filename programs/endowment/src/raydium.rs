@@ -13,6 +13,7 @@ pub const CPMM_PROGRAM_ID: Pubkey = pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHK
 pub const CPMM_AUTH_SEED: &[u8] = b"vault_and_lp_mint_auth_seed";
 
 pub const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+pub const DEPOSIT_DISCRIMINATOR: [u8; 8] = [242, 35, 198, 137, 82, 225, 242, 182];
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
 
@@ -32,6 +33,8 @@ pub struct PoolView {
     pub vaults: [Pubkey; 2],
     pub mints: [Pubkey; 2],
     pub observation: Pubkey,
+    pub lp_mint: Pubkey,
+    pub lp_supply: u64,
     /// Protocol + fund + creator fees held in each vault that are not
     /// swappable liquidity.
     pub reserved_fees: [u64; 2],
@@ -54,6 +57,8 @@ impl PoolView {
             vaults: [pubkey_at(data, 72), pubkey_at(data, 104)],
             mints: [pubkey_at(data, 168), pubkey_at(data, 200)],
             observation: pubkey_at(data, 296),
+            lp_mint: pubkey_at(data, 136),
+            lp_supply: u64_at(data, 333),
             reserved_fees: [fees(341, 357, 397), fees(349, 365, 405)],
             creator_fee_enabled: data[390] != 0,
         })

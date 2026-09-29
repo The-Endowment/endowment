@@ -3,8 +3,11 @@ use anchor_lang::prelude::*;
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{AdminAccepted, AdminProposed, BuybackLimitsChanged, GuardianChanged},
-    state::{validate_limits, Config},
+    events::{
+        ActivationChanged, AdminAccepted, AdminProposed, AdminRenounced, BuyParamsChanged, BuybackLimitsChanged,
+        ContributionsClosed, GuardianChanged,
+    },
+    state::{validate_activation, validate_buy_params, validate_limits, Config},
 };
 
 #[derive(Accounts)]
@@ -45,6 +48,56 @@ pub fn handle_set_buyback_limits(
     config.max_buy_per_day = max_buy_per_day;
     config.max_price_impact_bps = max_price_impact_bps;
     emit!(BuybackLimitsChanged { max_buy_per_tx, max_buy_per_day, max_price_impact_bps });
+    Ok(())
+}
+
+/// Adjusts the post-close buy/liquidity split, buyback pacing and the crank
+/// tip, within the hard-coded bounds.
+pub fn handle_set_buy_params(
+    ctx: Context<AdminOnly>,
+    buy_bps: u16,
+    min_buy_interval_secs: i64,
+    tip_bps: u16,
+) -> Result<()> {
+    validate_buy_params(buy_bps, min_buy_interval_secs, tip_bps)?;
+    let config = &mut ctx.accounts.config;
+    config.buy_bps = buy_bps;
+    config.min_buy_interval_secs = min_buy_interval_secs;
+    config.tip_bps = tip_bps;
+    emit!(BuyParamsChanged { buy_bps, min_buy_interval_secs, tip_bps });
+    Ok(())
+}
+
+/// Sets the activation thresholds and re-applies them to the last count, so
+/// setting `activate_bps` to 0 turns sweeps on at once (for a founders-only test).
+pub fn handle_set_activation(ctx: Context<AdminOnly>, activate_bps: u16, deactivate_bps: u16) -> Result<()> {
+    validate_activation(activate_bps, deactivate_bps)?;
+    let config = &mut ctx.accounts.config;
+    config.activate_bps = activate_bps;
+    config.deactivate_bps = deactivate_bps;
+    let last = config.count.last_committed_bps;
+    config.apply_committed_bps(last);
+    emit!(ActivationChanged { activate_bps, deactivate_bps, active: config.active });
+    Ok(())
+}
+
+/// One-way: closes landlord contributions early. It can never move funds.
+pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+    if !config.closed {
+        config.closed = true;
+        emit!(ContributionsClosed { by_cap: false, penis_held: 0 });
+    }
+    Ok(())
+}
+
+/// One-way: gives up the admin role for good, freezing every bounded
+/// parameter as it stands.
+pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+    config.admin = Pubkey::default();
+    config.pending_admin = Pubkey::default();
+    emit!(AdminRenounced {});
     Ok(())
 }
 

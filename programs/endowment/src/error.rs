@@ -4,8 +4,6 @@ use anchor_lang::prelude::*;
 pub enum EndowmentError {
     #[msg("Only the program's upgrade authority can initialize")]
     NotUpgradeAuthority,
-    #[msg("Supply target is outside the hard-coded bounds")]
-    SupplyTargetOutOfBounds,
     #[msg("The endowment is paused")]
     Paused,
     #[msg("The PUMP account is not delegated to the endowment")]
@@ -20,10 +18,8 @@ pub enum EndowmentError {
     Overflow,
     #[msg("Buyback limits are outside the hard-coded bounds")]
     InvalidBuybackLimits,
-    #[msg("Buyback amount must be positive")]
-    ZeroAmount,
-    #[msg("Buyback exceeds the per-transaction cap")]
-    BuyTooLarge,
+    #[msg("Nothing to buy: the PUMP vault is empty or today's cap is used up")]
+    NothingToBuy,
     #[msg("Buyback exceeds the daily cap")]
     DailyCapReached,
     #[msg("Account does not belong to the endowment's pool")]
@@ -34,4 +30,28 @@ pub enum EndowmentError {
     PriceImpactTooHigh,
     #[msg("Fill is below the caller's minimum")]
     SlippageExceeded,
+    #[msg("Too soon since the last buyback")]
+    BuyTooSoon,
+    #[msg("Buy parameters are outside the hard-coded bounds")]
+    InvalidBuyParams,
+    #[msg("Activation thresholds are outside the hard-coded bounds")]
+    InvalidActivation,
+    #[msg("Landlord sweeps are not active: not enough $PENIS is committed")]
+    NotActive,
+    #[msg("Landlord contributions are closed")]
+    ContributionsClosed,
+    #[msg("The contribution cap has not been reached")]
+    CapNotReached,
+    #[msg("A commitment count is already open")]
+    CountOpen,
+    #[msg("No commitment count is open")]
+    CountNotOpen,
+    #[msg("A commitment count already ran in the last 24 hours")]
+    CountTooSoon,
+    #[msg("Not every landlord has been counted yet")]
+    CountIncomplete,
+    #[msg("Invalid landlord or $PENIS account in the count")]
+    InvalidCountAccount,
+    #[msg("The $PENIS vault would shrink")]
+    VaultWouldShrink,
 }

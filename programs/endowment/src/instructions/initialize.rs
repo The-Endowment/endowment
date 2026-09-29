@@ -8,7 +8,7 @@ use crate::{
     constants::*,
     error::EndowmentError,
     program::Endowment,
-    state::{validate_limits, Config},
+    state::{validate_limits, CommitmentCount, Config},
 };
 
 #[derive(Accounts)]
@@ -22,15 +22,15 @@ pub struct Initialize<'info> {
         seeds = [CONFIG_SEED],
         bump
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     /// CHECK: PDA that owns the vaults and receives landlord delegations. Holds no data.
     #[account(seeds = [AUTHORITY_SEED], bump)]
     pub authority: UncheckedAccount<'info>,
 
     #[account(mint::token_program = pump_token_program)]
-    pub pump_mint: InterfaceAccount<'info, Mint>,
+    pub pump_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mint::token_program = penis_token_program)]
-    pub penis_mint: InterfaceAccount<'info, Mint>,
+    pub penis_mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// Receives landlord sweeps and the endowment's own PUMP dividends.
     #[account(
@@ -40,7 +40,7 @@ pub struct Initialize<'info> {
         associated_token::authority = authority,
         associated_token::token_program = pump_token_program,
     )]
-    pub pump_vault: InterfaceAccount<'info, TokenAccount>,
+    pub pump_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     /// Holds bought-back $PENIS. No instruction can move tokens out of it.
     #[account(
         init,
@@ -49,7 +49,7 @@ pub struct Initialize<'info> {
         associated_token::authority = authority,
         associated_token::token_program = penis_token_program,
     )]
-    pub penis_vault: InterfaceAccount<'info, TokenAccount>,
+    pub penis_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // Only the upgrade authority may initialize, so nobody can front-run the
     // deploy with their own admin and guardian.
@@ -71,17 +71,12 @@ pub fn handle_initialize(
     ctx: Context<Initialize>,
     admin: Pubkey,
     guardian: Pubkey,
-    supply_target_bps: u16,
     pool: Pubkey,
     max_buy_per_tx: u64,
     max_buy_per_day: u64,
     max_price_impact_bps: u16,
 ) -> Result<()> {
     validate_limits(max_buy_per_tx, max_buy_per_day, max_price_impact_bps)?;
-    require!(
-        (MIN_SUPPLY_TARGET_BPS..=MAX_SUPPLY_TARGET_BPS).contains(&supply_target_bps),
-        EndowmentError::SupplyTargetOutOfBounds
-    );
 
     ctx.accounts.config.set_inner(Config {
         admin,
@@ -89,7 +84,6 @@ pub fn handle_initialize(
         guardian,
         pump_mint: ctx.accounts.pump_mint.key(),
         penis_mint: ctx.accounts.penis_mint.key(),
-        supply_target_bps,
         paused_until: 0,
         total_swept: 0,
         landlord_count: 0,
@@ -105,6 +99,19 @@ pub fn handle_initialize(
         bought_today: 0,
         total_pump_spent: 0,
         total_penis_bought: 0,
+        min_buy_interval_secs: DEFAULT_MIN_BUY_INTERVAL_SECS,
+        last_buy_at: 0,
+        tip_bps: DEFAULT_TIP_BPS,
+        total_tips: 0,
+        activate_bps: DEFAULT_ACTIVATE_BPS,
+        deactivate_bps: DEFAULT_DEACTIVATE_BPS,
+        active: false,
+        count: CommitmentCount::default(),
+        contribution_cap: CONTRIBUTION_CAP,
+        closed: false,
+        buy_bps: DEFAULT_BUY_BPS,
+        total_liquidity_pump: 0,
+        total_lp_tokens: 0,
     });
     Ok(())
 }
