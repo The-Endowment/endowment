@@ -116,9 +116,9 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         EndowmentError::NotDelegated
     );
     // Never more than the vault can spend in MAX_VAULT_DAYS_OF_BUYS days: the
-    // rest stays with the landlord for a later sweep (R3-MINT-01).
+    // rest stays with the landlord for a later sweep (R3-MINT-01, FC-R3-04).
     let vault_before = ctx.accounts.dividend_vault.amount;
-    let vault_cap = config.params.max_buy_per_day.saturating_mul(MAX_VAULT_DAYS_OF_BUYS);
+    let vault_cap = config.vault_cap();
     let amount = ctx
         .accounts
         .landlord

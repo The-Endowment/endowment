@@ -173,8 +173,12 @@ pub struct Config {
     pub total_tips: u64,
     pub total_donated: u64,
 
+    /// Bumped whenever the refresher changes (resigns, or a new one is applied).
+    /// Reads made under an earlier epoch don't count (FC-R3-03).
+    pub refresher_epoch: u32,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 128],
+    pub reserved: [u8; 124],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -228,6 +232,36 @@ impl Config {
     /// Signer seeds for this instance's authority PDA.
     pub fn authority_seeds<'a>(config: &'a Pubkey, bump: &'a [u8; 1]) -> [&'a [u8]; 3] {
         [AUTHORITY_SEED, config.as_ref(), &bump[..]]
+    }
+
+    /// The most a dividend vault may hold (sweeps and donations stop there):
+    /// MAX_VAULT_DAYS_OF_BUYS days of what buybacks can actually spend, which
+    /// is the smaller of the daily allowance and what the per-buy cap and the
+    /// buy interval allow in a day (FC-R3-04).
+    pub fn vault_cap(&self) -> u64 {
+        let p = &self.params;
+        let interval = p.min_buy_interval_secs.max(1) as u128;
+        let by_interval = (p.max_buy_per_tx as u128 * 86_400 / interval).min(u64::MAX as u128) as u64;
+        p.max_buy_per_day.min(by_interval).saturating_mul(MAX_VAULT_DAYS_OF_BUYS)
+    }
+
+    /// A landlord's refresher reads, if they were made under the current refresher.
+    pub fn attestations_of(&self, landlord: &Landlord) -> u8 {
+        if landlord.attestation_epoch == self.refresher_epoch {
+            landlord.attestations
+        } else {
+            0
+        }
+    }
+
+    /// The refresher resigns: reads made under it stop counting, an open round
+    /// (whose tally rests on those reads) closes without a result, and sweeps
+    /// switch off until a count under a new refresher switches them back on
+    /// (FC-R3-03).
+    pub fn retire_refresher_reads(&mut self) {
+        self.refresher_epoch = self.refresher_epoch.wrapping_add(1);
+        self.count.open = false;
+        self.active = false;
     }
 
     /// The minimum coin a landlord must hold, given the coin's current supply.
@@ -308,9 +342,12 @@ pub struct Landlord {
     pub attestations: u8,
     /// When the last of those reads was.
     pub last_attested_at: i64,
+    /// The endowment's `refresher_epoch` when those reads were made. Reads from
+    /// an earlier epoch (a refresher since resigned or replaced) don't count.
+    pub attestation_epoch: u32,
 
     /// Room for future fields without a migration.
-    pub reserved: [u8; 56],
+    pub reserved: [u8; 52],
 }
 
 impl Landlord {
@@ -356,7 +393,8 @@ mod tests {
             snapshot_valid: false,
             attestations: 0,
             last_attested_at: 0,
-            reserved: [0; 56],
+            attestation_epoch: 0,
+            reserved: [0; 52],
         }
     }
 

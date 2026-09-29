@@ -10,7 +10,8 @@ use anchor_lang::prelude::*;
 
 use crate::{
     constants::{
-        MAX_STRETCH_SHARE_BPS, MIN_TWAP_WINDOW_SECONDS, RAYDIUM_OBSERVATION_COALESCE_SECONDS, TWAP_WINDOW_SECONDS,
+        MAX_STRETCH_SHARE_BPS, MAX_TWAP_READER_ERROR_BPS, MIN_TWAP_WINDOW_SECONDS, RAYDIUM_OBSERVATION_COALESCE_SECONDS,
+        TWAP_WINDOW_SECONDS,
     },
     error::EndowmentError,
 };
@@ -148,14 +149,10 @@ pub fn pool_fee_bps(amm_config: &[u8], creator_fee_enabled: bool) -> Result<u64>
 ///   cumulative is exact). Nothing after it is extrapolated, so moving the spot
 ///   price without a swap moves the average not at all (the spot band in
 ///   `buyback` then refuses the buy);
-/// - each older record's cumulative runs somewhere between 0 and
-///   `RAYDIUM_OBSERVATION_COALESCE_SECONDS` (14 s) past its timestamp. Taking
-///   the timestamp itself (as round 1 did) biased the average low by up to
-///   14 s / span whenever swaps had coalesced into the starting record, which an
-///   attacker can arrange (F-01). Records are taken as of the middle of that
-///   range instead: no bias either way, and at most ±7 s / span of error at the
-///   start (±0.78% over the shortest window), which the floor allows for
-///   (`TWAP_READER_ERROR_BPS`);
+/// - each older record's cumulative is exact at some moment between its
+///   timestamp and `RAYDIUM_OBSERVATION_COALESCE_SECONDS` (14 s) after it; which
+///   moment isn't recorded. The reader takes the middle (+7 s), so each record's
+///   time is off by at most ±7 s (F-01);
 /// - it walks back through the records until it has `TWAP_WINDOW_SECONDS` of
 ///   weight, where no single stretch weighs more than `MAX_STRETCH_SHARE_BPS` of
 ///   the window: a longer stretch counts at its own average price, for that
@@ -165,8 +162,24 @@ pub fn pool_fee_bps(amm_config: &[u8], creator_fee_enabled: bool) -> Result<u64>
 ///   in as little as 99 × 15 s = 1,485 s), it averages over what they hold, as
 ///   long as that is at least `MIN_TWAP_WINDOW_SECONDS` and no one stretch is
 ///   more than `MAX_STRETCH_SHARE_BPS` of it. Either way one coloured stretch
-///   is at most a quarter of the average, so the spot band catches it.
-pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now: u64) -> Result<u128> {
+///   is at most a quarter of the average.
+///
+/// The reader's own error. Between uncapped stretches the ±7 s timing errors
+/// cancel (each record's time ends one stretch and starts the next, so the sum
+/// telescopes), leaving only the oldest record's. A capped stretch breaks that:
+/// its price is scaled by `cap / seconds`, so the errors at its two ends are
+/// scaled too and no longer cancel against their uncapped neighbours' (FC-R3-01).
+/// At a constant price p the average's error, in seconds of p, is at most:
+/// - `cap × (e_newer + e_older) / seconds` for each capped stretch (its own ends);
+/// - `e` for each record where an uncapped stretch meets a capped one (the
+///   uncapped side's share, no longer cancelled);
+/// - `e` for the oldest record if the oldest stretch is uncapped;
+///
+/// where `e` is 7 s for a record (0 for the latest, which is exact). This
+/// returns that total over the weight, in basis points (rounded up), with the
+/// average; the floor and the spot band allow for it. A history whose bound
+/// exceeds `MAX_TWAP_READER_ERROR_BPS` is refused as unreadable.
+pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now: u64) -> Result<Twap> {
     require!(
         observation.len() == OBSERVATION_STATE_LEN && observation[..8] == OBSERVATION_DISCRIMINATOR,
         EndowmentError::InvalidPoolData
@@ -187,10 +200,17 @@ pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now
     require!(end >= latest_ts && end <= now, EndowmentError::InvalidPoolData);
 
     let cap = TWAP_WINDOW_SECONDS * MAX_STRETCH_SHARE_BPS / 10_000;
-    // The newer end of the stretch being added: its timestamp, cumulative time
-    // (the latest record is exact as of `end`), and weighted price and weight so far.
-    let (mut newer_ts, mut newer_time, mut newer_cum) = (latest_ts, end, latest_cum);
+    let half = RAYDIUM_OBSERVATION_COALESCE_SECONDS / 2;
+    // The newer end of the stretch being added: its timestamp, time (the latest
+    // record is exact as of `end`), cumulative, and the bound on that time's error.
+    let (mut newer_ts, mut newer_time, mut newer_cum, mut newer_err) = (latest_ts, end, latest_cum, 0u64);
     let (mut weighted, mut weight, mut longest) = (0u128, 0u64, 0u64);
+    // The error bound, in milliseconds of the price; whether the stretch just
+    // added (the newer neighbour of the next) was capped, and the error at its
+    // older end (for the oldest record).
+    let mut error_ms: u128 = 0;
+    let mut newer_capped: Option<bool> = None;
+    let mut oldest_err = 0u64;
     for step in 1..OBSERVATION_NUM {
         let i = (latest + OBSERVATION_NUM - step) % OBSERVATION_NUM;
         let (ts, cum) = cumulative(i);
@@ -198,23 +218,46 @@ pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now
             // Empty slot, or wrapped around to newer entries: no older history.
             break;
         }
-        let time = (ts + RAYDIUM_OBSERVATION_COALESCE_SECONDS / 2).min(newer_time);
+        // Records are at least 15 s apart, so this is the middle of the range;
+        // clamped only for malformed data, where the error is the full range.
+        let (time, err) = if ts + half <= newer_time {
+            (ts + half, half)
+        } else {
+            (newer_time, RAYDIUM_OBSERVATION_COALESCE_SECONDS)
+        };
         let seconds = newer_time - time;
+        if seconds == 0 {
+            (newer_ts, newer_time, newer_cum, newer_err) = (ts, time, cum, newer_err.max(err));
+            continue;
+        }
         let delta = newer_cum.wrapping_sub(cum);
-        let (add, secs) = if seconds > cap {
+        let capped = seconds > cap;
+        let (add, secs) = if capped {
             // Its average price, for the capped time.
             ((delta / seconds as u128).checked_mul(cap as u128).ok_or(EndowmentError::TwapUnavailable)?, cap)
         } else {
             (delta, seconds)
         };
+        if capped {
+            error_ms += ((cap as u128) * ((newer_err + err) as u128) * 1_000).div_ceil(seconds as u128);
+            if newer_capped == Some(false) {
+                error_ms += newer_err as u128 * 1_000;
+            }
+        } else if newer_capped == Some(true) {
+            error_ms += newer_err as u128 * 1_000;
+        }
         weighted = weighted.checked_add(add).ok_or(EndowmentError::TwapUnavailable)?;
         weight += secs;
         longest = longest.max(secs);
+        newer_capped = Some(capped);
+        oldest_err = if capped { 0 } else { err };
         if weight >= TWAP_WINDOW_SECONDS {
             break;
         }
-        (newer_ts, newer_time, newer_cum) = (ts, time, cum);
+        (newer_ts, newer_time, newer_cum, newer_err) = (ts, time, cum, err);
     }
+    // The oldest record, unless its stretch was capped (already counted).
+    error_ms += oldest_err as u128 * 1_000;
     // The full window, or (the records having run out) a shorter one of at
     // least the minimum in which no stretch outweighs its share.
     require!(
@@ -223,9 +266,18 @@ pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now
                 && (longest as u128) * 10_000 <= (weight as u128) * MAX_STRETCH_SHARE_BPS as u128),
         EndowmentError::TwapUnavailable
     );
-    let twap = weighted / weight as u128;
-    require!(twap > 0, EndowmentError::TwapUnavailable);
-    Ok(twap)
+    let price_x32 = weighted / weight as u128;
+    require!(price_x32 > 0, EndowmentError::TwapUnavailable);
+    let error_bps = (error_ms * 10_000).div_ceil(weight as u128 * 1_000) as u64;
+    require!(error_bps <= MAX_TWAP_READER_ERROR_BPS, EndowmentError::TwapUnavailable);
+    Ok(Twap { price_x32, error_bps })
+}
+
+/// A TWAP and the bound on the reader's own error, in basis points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Twap {
+    pub price_x32: u128,
+    pub error_bps: u64,
 }
 
 #[cfg(test)]
@@ -275,7 +327,7 @@ mod tests {
         let (entries, end) = history(&prices, 1_000, 100, 0);
         let data = observation(&pool, 29, end, &entries);
         // Long after, whatever the pool's price now: only the record counts.
-        let twap = twap_price_x32(&data, &pool, 0, end + 100_000).unwrap();
+        let twap = twap_price_x32(&data, &pool, 0, end + 100_000).unwrap().price_x32;
         // Span ends at 3,900; the newest start at least 1,800 back is the record
         // at 2,000, taken as of 2,007: (18 × 100 × 7 + 100 × 9) / 1,893.
         assert_eq!(twap, ((1_800 * 7 + 900) << 32) / 1_893);
@@ -289,12 +341,12 @@ mod tests {
         // (the attacker's case: round 1 read this 14 s / span low).
         let (entries, end) = history(&[P; 40], 1_000, 60, 14);
         let data = observation(&pool, 39, end, &entries);
-        let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
+        let twap = twap_price_x32(&data, &pool, 0, end).unwrap().price_x32;
         assert!(P - twap <= bound, "{twap}");
         // Nothing coalesced: it reads at most as far high.
         let (entries, end) = history(&[P; 40], 1_000, 60, 0);
         let data = observation(&pool, 39, end, &entries);
-        let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
+        let twap = twap_price_x32(&data, &pool, 0, end).unwrap().price_x32;
         assert!(twap >= P && twap - P <= bound, "{twap}");
     }
 
@@ -307,7 +359,7 @@ mod tests {
         let day_end = 1_000 + 19 * 100 + 86_400;
         entries.push((20, day_end, entries[19].2 + 8 * (1 << 32) * 86_400));
         let data = observation(&pool, 20, day_end, &entries);
-        let twap = twap_price_x32(&data, &pool, 0, day_end).unwrap();
+        let twap = twap_price_x32(&data, &pool, 0, day_end).unwrap().price_x32;
         // (8 + 3 × 7) / 4 = 7.25
         assert!(twap > (29 << 32) / 4 - P / 100 && twap < (29 << 32) / 4 + P / 100, "{twap}");
     }
@@ -325,7 +377,7 @@ mod tests {
         cum += 2 * P * 15;
         entries.push((91, hour_end + 15, cum));
         let data = observation(&pool, 91, hour_end + 15, &entries);
-        let twap = twap_price_x32(&data, &pool, 0, hour_end + 15).unwrap();
+        let twap = twap_price_x32(&data, &pool, 0, hour_end + 15).unwrap().price_x32;
         // The hour counts for at most a quarter of the 30-minute window:
         // ≤ (3 × 7 + 14) / 4 = 8.75.
         assert!(twap <= P * 5 / 4 + P / 50, "{twap}");
@@ -375,11 +427,11 @@ mod tests {
         for latest in [99, 0, 37] {
             let (data, end) = full_ring(&pool, 15, latest);
             let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
-            assert!(twap.abs_diff(P) <= P * TWAP_READER_ERROR / 10_000, "{latest}: {twap}");
+            assert!(twap.price_x32.abs_diff(P) <= P * twap.error_bps as u128 / 10_000, "{latest}: {twap:?}");
+            // No stretch is capped: only the oldest record's ±7 s, over the ring's span.
+            assert!(twap.error_bps <= 50, "{twap:?}");
         }
     }
-
-    const TWAP_READER_ERROR: u128 = crate::constants::TWAP_READER_ERROR_BPS as u128;
 
     #[test]
     fn r3tw01_a_short_ring_is_refused_below_the_minimum_window() {
@@ -403,5 +455,119 @@ mod tests {
         entries.push((7, end, entries[6].2 + 3 * P * 450));
         let data = observation(&pool, 7, end, &entries);
         assert!(twap_price_x32(&data, &pool, 0, end).is_err());
+    }
+
+    /// Replays Raydium CPMM's observation update (its oracle source: skip a swap
+    /// at the same second, coalesce one within 15 s of the latest record into
+    /// it, otherwise open a new record) for swaps at `times`, oldest first, all
+    /// at the constant price P. Returns the account data and the last update.
+    fn raydium_ring(pool: &Pubkey, times: &[u64]) -> (Vec<u8>, u64) {
+        let mut ts = [0u64; OBSERVATION_NUM];
+        let mut cum = [0u128; OBSERVATION_NUM];
+        let mut idx = 0usize;
+        let mut last_update = times[0];
+        ts[0] = times[0];
+        for &t in &times[1..] {
+            let (since_obs, since_upd) = (t - ts[idx], t - last_update);
+            if since_upd == 0 || since_obs == 0 {
+                continue;
+            }
+            let d = P * since_upd as u128;
+            if since_obs < 15 {
+                cum[idx] = cum[idx].wrapping_add(d);
+            } else {
+                let next = (idx + 1) % OBSERVATION_NUM;
+                ts[next] = t;
+                cum[next] = cum[idx].wrapping_add(d);
+                idx = next;
+            }
+            last_update = t;
+        }
+        let entries: Vec<_> = (0..OBSERVATION_NUM).filter(|&i| ts[i] != 0).map(|i| (i, ts[i], cum[i])).collect();
+        (observation(pool, idx as u16, last_update, &entries), last_update)
+    }
+
+    /// A small deterministic generator, so the property test is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    #[test]
+    fn fcr301_the_reported_error_bounds_a_flat_price_over_many_ring_shapes() {
+        // Thousands of histories at a constant price: every gap mixture from
+        // 15 s to hours (so any number of capped stretches), swaps coalesced 0 to
+        // 14 s after a record, rings that wrap. Whatever the reader returns, the
+        // true price is within its reported error; anything it can't bound
+        // within MAX_TWAP_READER_ERROR_BPS it refuses.
+        let pool = Pubkey::new_unique();
+        let mut rng = Lcg(7);
+        let (mut read, mut refused, mut worst) = (0, 0, 0u64);
+        for _ in 0..4_000 {
+            let mut times = vec![1_000u64];
+            let records = 5 + rng.next(140);
+            for _ in 0..records {
+                let last = *times.last().unwrap();
+                let gap = match rng.next(4) {
+                    0 => 15 + rng.next(30),
+                    1 => 60 + rng.next(400),
+                    2 => 450 + rng.next(3_600),
+                    _ => 15,
+                };
+                times.push(last + gap);
+                // Sometimes a swap coalesced into that record, 1-14 s after it.
+                if rng.next(2) == 0 {
+                    times.push(last + gap + 1 + rng.next(14));
+                }
+            }
+            let (data, end) = raydium_ring(&pool, &times);
+            match twap_price_x32(&data, &pool, 0, end) {
+                Ok(t) => {
+                    read += 1;
+                    let off = t.price_x32.abs_diff(P) * 10_000 / P;
+                    assert!(off as u64 <= t.error_bps, "off {off} bps > bound {} ({times:?})", t.error_bps);
+                    assert!(t.error_bps <= MAX_TWAP_READER_ERROR_BPS);
+                    worst = worst.max(t.error_bps);
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        assert!(read > 1_000, "{read} read, {refused} refused");
+        println!("read {read}, refused {refused}, largest bound {worst} bps");
+    }
+
+    #[test]
+    fn fcr301_the_final_check_patterns_are_bounded_or_refused() {
+        // The final check's probes: hour-long gaps (capped) alternating with 15 s
+        // stretches, swaps coalesced 14 s after one end of each. They read a flat
+        // price ±2.3%, beyond the old fixed 80 bps allowance.
+        let pool = Pubkey::new_unique();
+        let high = [1_000, 4_600, 4_615, 4_629, 8_229, 8_244, 8_258, 11_858, 11_873, 11_887, 15_487, 15_502];
+        let low = [1_000, 4_600, 4_614, 4_615, 8_215, 8_229, 8_230, 11_830, 11_844, 11_845, 15_445, 15_459, 15_460];
+        for times in [&high[..], &low[..]] {
+            let (data, end) = raydium_ring(&pool, times);
+            match twap_price_x32(&data, &pool, 0, end) {
+                Ok(t) => {
+                    let off = (t.price_x32.abs_diff(P) * 10_000 / P) as u64;
+                    assert!(off <= t.error_bps, "off {off} > bound {}", t.error_bps);
+                }
+                Err(e) => assert_eq!(e, EndowmentError::TwapUnavailable.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn fcr301_an_uncapped_history_has_only_the_oldest_records_error() {
+        let pool = Pubkey::new_unique();
+        // Steady trading every 60 s for an hour: nothing capped, ±7 s over 30 min.
+        let times: Vec<u64> = (0..60).map(|i| 1_000 + 60 * i).collect();
+        let (data, end) = raydium_ring(&pool, &times);
+        let t = twap_price_x32(&data, &pool, 0, end).unwrap();
+        // 7 s over at least 1,800 s of weight: at most 39 bps, rounded up.
+        assert!(t.error_bps >= 1 && t.error_bps <= 39, "{t:?}");
+        assert!(t.price_x32.abs_diff(P) * 10_000 / P <= t.error_bps as u128);
     }
 }

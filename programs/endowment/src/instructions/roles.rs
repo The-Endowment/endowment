@@ -104,13 +104,24 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
             || ctx.accounts.caller.key() == config.admin,
         EndowmentError::ApplyGrace
     );
+    let refresher_changes = pending.params.refresher != config.params.refresher;
     config.params = pending.params;
     config.pending = PendingParams::default();
+    if refresher_changes {
+        // Reads made under the previous refresher stop counting (FC-R3-03).
+        config.refresher_epoch = config.refresher_epoch.wrapping_add(1);
+    }
     // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
     config.buy_allowance = config.buy_allowance.min(config.params.max_buy_per_tx);
-    // New thresholds apply to the last count at once.
-    let last = config.last_count_bps;
-    config.apply_committed_bps(last);
+    // New thresholds apply to the last count at once, unless the refresher is
+    // gone or changed: that count rests on reads that no longer count, so
+    // sweeps stay off until a count under the new refresher (FC-R3-03).
+    if config.params.refresher == Pubkey::default() || refresher_changes {
+        config.active = false;
+    } else {
+        let last = config.last_count_bps;
+        config.apply_committed_bps(last);
+    }
     emit!(ParamsApplied { config: config_key, params: config.params, active: config.active });
     Ok(())
 }
@@ -150,9 +161,9 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 ///
 /// One live role remains: the refresher, whose reads decide who counts (see
 /// `count`). After renounce it can't be replaced, only resign
-/// (`resign_refresher`), which leaves nobody counting and so switches sweeps
-/// off at the next count: a leaked or distrusted refresher key can always be
-/// retired by whoever holds it, and never handed to anyone else.
+/// (`resign_refresher`), which switches sweeps off at once and voids its
+/// reads: a leaked or distrusted refresher key can always be retired by
+/// whoever holds it, and never handed to anyone else.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
@@ -197,12 +208,22 @@ pub fn handle_propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Resul
 /// any, sets another through the timelock). Resigning is the only change the
 /// refresher can make, and it can only ever move toward fewer landlords
 /// counting, so it needs no timelock: it's how a refresher whose key may have
-/// leaked shuts it off, including after the admin has renounced.
+/// leaked shuts it off, including after the admin has renounced. It:
+/// - switches sweeps off at once, rather than waiting for a count that no
+///   longer has a refresher to run it (FC-R3-03);
+/// - voids every read it made, so nothing it attested can still be counted,
+///   in an open round or later (FC-R3-03);
+/// - strips it from a pending parameter proposal, so a change proposed while it
+///   was trusted can't bring it back when applied (FC-R3-02).
 pub fn handle_resign_refresher(ctx: Context<ResignRefresher>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     let refresher = config.params.refresher;
     config.params.refresher = Pubkey::default();
+    if config.pending.effective_at != 0 && config.pending.params.refresher == refresher {
+        config.pending.params.refresher = Pubkey::default();
+    }
+    config.retire_refresher_reads();
     emit!(RefresherResigned { config: config_key, refresher });
     Ok(())
 }

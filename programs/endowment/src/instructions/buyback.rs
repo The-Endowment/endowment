@@ -134,6 +134,8 @@ struct Plan {
     dividend_index: usize,
     coin_index: usize,
     twap_price_x32: u128,
+    /// The TWAP reader's bound on its own error for this history, in bps.
+    twap_error_bps: u64,
     pool_fee: u64,
     dividend_fee: u64,
     coin_fee: u64,
@@ -167,7 +169,7 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
         plan.pool_fee,
         plan.dividend_fee,
         plan.coin_fee,
-        floor_slippage_bps(params.max_price_impact_bps, params.max_twap_deviation_bps),
+        floor_slippage_bps(params.max_price_impact_bps, params.max_twap_deviation_bps, plan.twap_error_bps),
     )
     .ok_or(EndowmentError::PriceImpactTooHigh)?;
     require!(floor > 0, EndowmentError::PriceImpactTooHigh);
@@ -242,11 +244,18 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     }
 
     // 5. Send the donation, if this endowment chose one, to the flagship's
-    //    dividend vault, while it exists, isn't frozen, and the flagship coin
-    //    can trade (the donor's buybacks never depend on the flagship's state).
+    //    dividend vault, while it exists, isn't frozen, the flagship coin can
+    //    trade, and only up to the flagship's own vault cap: a donation never
+    //    takes the flagship vault above what it can spend in
+    //    MAX_VAULT_DAYS_OF_BUYS days, like a sweep (R3-MINT-01). The donor's
+    //    buybacks never depend on the flagship's state.
     let mut donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
-    if donation > 0 && !flagship_can_trade(ctx.remaining_accounts, clock.epoch)? {
-        donation = 0;
+    let mut flagship_cap = 0u64;
+    if donation > 0 {
+        match flagship_state(ctx.remaining_accounts, clock.epoch, ctx.program_id)? {
+            Some(cap) => flagship_cap = cap,
+            None => donation = 0,
+        }
     }
     if donation > 0 {
         let (flagship_authority, _) =
@@ -258,11 +267,15 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
         );
         let vault = &a.flagship_dividend_vault;
         require_keys_eq!(vault.key(), expected, EndowmentError::WrongFlagshipVault);
-        if read_token_account(vault)?.is_some() && !is_frozen(vault)? {
-            require!(vault.is_writable, EndowmentError::WrongFlagshipVault);
-            pay(vault.to_account_info(), donation)?;
-        } else {
-            donation = 0;
+        match read_token_account(vault)? {
+            Some(view) if !is_frozen(vault)? => {
+                require!(vault.is_writable, EndowmentError::WrongFlagshipVault);
+                donation = donation.min(flagship_cap.saturating_sub(view.amount));
+                if donation > 0 {
+                    pay(vault.to_account_info(), donation)?;
+                }
+            }
+            _ => donation = 0,
         }
     }
 
@@ -342,18 +355,22 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         .map(|v| v.mint == pool.lp_mint && v.owner == a.authority.key())
         .unwrap_or(false);
 
-    // Price: the TWAP is the reference, from recorded history only; the spot
-    // price may not be further from it than `max_twap_deviation_bps` either way.
+    // Price: the TWAP is the reference, from recorded history only. The coin's
+    // spot price may not have risen above it by more than `max_twap_deviation_bps`
+    // (plus the reader's own error bound). A coin that got *cheaper* than its
+    // TWAP never refuses a buy: that is a good price, and the floor (measured
+    // against the TWAP) bounds the fill either way (see `math`'s docs).
     let reserve_dividend = pool.reserve(dividend_index, a.pool_dividend_vault.amount)?;
     let reserve_coin = pool.reserve(coin_index, a.pool_coin_vault.amount)?;
     let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
-    let twap_price_x32 =
-        twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, now as u64)?;
-    let deviation = params.max_twap_deviation_bps as u128;
-    // Fewer coin per dividend at spot than at the TWAP means the coin got pricier;
-    // more means it got cheaper and the TWAP lags the fall (the floor would be loose).
-    require!(spot * 10_000 >= twap_price_x32 * (10_000 - deviation), EndowmentError::PriceAboveTwap);
-    require!(spot * 10_000 <= twap_price_x32 * (10_000 + deviation), EndowmentError::PriceBelowTwap);
+    let twap = twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, now as u64)?;
+    let twap_price_x32 = twap.price_x32;
+    let tolerance = params.max_twap_deviation_bps as u128 + twap.error_bps as u128;
+    // Fewer coin per dividend at spot than at the TWAP means the coin got pricier.
+    require!(
+        spot * 10_000 >= twap_price_x32 * 10_000u128.saturating_sub(tolerance),
+        EndowmentError::PriceAboveTwap
+    );
 
     // Size: what the vault can spend, capped per transaction, by the paced
     // allowance, and so this trade's own impact stays within half the budget.
@@ -395,6 +412,7 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         dividend_index,
         coin_index,
         twap_price_x32,
+        twap_error_bps: twap.error_bps,
         pool_fee,
         dividend_fee,
         coin_fee,
@@ -472,6 +490,28 @@ fn flagship_can_trade(remaining: &[AccountInfo], epoch: u64) -> Result<bool> {
     Ok(capped_transfer_fee_bps(mint, epoch).is_ok())
 }
 
+/// The flagship's dividend-vault cap, if a donation can go to it now: its coin
+/// can trade (`flagship_can_trade`, first remaining account), and its config
+/// (second remaining account, at `flagship_config()`) exists, isn't retired and
+/// isn't paused. `None` skips the donation.
+fn flagship_state(remaining: &[AccountInfo], epoch: u64, program_id: &Pubkey) -> Result<Option<u64>> {
+    if !flagship_can_trade(remaining, epoch)? {
+        return Ok(None);
+    }
+    let info = remaining.get(1).ok_or(EndowmentError::WrongFlagshipVault)?;
+    require_keys_eq!(info.key(), flagship_config(), EndowmentError::WrongFlagshipVault);
+    if info.data_is_empty() || info.owner != program_id {
+        return Ok(None);
+    }
+    let data = info.try_borrow_data()?;
+    let config = Config::try_deserialize(&mut &data[..])?;
+    let now = Clock::get()?.unix_timestamp;
+    if config.retired || config.is_paused(now) {
+        return Ok(None);
+    }
+    Ok(Some(config.vault_cap()))
+}
+
 /// Deposits the liquidity share into the pool at its current ratio, with the LP
 /// tokens landing in the authority's LP account. Skipped (the share stays in the
 /// vault for a later buy) if the pool's price after our swap has strayed from
@@ -485,9 +525,15 @@ fn deposit_liquidity(ctx: &Context<Buyback>, config_key: &Pubkey, plan: &Plan, c
     let reserve_dividend = pool.reserve(plan.dividend_index, token_amount(&a.pool_dividend_vault.to_account_info())?)?;
     let reserve_coin = pool.reserve(plan.coin_index, token_amount(&a.pool_coin_vault.to_account_info())?)?;
     let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
-    let band = a.config.params.max_price_impact_bps as u128 + a.config.params.max_twap_deviation_bps as u128;
+    // Symmetric, unlike the buy band: skipping a deposit is harmless (the share
+    // stays in the vault for a later buy), while depositing at a ratio pushed
+    // away from the TWAP in either direction locks liquidity in at a price that
+    // then reverts. Includes the reader's error bound like the buy band.
+    let band = a.config.params.max_price_impact_bps as u128
+        + a.config.params.max_twap_deviation_bps as u128
+        + plan.twap_error_bps as u128;
     let twap = plan.twap_price_x32;
-    if spot * 10_000 < twap * (10_000 - band) || spot * 10_000 > twap * (10_000 + band) {
+    if spot * 10_000 < twap * 10_000u128.saturating_sub(band) || spot * 10_000 > twap * (10_000 + band) {
         return Ok(());
     }
 

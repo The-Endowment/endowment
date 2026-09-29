@@ -144,7 +144,8 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         total_lp_tokens: 0,
         total_tips: 0,
         total_donated: 0,
-        reserved: [0; 128],
+        refresher_epoch: 0,
+        reserved: [0; 124],
     });
     // An activation threshold of 0 means sweeps run from the start (for a
     // founders-only test window; renouncing requires production thresholds).

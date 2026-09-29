@@ -97,7 +97,8 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
         snapshot_valid: false,
         attestations: 0,
         last_attested_at: 0,
-        reserved: [0; 56],
+        attestation_epoch: 0,
+        reserved: [0; 52],
     });
 
     emit!(LandlordRegistered { config: config_key, owner, baseline, coin_held });

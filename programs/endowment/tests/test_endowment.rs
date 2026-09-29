@@ -613,15 +613,14 @@ impl Env {
         ata(&authority_pda(&flagship_config()), &self.inst.dividend_mint, &self.inst.dividend_program)
     }
 
+    /// Creates the flagship endowment (the test build's flagship creator, on
+    /// this pool, with the defaults), which creates its dividend vault.
     fn create_flagship_vault(&mut self) {
-        let payer = self.funded();
-        let create = create_associated_token_account_idempotent(
-            &payer.pubkey(),
-            &authority_pda(&flagship_config()),
-            &self.inst.dividend_mint,
-            &self.inst.dividend_program,
-        );
-        assert!(send(&mut self.svm, &[create], &payer, &[&payer]));
+        let mut flagship = self.inst.clone();
+        flagship.creator = test_flagship_creator();
+        self.svm.airdrop(&flagship.creator.pubkey(), 10_000_000_000).unwrap();
+        let guardian = self.guardian.pubkey();
+        assert!(self.create_inst(&flagship, params(guardian, 0)));
     }
 
     fn buyback_accounts_for(&self, inst: &Inst, caller: &Pubkey) -> endowment::accounts::Buyback {
@@ -662,8 +661,8 @@ impl Env {
     }
 
     /// As the website builds it: the flagship's vault is passed writable, and
-    /// the flagship's coin mint as the first remaining account, only when this
-    /// endowment donates.
+    /// the flagship's coin mint and config as the remaining accounts, only when
+    /// this endowment donates.
     fn buyback_ix_with(&self, accounts: endowment::accounts::Buyback, min_out: u64) -> Instruction {
         let donates = Env::config_at(&self.svm, &accounts.config).donation_bps > 0;
         let vault = accounts.flagship_dividend_vault;
@@ -673,6 +672,7 @@ impl Env {
                 meta.is_writable = true;
             }
             metas.push(AccountMeta::new_readonly(FLAGSHIP_COIN_MINT, false));
+            metas.push(AccountMeta::new_readonly(flagship_config(), false));
         }
         Instruction::new_with_bytes(endowment::id(), &endowment::instruction::Buyback { min_out }.data(), metas)
     }
@@ -3660,7 +3660,7 @@ fn regression_f01_a_coalesced_base_observation_doesnt_lower_the_floor() {
     }
     env.warp(1_790);
     let data = env.svm.get_account(&fixtures::key(fixtures::OBSERVATION)).unwrap().data;
-    let twap = endowment::raydium::twap_price_x32(&data, &env.inst.pool, 0, env.now() as u64).unwrap();
+    let twap = endowment::raydium::twap_price_x32(&data, &env.inst.pool, 0, env.now() as u64).unwrap().price_x32;
     // The price held steady throughout. Round 1 read 14 s / span low here
     // (−2.3% over its 10-minute window); now within ±7 s / span.
     let bps = twap * 10_000 / price;
@@ -3699,15 +3699,14 @@ fn regression_r3rf01_the_refresher_can_resign_after_renounce_and_then_sweeps_sto
     assert!(resign_refresher(&mut env, &refresher()));
     assert_eq!(env.config_state().params.refresher, Pubkey::default());
     assert_err!(resign_refresher(&mut env, &refresher()), NotRefresher);
-    // Its reads attest nothing now, so no count can start, and once the last
-    // count is three days old sweeps stop.
-    env.warp(COUNT_INTERVAL_SECS);
-    assert_err!(env.count(), NotAttested);
+    // Sweeps stop at once, and its reads attest nothing now, so no count can start.
+    assert!(!env.config_state().active);
     let owner = owners[0].insecure_clone();
     let account = env.inst.dividend_account(&owner.pubkey());
     env.airdrop_dividend(&account, 10);
-    env.warp(ACTIVE_MAX_AGE_SECS);
-    assert_err!(env.sweep(&owner.pubkey(), &account), CountStale);
+    assert_err!(env.sweep(&owner.pubkey(), &account), NotActive);
+    env.warp(COUNT_INTERVAL_SECS);
+    assert_err!(env.count(), NotAttested);
 }
 
 #[test]
@@ -3837,7 +3836,7 @@ fn regression_r3tw01_a_ring_of_records_15_seconds_apart_still_buys() {
 }
 
 #[test]
-fn regression_r3tw02_the_band_is_a_parameter_and_applies_both_ways() {
+fn regression_r3tw02_the_band_is_a_parameter_and_refuses_only_a_pricier_coin() {
     let mut env = funded_pool_env(50_000 * UNIT);
     // Spot 4% from the TWAP, coin pricier: within the default ±5%, it buys.
     donate_to_pool(&mut env, 400);
@@ -3847,12 +3846,13 @@ fn regression_r3tw02_the_band_is_a_parameter_and_applies_both_ways() {
     steady_history(&mut env);
     donate_to_pool(&mut env, 400);
     assert_err!(env.buy(), PriceAboveTwap);
-    // The coin 4% cheaper than its TWAP: refused as "below" (R3-TW-05).
+    // The coin 4% cheaper than its TWAP: it buys. The band is one-sided; the
+    // floor, anchored to the TWAP, bounds the fill either way.
     steady_history(&mut env);
     let vault = fixtures::key(fixtures::POOL_PENIS_VAULT);
     let balance = token_balance(&env.svm, &vault);
     env.set_balance(&vault, balance + balance * 400 / 10_000);
-    assert_err!(env.buy(), PriceBelowTwap);
+    assert!(env.buy());
     // Out of bounds either way.
     let admin = env.admin();
     let mut p = env.config_state().params;
@@ -3890,7 +3890,7 @@ fn regression_r3tw04_a_transfer_then_a_swap_colours_at_most_a_quarter_of_the_twa
     let ix = raydium_swap_ix(&env, &trader.pubkey(), UNIT);
     assert!(send(&mut env.svm, &[ix], &trader, &[&trader]));
     let data = env.svm.get_account(&fixtures::key(fixtures::OBSERVATION)).unwrap().data;
-    let twap = endowment::raydium::twap_price_x32(&data, &env.inst.pool, 0, env.now() as u64).unwrap();
+    let twap = endowment::raydium::twap_price_x32(&data, &env.inst.pool, 0, env.now() as u64).unwrap().price_x32;
     // The day weighs a quarter: the TWAP moved about a quarter of the way.
     let moved = 10_000 - twap * 10_000 / before;
     assert!((400..=600).contains(&moved), "{moved}");
@@ -3967,14 +3967,163 @@ fn regression_r3mint03_a_donating_buy_must_name_the_flagship_coin() {
     let caller = env.cranker();
     let accounts = env.buyback_accounts(&caller.pubkey());
     let mut ix = env.buyback_ix_with(accounts, 1);
-    // Without the flagship's coin mint, or with another mint in its place: refused.
+    let config = ix.accounts.pop().unwrap();
+    assert_eq!(config.pubkey, flagship_config());
     let mint = ix.accounts.pop().unwrap();
     assert_eq!(mint.pubkey, FLAGSHIP_COIN_MINT);
+    // Without the flagship's coin mint, or with another mint in its place: refused.
     assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
     ix.accounts.push(AccountMeta::new_readonly(env.inst.dividend_mint, false));
+    ix.accounts.push(config.clone());
+    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
+    ix.accounts.truncate(ix.accounts.len() - 2);
+    // The coin, but without the flagship's config (its vault cap), or another
+    // endowment's config in its place: refused.
+    ix.accounts.push(mint);
+    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
+    ix.accounts.push(AccountMeta::new_readonly(env.config(), false));
     assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
     ix.accounts.pop();
-    ix.accounts.push(mint);
+    ix.accounts.push(config);
     assert!(send(&mut env.svm, &[ix], &caller, &[&caller]));
     assert!(env.config_state().total_donated > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Regressions: the final check's findings (audit-pocs/final-check), which must now fail.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regression_fcr302_a_pending_proposal_cant_reinstate_a_resigned_refresher() {
+    let (mut env, _owners) = counted_env();
+    let admin = env.admin();
+    // The probe: a routine change, proposed while the refresher is still trusted.
+    let mut p = env.config_state().params;
+    p.tip_bps = p.tip_bps.saturating_sub(1);
+    assert!(env.propose(&admin, p));
+    // The refresher suspects its key leaked and resigns: the proposal loses it too.
+    assert!(resign_refresher(&mut env, &refresher()));
+    assert_eq!(env.config_state().pending.params.refresher, Pubkey::default());
+    // Past the timelock and the admin's grace day, a stranger applies it.
+    env.warp(PARAM_TIMELOCK_SECONDS + PARAM_APPLY_GRACE_SECONDS);
+    let stranger = env.funded();
+    assert!(env.apply_params_as(&stranger));
+    let c = env.config_state();
+    assert_eq!(c.params.refresher, Pubkey::default(), "the resigned key stays out");
+    assert_eq!(c.params.tip_bps, p.tip_bps, "the rest of the change applies");
+    assert!(!c.active);
+}
+
+#[test]
+fn regression_fcr303_resigning_switches_sweeps_off_and_voids_its_reads() {
+    let (mut env, owners) = counted_env();
+    let o: Vec<Pubkey> = owners.iter().map(|k| k.pubkey()).collect();
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    assert!(env.config_state().active);
+    // A round opens on a full set of reads; the refresher resigns partway through.
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.attest_fully(&o));
+    let begin = env.begin_ix(env.config());
+    assert!(env.crank(&[begin]));
+    assert!(env.count_batch(&o[..1]));
+    assert!(resign_refresher(&mut env, &refresher()));
+    let c = env.config_state();
+    assert!(!c.active && !c.count.open);
+    // Sweeps are off at once, not when the last count goes stale.
+    let owner = owners[0].insecure_clone();
+    let account = env.inst.dividend_account(&owner.pubkey());
+    env.airdrop_dividend(&account, 10);
+    assert_err!(env.sweep(&owner.pubkey(), &account), NotActive);
+    // The round those reads were for closed without a result.
+    assert_err!(env.finish(), NoOpenCount);
+    // Reappointed through the timelock (the same key), it starts from nothing:
+    // sweeps stay off until a new count, and its earlier reads don't carry over.
+    env.change_params(|p| p.refresher = refresher().pubkey());
+    assert!(!env.config_state().active);
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.attest(&o));
+    for owner in &o[1..] {
+        assert_eq!(env.landlord_state(owner).attestations, 1, "one fresh read, not four");
+    }
+    let begin = env.begin_ix(env.config());
+    assert!(env.crank(&[begin]));
+    assert!(env.count_batch(&o));
+    assert_eq!(env.config_state().count.counted, 0, "every landlord is pending");
+}
+
+#[test]
+fn regression_fcmint01_a_donation_stops_at_the_flagship_vault_cap() {
+    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 30);
+    env.create_flagship_vault();
+    let flagship_vault = env.flagship_vault();
+    // The flagship runs the defaults: three days of MAX_BUY_PER_DAY.
+    let cap = 3 * MAX_BUY_PER_DAY;
+    // The probe: already ten times the cap. Nothing more arrives; the share
+    // stays in the donor's vault for its own buys.
+    env.set_balance(&flagship_vault, 10 * cap);
+    assert!(env.buy());
+    assert_eq!(token_balance(&env.svm, &flagship_vault), 10 * cap);
+    assert_eq!(env.config_state().total_donated, 0);
+    // Just under the cap: the donation tops it up exactly.
+    env.set_balance(&flagship_vault, cap - 100);
+    env.warp(DAY);
+    assert!(env.buy());
+    assert_eq!(token_balance(&env.svm, &flagship_vault), cap);
+    assert_eq!(env.config_state().total_donated, 100);
+}
+
+#[test]
+fn regression_fcr304_the_vault_cap_counts_what_the_buy_interval_lets_it_spend() {
+    let mut env = funded_pool_env(0);
+    env.change_params(|p| {
+        p.activate_bps = 0;
+        p.deactivate_bps = 0;
+        p.min_stake_bps = 0;
+        p.min_buy_interval_secs = DAY;
+    });
+    // One buy of at most MAX_BUY_PER_TX a day: the cap is three of those,
+    // not three of max_buy_per_day.
+    assert_eq!(env.config_state().vault_cap(), 3 * MAX_BUY_PER_TX);
+    let (owner, account) = env.registered_landlord(0);
+    env.set_balance(&account, 50 * MAX_BUY_PER_DAY);
+    assert!(env.sweep(&owner.pubkey(), &account));
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 3 * MAX_BUY_PER_TX);
+}
+
+/// The attacker's own Raydium swap the other way: the coin for the dividend.
+fn raydium_sell_ix(env: &Env, trader: &Pubkey, amount_in: u64) -> Instruction {
+    let mut ix = raydium_swap_ix(env, trader, amount_in);
+    ix.accounts.swap(4, 5);
+    ix.accounts.swap(6, 7);
+    ix.accounts.swap(10, 11);
+    ix
+}
+
+#[test]
+fn regression_band_an_attacker_who_pushes_the_price_down_first_only_loses() {
+    // Control: the same buy with nobody in front of it.
+    let mut control = funded_pool_env(5_000 * UNIT + tip_on(5_000 * UNIT));
+    assert!(control.buy());
+    let fair = token_balance(&control.svm, &control.coin_vault());
+
+    let mut env = funded_pool_env(5_000 * UNIT + tip_on(5_000 * UNIT));
+    let (attacker, pump) = env.new_landlord(0);
+    let dump = token_balance(&env.svm, &fixtures::key(fixtures::POOL_PENIS_VAULT)) / 20;
+    env.mint_coin(&attacker.pubkey(), dump);
+    // Dump 5% of the pool's coin, then the buyback in the same transaction: the
+    // coin sits well below its TWAP, and the buy goes through at that price.
+    let ixs = [raydium_sell_ix(&env, &attacker.pubkey(), dump), env.buyback_ix(&attacker.pubkey(), 1)];
+    assert!(send(&mut env.svm, &ixs, &attacker, &[&attacker]));
+    let bought = token_balance(&env.svm, &env.coin_vault());
+    assert!(bought > fair, "the endowment gets more coin, not less: {bought} vs {fair}");
+    // The attacker buys back with everything the dump raised (and the tip),
+    // and ends with less coin than it dumped.
+    let raised = token_balance(&env.svm, &pump);
+    let ix = raydium_swap_ix(&env, &attacker.pubkey(), raised);
+    assert!(send(&mut env.svm, &[ix], &attacker, &[&attacker]));
+    let back = token_balance(&env.svm, &env.inst.coin_account(&attacker.pubkey()));
+    println!("attacker: dumped {dump}, got back {back}");
+    assert!(back < dump);
 }

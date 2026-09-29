@@ -5,26 +5,36 @@
 //! can't move it (see `raydium::twap_price_x32`). A buyback accepts no fill worse than
 //!
 //!   floor = amount_in × (1 − dividend_fee) × twap × (1 − coin_fee) × (1 − pool_fee − slippage)
-//!   slippage = max_price_impact / 2 + max_twap_deviation + reader_error
+//!   slippage = max_price_impact / 2 + max_twap_deviation + reader_error + rounding
 //!
 //! where `twap` is the coin received per dividend, fees are the two mints'
 //! Token-2022 transfer fees and Raydium's fee on input (all capped, see
 //! `constants.rs`). Each buy is sized so its own price impact is at most half
 //! of `max_price_impact` (`amount_in ≤ reserve_in × max_price_impact / 2`);
-//! `max_twap_deviation` is how far the spot price may have drifted from the
-//! TWAP (the band in `buyback` enforces the same line), and `reader_error` is
-//! the TWAP reader's own uncertainty (`TWAP_READER_ERROR_BPS`). So a buy at a
-//! flat price is never refused by the floor (R3-TW-03), and no buy can fill
-//! worse than the TWAP by more than those three together.
+//! `max_twap_deviation` is how far the coin's spot price may have risen above
+//! the TWAP (the band in `buyback` enforces the same line); `reader_error` is
+//! the bound the TWAP reader computes for its own timing uncertainty on the
+//! history it used (`raydium::Twap::error_bps`, at most
+//! `MAX_TWAP_READER_ERROR_BPS`); `rounding` is `TWAP_ROUNDING_BPS`. So a buy at
+//! a flat price is never refused by the floor (R3-TW-03, FC-R3-01), and no buy
+//! can fill worse than the TWAP by more than those together.
+//!
+//! The band is one-sided: a coin *cheaper* than its TWAP (more coin per
+//! dividend) never refuses a buy. That side was never a safety check: someone
+//! who wanted to exploit a cheap coin against a lagging TWAP would first buy it
+//! back up to the TWAP in the same block, after which a two-sided band passes
+//! anyway, and the floor above is what bounds that fill either way (see the
+//! design note). It only ever refused honest buys at a good price.
 
-use crate::constants::TWAP_READER_ERROR_BPS;
+use crate::constants::TWAP_ROUNDING_BPS;
 
 const BPS: u128 = 10_000;
 const Q32: u32 = 32;
 
-/// The floor's allowance beyond fees: see the module docs.
-pub fn floor_slippage_bps(max_price_impact_bps: u16, max_twap_deviation_bps: u16) -> u64 {
-    (max_price_impact_bps as u64).div_ceil(2) + max_twap_deviation_bps as u64 + TWAP_READER_ERROR_BPS
+/// The floor's allowance beyond fees: see the module docs. `reader_error_bps`
+/// is the TWAP reader's computed bound for the history it used.
+pub fn floor_slippage_bps(max_price_impact_bps: u16, max_twap_deviation_bps: u16, reader_error_bps: u64) -> u64 {
+    (max_price_impact_bps as u64).div_ceil(2) + max_twap_deviation_bps as u64 + reader_error_bps + TWAP_ROUNDING_BPS
 }
 
 /// Minimum acceptable coin received for `amount_in` dividend, against the TWAP.
@@ -171,21 +181,26 @@ mod tests {
 
     #[test]
     fn floor_slippage_is_half_the_impact_plus_the_band_plus_the_reader_error() {
-        assert_eq!(floor_slippage_bps(100, 500), 50 + 500 + TWAP_READER_ERROR_BPS);
-        assert_eq!(floor_slippage_bps(15, 100), 8 + 100 + TWAP_READER_ERROR_BPS);
+        assert_eq!(floor_slippage_bps(100, 500, 39), 50 + 500 + 39 + TWAP_ROUNDING_BPS);
+        assert_eq!(floor_slippage_bps(15, 100, 300), 8 + 100 + 300 + TWAP_ROUNDING_BPS);
     }
 
     #[test]
     fn r3tw03_a_flat_price_clears_the_floor_at_the_smallest_settings() {
-        // A buy at the impact cap, the TWAP read 0.78% high (the reader's
-        // worst case at the shortest window), spot exactly at the true price.
+        // A buy at the impact cap, the TWAP read 0.78% high and the reader
+        // reporting that bound, spot exactly at the true price.
         let (reserve_in, reserve_out) = (1_000_000_000u64, 7_000_000_000u64);
         let impact = crate::constants::MIN_PRICE_IMPACT_BPS;
         let deviation = crate::constants::MIN_TWAP_DEVIATION_BPS;
         let amount = impact_cap(reserve_in, impact);
         let twap = spot_price_x32(reserve_in, reserve_out).unwrap() * 10_078 / 10_000;
-        let floor = min_acceptable_out(amount, twap, 25, 0, 300, floor_slippage_bps(impact, deviation)).unwrap();
+        let floor = min_acceptable_out(amount, twap, 25, 0, 300, floor_slippage_bps(impact, deviation, 78)).unwrap();
         let quote = quote_out(amount, reserve_in, reserve_out, 25, 0, 300);
+        assert!(quote >= floor, "{quote} < {floor}");
+        // And at the reader's largest allowed bound.
+        let twap = spot_price_x32(reserve_in, reserve_out).unwrap() * 10_300 / 10_000;
+        let slippage = floor_slippage_bps(impact, deviation, crate::constants::MAX_TWAP_READER_ERROR_BPS);
+        let floor = min_acceptable_out(amount, twap, 25, 0, 300, slippage).unwrap();
         assert!(quote >= floor, "{quote} < {floor}");
     }
 

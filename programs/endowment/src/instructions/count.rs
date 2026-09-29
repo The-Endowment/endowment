@@ -47,7 +47,8 @@
 //! times, and it can leave landlords out by not reading them. Every read is
 //! public (`LandlordsAttested` lists the landlords read), the refresher is shown
 //! on each endowment's page, and it can resign (`resign_refresher`) at any time,
-//! which leaves nobody counting.
+//! which switches sweeps off at once and voids every read it made (reads are
+//! tagged with the endowment's `refresher_epoch`).
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::Mint;
@@ -202,7 +203,7 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
         let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
         let held = landlord.held(balance);
         let eligible = delegated && held > 0 && held >= min_stake;
-        if eligible && landlord.attestations < REQUIRED_ATTESTATIONS {
+        if eligible && config.attestations_of(&landlord) < REQUIRED_ATTESTATIONS {
             // Would count but hasn't had all its reads: pending, not zero. The
             // refresher can still read it, and it can be counted later in the
             // round (or counts zero if the round times out first).
@@ -283,6 +284,11 @@ pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'inf
         let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
         if delegated {
             landlord.snapshot = landlord.snapshot.min(balance);
+            if attest && landlord.attestation_epoch != config.refresher_epoch {
+                // Reads under a previous refresher don't carry over (FC-R3-03).
+                landlord.attestations = 0;
+                landlord.attestation_epoch = config.refresher_epoch;
+            }
             let spaced = landlord.attestations == 0
                 || now.saturating_sub(landlord.last_attested_at) >= MIN_ATTEST_SPACING_SECS;
             if attest && spaced {

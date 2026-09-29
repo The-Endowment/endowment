@@ -62,8 +62,8 @@ pub const TWAP_WINDOW_SECONDS: u64 = 30 * 60;
 /// 1,485 s: a busy pool (or a flood of dust swaps) can shorten the window to
 /// what the ring holds, but never below this minimum, so frequent trading can't
 /// make the TWAP unavailable (R3-TW-01). Shorter would make the average cheaper
-/// to push; the start-of-window uncertainty (±7 s, see `TWAP_READER_ERROR_BPS`)
-/// grows as the window shrinks.
+/// to push; the reader's timing uncertainty (see `MAX_TWAP_READER_ERROR_BPS`)
+/// weighs more as the window shrinks.
 pub const MIN_TWAP_WINDOW_SECONDS: u64 = 15 * 60;
 
 /// Raydium coalesces swaps within this many seconds of an observation's
@@ -71,11 +71,19 @@ pub const MIN_TWAP_WINDOW_SECONDS: u64 = 15 * 60;
 /// price may run up to this long past its recorded timestamp.
 pub const RAYDIUM_OBSERVATION_COALESCE_SECONDS: u64 = 14;
 
-/// The reader takes each older record as of the middle of that range, so the
-/// average's start is uncertain by ±7 s: ±7 / 900 ≈ ±0.78% at the shortest
-/// window. The floor allows for it explicitly (R3-TW-03), so a flat price never
-/// reads as a loss.
-pub const TWAP_READER_ERROR_BPS: u64 = 80;
+/// The reader takes each older record as of the middle of that range (±7 s) and
+/// works out, for the stretches it actually used, a bound on how far that timing
+/// uncertainty can move the average (`raydium::twap_price_x32`): about ±7 s over
+/// the window when no stretch is capped, more for each capped stretch, whose
+/// endpoints no longer cancel against their neighbours' (FC-R3-01). The floor
+/// and the spot band allow for that computed bound, so a flat price never reads
+/// as a loss. A history whose bound exceeds this is refused as unreadable: it
+/// takes several capped stretches with swaps timed around them, which is also
+/// what a manipulated record looks like.
+pub const MAX_TWAP_READER_ERROR_BPS: u64 = 300;
+
+/// Added to the computed reader bound for integer rounding in the floor.
+pub const TWAP_ROUNDING_BPS: u64 = 10;
 
 /// No single stretch of the price record counts for more than this share of the
 /// full TWAP window (a longer one counts at its average price, for that capped
@@ -126,10 +134,11 @@ pub const COUNT_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 pub const REQUIRED_ATTESTATIONS: u8 = 3;
 pub const MIN_ATTEST_SPACING_SECS: i64 = 30 * 60;
 
-/// A sweep never takes the dividend vault above this many days of the daily buy
-/// allowance: what's already in the vault is what could be stranded if a
-/// third-party authority (a fee or hook authority, say) stopped buybacks for
-/// good, so it's kept to a few days' worth (R3-MINT-01).
+/// Neither a sweep nor a donation takes a dividend vault above this many days
+/// of what it can spend (`Config::vault_cap`): what's already in the vault is
+/// what could be stranded if a third-party authority (a fee or hook authority,
+/// say) or a pool halt stopped buybacks for good, so it's kept to a few days'
+/// worth (R3-MINT-01).
 pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 
 /// Sweeps stop if no count has finished for this long (a count that nobody runs
