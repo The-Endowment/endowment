@@ -62,8 +62,22 @@ pub mod endowment {
         instructions::buyback::handle_buyback(ctx, min_out)
     }
 
-    pub fn count_commitment<'info>(ctx: Context<'info, CountCommitment<'info>>) -> Result<()> {
-        instructions::count::handle_count_commitment(ctx)
+    /// The daily commitment count: begin, count landlords in batches, finish.
+    pub fn begin_count(ctx: Context<BeginCount>) -> Result<()> {
+        instructions::count::handle_begin_count(ctx)
+    }
+
+    pub fn count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>) -> Result<()> {
+        instructions::count::handle_count_landlords(ctx)
+    }
+
+    pub fn finish_count(ctx: Context<FinishCount>) -> Result<()> {
+        instructions::count::handle_finish_count(ctx)
+    }
+
+    /// Decrease-only re-read of landlords' balances between counts.
+    pub fn refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'info>>) -> Result<()> {
+        instructions::count::handle_refresh_landlords(ctx)
     }
 
     /// Parameters: proposed by the admin, applied by anyone after 72 hours.

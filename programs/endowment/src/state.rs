@@ -53,6 +53,23 @@ impl Params {
     }
 }
 
+/// One daily commitment count, run across as many transactions as needed.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
+pub struct CountRound {
+    /// Increments at each `begin_count`. 0 = no count has ever started.
+    pub round: u64,
+    pub open: bool,
+    pub started_at: i64,
+    /// The coin's supply when the round began; the denominator.
+    pub supply: u64,
+    /// Landlords registered before the round began: each must be counted (or
+    /// the round must time out) before it can finish.
+    pub expected: u32,
+    pub counted: u32,
+    /// Sum of what the counted landlords count for.
+    pub committed: u64,
+}
+
 /// A parameter change waiting out the timelock.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
 pub struct PendingParams {
@@ -83,7 +100,6 @@ pub struct Config {
     pub pool: Pubkey,
     pub bump: u8,
     pub authority_bump: u8,
-    pub roster_bump: u8,
 
     pub params: Params,
     pub pending: PendingParams,
@@ -100,11 +116,18 @@ pub struct Config {
     /// One-way: set when `total_coin_bought` reaches `contribution_cap`.
     pub milestone_reached: bool,
 
-    /// Landlord sweeps run only while `active`. See `count_commitment`.
+    /// Landlord sweeps run only while `active`. See the daily count
+    /// (`begin_count` → `count_landlords` → `finish_count`).
     pub active: bool,
+    /// When the last count finished, and what it found.
     pub last_count_at: i64,
     pub last_count_bps: u16,
     pub last_committed: u64,
+
+    /// Registered landlords (no limit).
+    pub landlord_count: u32,
+    /// The current (or last) count round and its running tally.
+    pub count: CountRound,
 
     /// Buy pacing: a token bucket holding at most `max_buy_per_tx`, refilling at
     /// `max_buy_per_day` per 24 hours.
@@ -167,6 +190,24 @@ impl Config {
     pub fn min_stake(&self, supply: u64) -> u64 {
         (supply as u128 * self.params.min_stake_bps as u128).div_ceil(10_000) as u64
     }
+
+    /// Whether `landlord` belongs to the round now open and hasn't been counted in it.
+    pub fn expects(&self, landlord: &Landlord) -> bool {
+        self.count.open && landlord.joined_round < self.count.round && landlord.counted_round < self.count.round
+    }
+
+    /// Takes a departing landlord out of the open round, so leaving mid-count
+    /// can't strand the round or let its coin be counted twice.
+    pub fn remove_from_round(&mut self, landlord: &Landlord) {
+        if !self.count.open || landlord.joined_round >= self.count.round {
+            return;
+        }
+        self.count.expected = self.count.expected.saturating_sub(1);
+        if landlord.counted_round == self.count.round {
+            self.count.counted = self.count.counted.saturating_sub(1);
+            self.count.committed = self.count.committed.saturating_sub(landlord.counted_amount);
+        }
+    }
 }
 
 pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pubkey) -> Result<()> {
@@ -178,45 +219,6 @@ pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pub
         require_keys_neq!(*config, FLAGSHIP_CONFIG, EndowmentError::InvalidDonation);
     }
     Ok(())
-}
-
-/// One registered landlord, as the commitment count sees it.
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
-pub struct RosterEntry {
-    pub owner: Pubkey,
-    pub coin_account: Pubkey,
-    pub dividend_account: Pubkey,
-    /// Coin balance read at the last count (or at registration, before any).
-    pub snapshot: u64,
-    /// False until the landlord's first count. A landlord counts only from its
-    /// second count on, and then for min(balance now, balance at the last count),
-    /// so coin must be held across a full count interval to count.
-    pub snapshot_valid: bool,
-}
-
-/// Every landlord of one endowment. Seeds: [ROSTER_SEED, config].
-#[account]
-#[derive(InitSpace)]
-pub struct Roster {
-    pub version: u8,
-    pub config: Pubkey,
-    #[max_len(MAX_LANDLORDS)]
-    pub entries: Vec<RosterEntry>,
-}
-
-impl Roster {
-    pub fn position(&self, owner: &Pubkey) -> Option<usize> {
-        self.entries.iter().position(|e| e.owner == *owner)
-    }
-
-    /// The entry with the smallest recorded stake (the one a larger landlord replaces).
-    pub fn smallest(&self) -> Option<usize> {
-        self.entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.snapshot)
-            .map(|(i, _)| i)
-    }
 }
 
 /// A landlord of one endowment. Seeds: [LANDLORD_SEED, config, owner].
@@ -238,6 +240,19 @@ pub struct Landlord {
     pub registered_at: i64,
     pub last_sweep_at: i64,
     pub bump: u8,
+
+    /// The count round that was open (or last finished) when this landlord
+    /// registered. It is counted from the next round on.
+    pub joined_round: u64,
+    /// The last round this landlord was counted in, and what it counted for.
+    pub counted_round: u64,
+    pub counted_amount: u64,
+    /// Coin balance read at this landlord's last count. The next count credits
+    /// at most this, so coin must be held from one count to the next to count.
+    pub snapshot: u64,
+    /// False until the landlord's first count (which therefore counts zero).
+    pub snapshot_valid: bool,
+
     /// Room for future fields without a migration.
     pub reserved: [u8; 64],
 }
@@ -247,6 +262,16 @@ impl Landlord {
     /// capped by the remaining delegation. The baseline never moves here.
     pub fn sweepable(&self, balance: u64, delegated: u64) -> u64 {
         balance.saturating_sub(self.baseline).min(delegated)
+    }
+
+    /// What this landlord counts for, given its coin balance now: the smaller of
+    /// that and its balance at its previous count (zero at its first count).
+    pub fn held(&self, balance: u64) -> u64 {
+        if self.snapshot_valid {
+            balance.min(self.snapshot)
+        } else {
+            0
+        }
     }
 }
 
@@ -266,6 +291,11 @@ mod tests {
             registered_at: 0,
             last_sweep_at: 0,
             bump: 0,
+            joined_round: 0,
+            counted_round: 0,
+            counted_amount: 0,
+            snapshot: 0,
+            snapshot_valid: false,
             reserved: [0; 64],
         }
     }
@@ -351,10 +381,39 @@ mod tests {
     }
 
     #[test]
-    fn roster_smallest_is_the_lowest_snapshot() {
-        let entry = |snapshot| RosterEntry { owner: Pubkey::new_unique(), snapshot, ..Default::default() };
-        let roster = Roster { version: 1, config: Pubkey::default(), entries: vec![entry(50), entry(10), entry(30)] };
-        assert_eq!(roster.smallest(), Some(1));
+    fn a_landlord_counts_only_what_it_held_since_its_last_count() {
+        let mut l = landlord(0);
+        assert_eq!(l.held(500), 0, "the first count only records the balance");
+        l.snapshot_valid = true;
+        l.snapshot = 300;
+        assert_eq!(l.held(500), 300, "growth waits for the next count");
+        assert_eq!(l.held(120), 120, "a drop counts at once");
+    }
+
+    #[test]
+    fn leaving_mid_round_takes_the_landlord_out_of_the_tally() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.count = CountRound { round: 5, open: true, expected: 3, counted: 2, committed: 700, ..Default::default() };
+        let mut counted = landlord(0);
+        counted.joined_round = 4;
+        counted.counted_round = 5;
+        counted.counted_amount = 400;
+        config.remove_from_round(&counted);
+        assert_eq!((config.count.expected, config.count.counted, config.count.committed), (2, 1, 300));
+
+        let mut waiting = landlord(0);
+        waiting.joined_round = 1;
+        waiting.counted_round = 4;
+        assert!(config.expects(&waiting));
+        config.remove_from_round(&waiting);
+        assert_eq!((config.count.expected, config.count.counted, config.count.committed), (1, 1, 300));
+
+        // Joined during this round: never part of it.
+        let mut newcomer = landlord(0);
+        newcomer.joined_round = 5;
+        assert!(!config.expects(&newcomer));
+        config.remove_from_round(&newcomer);
+        assert_eq!(config.count.expected, 1);
     }
 
     #[test]

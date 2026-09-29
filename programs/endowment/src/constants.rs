@@ -15,15 +15,9 @@ pub const AUTHORITY_SEED: &[u8] = b"authority";
 #[constant]
 pub const LANDLORD_SEED: &[u8] = b"landlord";
 
-/// Roster PDA seeds: [ROSTER_SEED, config]. Every registered landlord, in the
-/// order the commitment count reads them.
-#[constant]
-pub const ROSTER_SEED: &[u8] = b"roster";
-
 /// Account layout versions, for future migrations.
 pub const CONFIG_VERSION: u8 = 1;
 pub const LANDLORD_VERSION: u8 = 1;
-pub const ROSTER_VERSION: u8 = 1;
 
 /// A guardian pause lifts on its own after this long, and a new pause can only
 /// start this long after the last one ended. The guardian can therefore stop an
@@ -67,14 +61,13 @@ pub const MAX_MIN_STAKE_BPS: u16 = 500;
 /// delegates at least this much to the endowment (the website approves u64::MAX).
 pub const MIN_DELEGATION: u64 = u64::MAX / 2;
 
-/// The commitment count runs at most once per this many seconds.
+/// A commitment count can start at most once per this many seconds.
 pub const COUNT_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
-/// The commitment count reads every landlord in one instruction, two accounts
-/// each (coin + dividend). With the count's five fixed accounts and a compute
-/// budget instruction, this keeps the transaction within Solana's 64-account
-/// lock limit (it needs an address lookup table to fit the 1,232-byte size limit).
-pub const MAX_LANDLORDS: usize = 28;
+/// Once a count has been open this long, anyone can finish it; landlords not yet
+/// counted count as zero for that round. Nobody can freeze the count by starting
+/// it and walking away.
+pub const COUNT_TIMEOUT_SECS: i64 = 2 * 60 * 60;
 
 /// Minimum time between buybacks, bounds.
 pub const MIN_BUY_INTERVAL_BOUNDS: (i64, i64) = (60, 24 * 60 * 60);

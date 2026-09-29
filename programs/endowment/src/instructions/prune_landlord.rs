@@ -5,17 +5,18 @@ use crate::{
     constants::*,
     error::EndowmentError,
     events::LandlordRemoved,
-    state::{Config, Landlord, Roster},
+    state::{Config, Landlord},
     transfer::read_token_account,
 };
 
-/// Permissionless: removes a landlord that no longer qualifies, so it can't hold
-/// a roster place. A landlord qualifies while its dividend account still
-/// delegates to the endowment and it holds at least the minimum stake. The rent
-/// goes back to the landlord's own wallet.
+/// Permissionless: removes a landlord that no longer qualifies, so the daily
+/// count doesn't have to keep reading it. A landlord qualifies while its dividend
+/// account still delegates to the endowment and it holds at least the minimum
+/// stake. The rent goes back to the landlord's own wallet.
 #[derive(Accounts)]
 pub struct PruneLandlord<'info> {
     #[account(
+        mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
@@ -23,8 +24,6 @@ pub struct PruneLandlord<'info> {
     /// CHECK: this endowment's authority PDA; compared with the delegate.
     #[account(seeds = [AUTHORITY_SEED, config.key().as_ref()], bump = config.authority_bump)]
     pub authority: UncheckedAccount<'info>,
-    #[account(mut, seeds = [ROSTER_SEED, config.key().as_ref()], bump = config.roster_bump)]
-    pub roster: Box<Account<'info, Roster>>,
     #[account(
         mut,
         close = owner,
@@ -48,20 +47,18 @@ pub struct PruneLandlord<'info> {
 }
 
 pub fn handle_prune_landlord(ctx: Context<PruneLandlord>) -> Result<()> {
-    let config = &ctx.accounts.config;
     let authority = ctx.accounts.authority.key();
     let delegated = read_token_account(&ctx.accounts.dividend_account)?
         .map(|t| t.delegates_to(&authority))
         .unwrap_or(false);
     let held = read_token_account(&ctx.accounts.coin_account)?.map(|t| t.amount).unwrap_or(0);
+    let config = &mut ctx.accounts.config;
     let staked = held >= config.min_stake(ctx.accounts.coin_mint.supply);
     require!(!delegated || !staked, EndowmentError::NotPrunable);
 
-    let owner = ctx.accounts.landlord.owner;
-    let roster = &mut ctx.accounts.roster;
-    if let Some(i) = roster.position(&owner) {
-        roster.entries.remove(i);
-    }
-    emit!(LandlordRemoved { config: config.key(), owner, evicted_by: None });
+    let landlord = &ctx.accounts.landlord;
+    config.remove_from_round(landlord);
+    config.landlord_count = config.landlord_count.saturating_sub(1);
+    emit!(LandlordRemoved { config: config.key(), owner: landlord.owner });
     Ok(())
 }

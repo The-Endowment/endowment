@@ -30,13 +30,12 @@ pub struct LandlordDeregistered {
     pub total_contributed: u64,
 }
 
-/// A landlord removed by someone else: it revoked its delegation, fell below the
-/// minimum stake, or was replaced by a larger landlord when the roster was full.
+/// A landlord removed by someone else because it no longer qualifies: it revoked
+/// its delegation or fell below the minimum stake.
 #[event]
 pub struct LandlordRemoved {
     pub config: Pubkey,
     pub owner: Pubkey,
-    pub evicted_by: Option<Pubkey>,
 }
 
 #[event]
@@ -86,12 +85,37 @@ pub struct MilestoneReached {
 }
 
 #[event]
+pub struct CountStarted {
+    pub config: Pubkey,
+    pub round: u64,
+    pub expected: u32,
+    pub supply: u64,
+}
+
+/// One landlord's line in the public tally. `raw_balance` is its coin balance at
+/// the moment it was read; comparing it round to round shows coin moving between
+/// landlord wallets.
+#[event]
+pub struct LandlordCounted {
+    pub config: Pubkey,
+    pub round: u64,
+    pub landlord: Pubkey,
+    pub owner: Pubkey,
+    pub counted: u64,
+    pub raw_balance: u64,
+}
+
+#[event]
 pub struct CommitmentCounted {
     pub config: Pubkey,
-    pub landlords: u32,
+    pub round: u64,
+    pub expected: u32,
+    pub counted: u32,
     pub committed: u64,
     pub committed_bps: u16,
     pub active: bool,
+    /// The round was finished after its timeout, with some landlords uncounted.
+    pub timed_out: bool,
 }
 
 #[event]

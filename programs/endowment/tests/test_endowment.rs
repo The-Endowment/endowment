@@ -20,11 +20,11 @@ use {
     },
     endowment::{
         constants::{
-            AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, FLAGSHIP_CONFIG, LANDLORD_SEED, MAX_LANDLORDS,
-            MAX_PAUSE_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS, ROSTER_SEED,
+            AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS, FLAGSHIP_CONFIG, LANDLORD_SEED,
+            MAX_PAUSE_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
         },
         error::EndowmentError,
-        state::{Config, CreateParams, Landlord, Params, Roster},
+        state::{Config, CreateParams, Landlord, Params},
     },
     litesvm::LiteSVM,
     solana_keypair::Keypair,
@@ -137,10 +137,6 @@ fn config_pda(coin_mint: &Pubkey, creator: &Pubkey) -> Pubkey {
 
 fn authority_pda(config: &Pubkey) -> Pubkey {
     pda(&[AUTHORITY_SEED, config.as_ref()])
-}
-
-fn roster_pda(config: &Pubkey) -> Pubkey {
-    pda(&[ROSTER_SEED, config.as_ref()])
 }
 
 fn landlord_pda(config: &Pubkey, owner: &Pubkey) -> Pubkey {
@@ -289,9 +285,6 @@ impl Inst {
     fn authority(&self) -> Pubkey {
         authority_pda(&self.config())
     }
-    fn roster(&self) -> Pubkey {
-        roster_pda(&self.config())
-    }
     fn dividend_vault(&self) -> Pubkey {
         ata(&self.authority(), &self.dividend_mint, &self.dividend_program)
     }
@@ -311,6 +304,8 @@ struct Env {
     guardian: Keypair,
     mint_authority: Keypair,
     inst: Inst,
+    /// Every (config, owner) registered through `register`, for counts to find.
+    known: Vec<(Pubkey, Pubkey)>,
 }
 
 impl Env {
@@ -346,6 +341,7 @@ impl Env {
             guardian,
             mint_authority,
             inst: Inst { creator, coin_mint, dividend_mint, coin_program, dividend_program, pool },
+            known: vec![],
         }
     }
 
@@ -384,6 +380,7 @@ impl Env {
                 dividend_program: TOKEN_2022,
                 pool: fixtures::key(fixtures::POOL),
             },
+            known: vec![],
         }
     }
 
@@ -393,9 +390,6 @@ impl Env {
     }
     fn authority(&self) -> Pubkey {
         self.inst.authority()
-    }
-    fn roster(&self) -> Pubkey {
-        self.inst.roster()
     }
     fn dividend_vault(&self) -> Pubkey {
         self.inst.dividend_vault()
@@ -419,7 +413,6 @@ impl Env {
                 creator: inst.creator.pubkey(),
                 config,
                 authority: authority_pda(&config),
-                roster: roster_pda(&config),
                 coin_mint: inst.coin_mint,
                 dividend_mint: inst.dividend_mint,
                 dividend_vault: inst.dividend_vault(),
@@ -645,44 +638,118 @@ impl Env {
         self.admin_call(signer, endowment::instruction::RenounceAdmin {}.data())
     }
 
-    fn roster_state(&self) -> Roster {
-        let account = self.svm.get_account(&self.roster()).unwrap();
-        Roster::try_deserialize(&mut account.data.as_slice()).unwrap()
-    }
-
-    /// The count's remaining accounts for the current roster, in order.
-    fn roster_pairs(&self) -> Vec<(Pubkey, Pubkey)> {
-        self.roster_state().entries.iter().map(|e| (e.coin_account, e.dividend_account)).collect()
-    }
-
-    fn count_ix_with(&self, config: Pubkey, pairs: &[(Pubkey, Pubkey)]) -> Instruction {
-        let mut metas = endowment::accounts::CountCommitment {
-            config,
-            roster: roster_pda(&config),
-            coin_mint: Env::config_at(&self.svm, &config).coin_mint,
+    /// Owners of every landlord of `config` that still exists, in registration order.
+    fn landlords_of(&self, config: &Pubkey) -> Vec<Pubkey> {
+        let mut owners: Vec<Pubkey> = vec![];
+        for (c, owner) in &self.known {
+            if c == config && !owners.contains(owner) && exists(&self.svm, &landlord_pda(config, owner)) {
+                owners.push(*owner);
+            }
         }
-        .to_account_metas(None);
-        for (coin, dividend) in pairs {
-            metas.push(AccountMeta::new_readonly(*coin, false));
-            metas.push(AccountMeta::new_readonly(*dividend, false));
+        owners
+    }
+
+    fn landlords(&self) -> Vec<Pubkey> {
+        self.landlords_of(&self.config())
+    }
+
+    fn landlord_at(svm: &LiteSVM, landlord: &Pubkey) -> Landlord {
+        let account = svm.get_account(landlord).unwrap();
+        Landlord::try_deserialize(&mut account.data.as_slice()).unwrap()
+    }
+
+    fn begin_ix(&self, config: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::BeginCount {}.data(),
+            endowment::accounts::BeginCount { config, coin_mint: Env::config_at(&self.svm, &config).coin_mint }
+                .to_account_metas(None),
+        )
+    }
+
+    /// Counts these landlords of `config`: each as its record, coin and dividend account.
+    fn count_landlords_ix(&self, config: Pubkey, owners: &[Pubkey]) -> Instruction {
+        let landlords: Vec<Pubkey> = owners.iter().map(|o| landlord_pda(&config, o)).collect();
+        self.count_records_ix(config, &landlords)
+    }
+
+    fn count_records_ix(&self, config: Pubkey, landlords: &[Pubkey]) -> Instruction {
+        let mut metas = endowment::accounts::CountLandlords { config }.to_account_metas(None);
+        for landlord in landlords {
+            let state = Env::landlord_at(&self.svm, landlord);
+            metas.push(AccountMeta::new(*landlord, false));
+            metas.push(AccountMeta::new_readonly(state.coin_account, false));
+            metas.push(AccountMeta::new_readonly(state.dividend_account, false));
         }
-        Instruction::new_with_bytes(endowment::id(), &endowment::instruction::CountCommitment {}.data(), metas)
+        Instruction::new_with_bytes(endowment::id(), &endowment::instruction::CountLandlords {}.data(), metas)
     }
 
-    fn count_ix(&self) -> Instruction {
-        self.count_ix_with(self.config(), &self.roster_pairs())
+    fn refresh_ix(&self, config: Pubkey, owners: &[Pubkey]) -> Instruction {
+        let mut metas = endowment::accounts::RefreshLandlords { config }.to_account_metas(None);
+        for owner in owners {
+            let landlord = landlord_pda(&config, owner);
+            let state = Env::landlord_at(&self.svm, &landlord);
+            metas.push(AccountMeta::new(landlord, false));
+            metas.push(AccountMeta::new_readonly(state.coin_account, false));
+        }
+        Instruction::new_with_bytes(endowment::id(), &endowment::instruction::RefreshLandlords {}.data(), metas)
     }
 
-    fn count_with(&mut self, config: Pubkey, pairs: &[(Pubkey, Pubkey)]) -> bool {
-        let ixs = [compute_limit_ix(1_400_000), self.count_ix_with(config, pairs)];
+    fn finish_ix(&self, config: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::FinishCount {}.data(),
+            endowment::accounts::FinishCount { config }.to_account_metas(None),
+        )
+    }
+
+    /// Sends from a fresh, funded wallet: the count's instructions are permissionless.
+    fn crank(&mut self, ixs: &[Instruction]) -> bool {
+        let mut all = vec![compute_limit_ix(1_400_000)];
+        all.extend_from_slice(ixs);
         let caller = self.funded();
-        send(&mut self.svm, &ixs, &caller, &[&caller])
+        send(&mut self.svm, &all, &caller, &[&caller])
     }
 
-    /// Anyone runs the daily count over the whole roster.
+    fn begin(&mut self) -> bool {
+        let ix = self.begin_ix(self.config());
+        self.crank(&[ix])
+    }
+
+    fn count_batch(&mut self, owners: &[Pubkey]) -> bool {
+        let ix = self.count_landlords_ix(self.config(), owners);
+        self.crank(&[ix])
+    }
+
+    fn finish(&mut self) -> bool {
+        let ix = self.finish_ix(self.config());
+        self.crank(&[ix])
+    }
+
+    fn refresh(&mut self, owners: &[Pubkey]) -> bool {
+        let ix = self.refresh_ix(self.config(), owners);
+        self.crank(&[ix])
+    }
+
+    /// Anyone runs a whole daily count of `config`: begin, every landlord in
+    /// batches of 8, finish.
+    fn count_for(&mut self, config: Pubkey) -> bool {
+        let begin = self.begin_ix(config);
+        if !self.crank(&[begin]) {
+            return false;
+        }
+        for batch in self.landlords_of(&config).chunks(8) {
+            let ix = self.count_landlords_ix(config, batch);
+            if !self.crank(&[ix]) {
+                return false;
+            }
+        }
+        let finish = self.finish_ix(config);
+        self.crank(&[finish])
+    }
+
     fn count(&mut self) -> bool {
-        let pairs = self.roster_pairs();
-        self.count_with(self.config(), &pairs)
+        self.count_for(self.config())
     }
 
     fn committed_bps(&self) -> u16 {
@@ -793,7 +860,6 @@ impl Env {
             config,
             authority: authority_pda(&config),
             landlord: landlord_pda(&config, owner),
-            roster: roster_pda(&config),
             dividend_mint: self.inst.dividend_mint,
             dividend_account: *account,
             coin_mint: self.inst.coin_mint,
@@ -801,8 +867,6 @@ impl Env {
             dividend_token_program: self.inst.dividend_program,
             coin_token_program: self.inst.coin_program,
             system_program: system_program::ID,
-            evict_landlord: None,
-            evict_owner: None,
         }
     }
 
@@ -822,7 +886,11 @@ impl Env {
     fn register(&mut self, owner: &Keypair) -> bool {
         let account = self.inst.dividend_account(&owner.pubkey());
         let ixs = [self.approve_ix(&owner.pubkey(), &account), self.register_ix(&owner.pubkey(), &account)];
-        send(&mut self.svm, &ixs, owner, &[owner])
+        let ok = send(&mut self.svm, &ixs, owner, &[owner]);
+        if ok {
+            self.known.push((self.config(), owner.pubkey()));
+        }
+        ok
     }
 
     /// A landlord holding `coin` of the coin that has delegated and registered.
@@ -859,7 +927,6 @@ impl Env {
             endowment::accounts::DeregisterLandlord {
                 owner: owner.pubkey(),
                 config,
-                roster: roster_pda(&config),
                 landlord,
             }
             .to_account_metas(None),
@@ -880,7 +947,6 @@ impl Env {
             endowment::accounts::PruneLandlord {
                 config,
                 authority: authority_pda(&config),
-                roster: roster_pda(&config),
                 landlord: landlord_pda(&config, owner),
                 owner: *owner,
                 coin_mint: self.inst.coin_mint,
@@ -1020,8 +1086,7 @@ fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
     assert_eq!((config.active, config.retired, config.milestone_reached), (false, false, false));
     assert_eq!((config.contribution_cap, config.donation_bps), (CONTRIBUTION_CAP, 0));
     assert_eq!(config.buy_allowance, MAX_BUY_PER_TX);
-    let roster = env.roster_state();
-    assert_eq!((roster.version, roster.config, roster.entries.len()), (1, env.config(), 0));
+    assert_eq!((config.landlord_count, config.count.round, config.count.open), (0, 0, false));
     assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
     assert_eq!(token_balance(&env.svm, &env.coin_vault()), 0);
 }
@@ -1150,10 +1215,9 @@ fn register_requires_a_full_delegation() {
     assert!(send(&mut env.svm, &[approve, register], &owner, &[&owner]));
     let landlord = env.landlord_state(&owner.pubkey());
     assert_eq!((landlord.version, landlord.baseline, landlord.config), (1, 100, env.config()));
-    let roster = env.roster_state();
-    assert_eq!(roster.entries.len(), 1);
-    assert_eq!(roster.entries[0].owner, owner.pubkey());
-    assert!(!roster.entries[0].snapshot_valid);
+    assert_eq!(env.config_state().landlord_count, 1);
+    assert!(!landlord.snapshot_valid);
+    assert_eq!(landlord.joined_round, 0);
 }
 
 #[test]
@@ -1245,7 +1309,7 @@ fn revoking_delegation_stops_sweeps() {
 }
 
 #[test]
-fn deregistering_leaves_the_roster_and_a_landlord_can_register_again_cleanly() {
+fn deregistering_closes_the_record_and_a_landlord_can_register_again_cleanly() {
     let mut env = Env::new();
     env.create_active();
     let (owner, account) = env.registered_landlord(100);
@@ -1255,7 +1319,7 @@ fn deregistering_leaves_the_roster_and_a_landlord_can_register_again_cleanly() {
     let lamports_before = env.svm.get_balance(&owner.pubkey()).unwrap();
     assert!(env.deregister(&owner));
     assert!(!exists(&env.svm, &landlord_pda(&env.config(), &owner.pubkey())));
-    assert!(env.roster_state().entries.is_empty());
+    assert_eq!(env.config_state().landlord_count, 0);
     assert!(env.svm.get_balance(&owner.pubkey()).unwrap() > lamports_before);
 
     // Coming back starts fresh: the new baseline is whatever the landlord holds now.
@@ -1263,7 +1327,7 @@ fn deregistering_leaves_the_roster_and_a_landlord_can_register_again_cleanly() {
     assert!(env.register(&owner));
     let landlord = env.landlord_state(&owner.pubkey());
     assert_eq!((landlord.baseline, landlord.total_contributed), (500, 0));
-    assert_eq!(env.roster_state().entries.len(), 1);
+    assert_eq!(env.config_state().landlord_count, 1);
 }
 
 #[test]
@@ -1936,18 +2000,22 @@ fn landlords_of_one_endowment_cant_be_registered_swept_counted_or_removed_throug
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &a.dividend_vault()), 100);
 
-    // B's count can't read A's landlord in place of its own.
-    let a_pair = (a.coin_account(&owner.pubkey()), a.dividend_account(&owner.pubkey()));
-    assert_err!(env.count_with(b.config(), &[a_pair]), InvalidCountAccount);
+    // B's count (or refresh) can't read or write A's landlord in place of its own.
+    let landlord_a = landlord_pda(&a.config(), &owner.pubkey());
+    let begin_b = env.begin_ix(b.config());
+    assert!(env.crank(&[begin_b]));
+    let foreign = env.count_records_ix(b.config(), &[landlord_a]);
+    assert_err!(env.crank(&[foreign]), InvalidCountAccount);
+    let mut foreign_refresh = env.refresh_ix(a.config(), &[owner.pubkey()]);
+    foreign_refresh.accounts[0] = AccountMeta::new_readonly(b.config(), false);
+    assert_err!(env.crank(&[foreign_refresh]), InvalidCountAccount);
 
     // A's landlord can't be deregistered through B.
-    let landlord_a = landlord_pda(&a.config(), &owner.pubkey());
     assert!(!env.deregister_with(&owner, b.config(), landlord_a));
-    assert_eq!(env.roster_state().entries.len(), 1);
+    assert_eq!(Env::config_at(&env.svm, &a.config()).landlord_count, 1);
     assert!(env.deregister(&owner));
-    assert!(env.roster_state().entries.is_empty());
-    env.inst = b.clone();
-    assert_eq!(env.roster_state().entries.len(), 1);
+    assert_eq!(Env::config_at(&env.svm, &a.config()).landlord_count, 0);
+    assert_eq!(Env::config_at(&env.svm, &b.config()).landlord_count, 1);
 }
 
 #[test]
@@ -2061,7 +2129,9 @@ fn count_switches_sweeps_on_at_30_percent_with_hysteresis() {
     assert!(env.count());
     let config = env.config_state();
     assert_eq!((config.last_count_bps, config.active, config.last_count_at), (0, false, env.now()));
-    assert!(env.roster_state().entries.iter().all(|e| e.snapshot_valid));
+    for owner in &owners {
+        assert!(env.landlord_state(&owner.pubkey()).snapshot_valid);
+    }
 
     // Held across a full day: 30% committed, on.
     env.warp(COUNT_INTERVAL_SECS);
@@ -2105,26 +2175,98 @@ fn count_runs_at_most_once_a_day_and_not_while_paused() {
 }
 
 #[test]
-fn count_must_list_every_landlord_once_in_roster_order() {
+fn count_batches_take_each_landlord_once_with_its_own_accounts() {
     let (mut env, owners) = counted_env();
     let config = env.config();
-    let pairs = env.roster_pairs();
+    let o: Vec<Pubkey> = owners.iter().map(|k| k.pubkey()).collect();
 
-    // Missing one.
-    assert_err!(env.count_with(config, &pairs[..2]), InvalidCountAccount);
-    // One twice in place of another.
-    assert_err!(env.count_with(config, &[pairs[0], pairs[0], pairs[2]]), InvalidCountAccount);
-    // Out of order.
-    assert_err!(env.count_with(config, &[pairs[1], pairs[0], pairs[2]]), InvalidCountAccount);
-    // Someone else's coin account in a landlord's place.
+    // Nothing to count before a round begins.
+    let early = env.count_landlords_ix(config, &o[..1]);
+    assert_err!(env.crank(&[early]), NoOpenCount);
+    assert_err!(env.finish(), NoOpenCount);
+    assert!(env.begin());
+    assert_err!(env.begin(), CountOpen);
+
+    // A forged coin account in a landlord's place.
     let stranger = env.new_landlord(0).0;
-    let forged = (env.inst.coin_account(&stranger.pubkey()), pairs[0].1);
-    assert_err!(env.count_with(config, &[forged, pairs[1], pairs[2]]), InvalidCountAccount);
-    // A coin account posing as a dividend account (or vice versa).
-    let swapped = (pairs[0].1, pairs[0].0);
-    assert_err!(env.count_with(config, &[swapped, pairs[1], pairs[2]]), InvalidCountAccount);
-    let _ = owners;
-    assert!(env.count_with(config, &pairs));
+    let mut forged = env.count_landlords_ix(config, &o[..1]);
+    forged.accounts[2] = AccountMeta::new_readonly(env.inst.coin_account(&stranger.pubkey()), false);
+    assert_err!(env.crank(&[forged]), InvalidCountAccount);
+    // Coin and dividend accounts swapped.
+    let mut swapped = env.count_landlords_ix(config, &o[..1]);
+    let (coin, dividend) = (swapped.accounts[2].pubkey, swapped.accounts[3].pubkey);
+    swapped.accounts[2] = AccountMeta::new_readonly(dividend, false);
+    swapped.accounts[3] = AccountMeta::new_readonly(coin, false);
+    assert_err!(env.crank(&[swapped]), InvalidCountAccount);
+    // A landlord record passed read-only.
+    let mut readonly = env.count_landlords_ix(config, &o[..1]);
+    readonly.accounts[1] = AccountMeta::new_readonly(readonly.accounts[1].pubkey, false);
+    assert_err!(env.crank(&[readonly]), InvalidCountAccount);
+    // The same landlord twice in one batch.
+    let twice = env.count_landlords_ix(config, &[o[0], o[0]]);
+    assert_err!(env.crank(&[twice]), NotInCount);
+
+    // Batches of any size and order; a landlord can't be counted again this round.
+    assert!(env.count_batch(&[o[2], o[0]]));
+    assert_err!(env.count_batch(&o[..1]), NotInCount);
+    // Not every landlord counted yet, and not timed out.
+    assert_err!(env.finish(), CountIncomplete);
+    assert!(env.count_batch(&o[1..2]));
+    assert!(env.finish());
+    let config_state = env.config_state();
+    assert_eq!((config_state.count.round, config_state.count.open), (1, false));
+    assert_eq!((config_state.count.expected, config_state.count.counted), (3, 3));
+}
+
+#[test]
+fn a_count_left_open_can_be_finished_by_anyone_after_its_timeout() {
+    let (mut env, owners) = counted_env();
+    // Round 1 records balances; round 2 is started and only partly counted.
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.begin());
+    assert!(env.count_batch(&[owners[1].pubkey()]));
+    assert_err!(env.finish(), CountIncomplete);
+    env.warp(COUNT_TIMEOUT_SECS - 1);
+    assert_err!(env.finish(), CountIncomplete);
+    env.warp(1);
+    assert!(env.finish());
+    // Only the counted landlord (15%) counts; the others count zero this round.
+    let config = env.config_state();
+    assert_eq!((config.last_count_bps, config.count.counted, config.count.expected), (1_500, 1, 3));
+    // The next day's count starts normally and reads everyone.
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    assert_eq!(env.committed_bps(), 3_000);
+}
+
+#[test]
+fn landlords_joining_or_leaving_mid_count_dont_break_it() {
+    let (mut env, owners) = counted_env();
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.begin());
+    assert!(env.count_batch(&[owners[0].pubkey()]));
+
+    // A newcomer joins mid-round: not part of this round.
+    let (late, _) = env.registered_holder(0, 50_000 * UNIT);
+    assert_err!(env.count_batch(&[late.pubkey()]), NotInCount);
+    // A counted landlord leaves: its 10% comes back out of the tally.
+    assert!(env.deregister(&owners[0]));
+    // An uncounted landlord leaves: the round no longer waits for it.
+    assert!(env.deregister(&owners[2]));
+    let count = env.config_state().count;
+    assert_eq!((count.expected, count.counted, count.committed), (1, 0, 0));
+    assert!(env.count_batch(&[owners[1].pubkey()]));
+    assert!(env.finish());
+    // Only owners[1]: 150,000 of 1,050,000.
+    assert_eq!(env.config_state().last_committed, 150_000 * UNIT);
+    // The newcomer is counted from the next round on (zero at its first read).
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    assert_eq!(env.config_state().last_committed, 200_000 * UNIT);
 }
 
 #[test]
@@ -2205,67 +2347,8 @@ fn landlords_below_the_minimum_stake_dont_count() {
 }
 
 // ---------------------------------------------------------------------------
-// The roster: at most MAX_LANDLORDS, the smallest replaceable by a larger one,
-// and landlords that no longer qualify prunable by anyone.
+// Landlords: unlimited, and prunable by anyone once they no longer qualify.
 // ---------------------------------------------------------------------------
-
-/// A full roster; landlord i holds (i + 10) × 1,000 of the coin.
-fn full_roster_env() -> (Env, Vec<Keypair>) {
-    let mut env = Env::new();
-    env.create();
-    let mut landlords = vec![];
-    for i in 0..MAX_LANDLORDS as u64 {
-        let (owner, _) = env.new_landlord(0);
-        env.mint_coin(&owner.pubkey(), (i + 10) * 1_000 * UNIT);
-        landlords.push(owner);
-    }
-    for owner in &landlords {
-        assert!(env.register(owner));
-    }
-    assert_eq!(env.roster_state().entries.len(), MAX_LANDLORDS);
-    (env, landlords)
-}
-
-#[test]
-fn a_full_roster_admits_a_newcomer_only_in_place_of_a_smaller_landlord() {
-    let (mut env, landlords) = full_roster_env();
-    let config = env.config();
-
-    let (newcomer, account) = env.new_landlord(0);
-    env.mint_coin(&newcomer.pubkey(), 50_000 * UNIT);
-    // Full, and no one named to replace.
-    assert_err!(env.register(&newcomer), RosterFull);
-
-    let register_evicting = |env: &Env, victim: &Pubkey, owner: &Keypair| {
-        let mut accounts = env.register_accounts(&owner.pubkey(), &env.inst.dividend_account(&owner.pubkey()));
-        accounts.evict_landlord = Some(landlord_pda(&config, victim));
-        accounts.evict_owner = Some(*victim);
-        [env.approve_ix(&owner.pubkey(), &env.inst.dividend_account(&owner.pubkey())), env.register_ix_with(accounts)]
-    };
-
-    // Not the smallest.
-    let ixs = register_evicting(&env, &landlords[1].pubkey(), &newcomer);
-    assert_err!(send(&mut env.svm, &ixs, &newcomer, &[&newcomer]), InvalidEviction);
-
-    // The smallest, but the newcomer isn't larger.
-    let (minnow, _) = env.new_landlord(0);
-    env.mint_coin(&minnow.pubkey(), 9_000 * UNIT);
-    let ixs = register_evicting(&env, &landlords[0].pubkey(), &minnow);
-    assert_err!(send(&mut env.svm, &ixs, &minnow, &[&minnow]), InvalidEviction);
-
-    // The smallest, replaced by someone larger; its rent goes back to its owner.
-    let victim = landlords[0].pubkey();
-    let victim_lamports = env.svm.get_balance(&victim).unwrap();
-    let ixs = register_evicting(&env, &victim, &newcomer);
-    assert!(send(&mut env.svm, &ixs, &newcomer, &[&newcomer]));
-    assert!(!exists(&env.svm, &landlord_pda(&config, &victim)));
-    assert!(env.svm.get_balance(&victim).unwrap() > victim_lamports);
-    let roster = env.roster_state();
-    assert_eq!(roster.entries.len(), MAX_LANDLORDS);
-    assert!(roster.position(&victim).is_none());
-    assert!(roster.position(&newcomer.pubkey()).is_some());
-    assert_eq!(env.landlord_state(&newcomer.pubkey()).dividend_account, account);
-}
 
 #[test]
 fn landlords_that_no_longer_qualify_can_be_pruned_by_anyone() {
@@ -2279,32 +2362,43 @@ fn landlords_that_no_longer_qualify_can_be_pruned_by_anyone() {
     assert!(env.prune(&owners[0].pubkey()));
     assert!(!exists(&env.svm, &landlord_pda(&env.config(), &owners[0].pubkey())));
     assert!(env.svm.get_balance(&owners[0].pubkey()).unwrap() > lamports);
-    assert_eq!(env.roster_state().entries.len(), 2);
+    assert_eq!(env.config_state().landlord_count, 2);
 
     // Below the minimum stake: pruned.
     env.burn_coin(&owners[2], 49_500 * UNIT);
     assert!(env.prune(&owners[2].pubkey()));
-    assert_eq!(env.roster_state().entries.len(), 1);
+    assert_eq!(env.config_state().landlord_count, 1);
     assert!(env.count());
 }
 
 #[test]
-fn the_count_of_a_full_roster_fits_one_transaction() {
-    let (mut env, _) = full_roster_env();
-    let ix = env.count_ix();
-    // 2 accounts per landlord + config, roster and coin mint.
-    assert_eq!(ix.accounts.len(), 2 * MAX_LANDLORDS + 3);
-    // With the payer, the endowment program and the compute budget program: within 64 locks.
-    assert!(ix.accounts.len() + 3 <= 64);
+fn there_is_no_limit_on_landlords() {
+    let mut env = Env::new();
+    env.create();
+    const LANDLORDS: u64 = 64;
+    let outsider = env.new_landlord(0).0;
+    env.mint_coin(&outsider.pubkey(), 1_000_000 * UNIT - LANDLORDS * 5_000 * UNIT);
+    for _ in 0..LANDLORDS {
+        env.registered_holder(0, 5_000 * UNIT);
+    }
+    assert_eq!(env.config_state().landlord_count, LANDLORDS as u32);
 
     assert!(env.count());
-    let first = last_cu();
     env.warp(COUNT_INTERVAL_SECS);
-    assert!(env.count());
-    let steady = last_cu();
-    println!("count_commitment with {MAX_LANDLORDS} landlords: {first} CU (first count), {steady} CU (steady state)");
-    assert!(env.config_state().active);
-    assert!(first < 1_400_000 && steady < 1_400_000);
+    // Count the second round by hand to measure a full batch of 8.
+    assert!(env.begin());
+    let owners = env.landlords();
+    let mut max_cu = 0;
+    for batch in owners.chunks(8) {
+        assert!(env.count_batch(batch));
+        max_cu = max_cu.max(last_cu());
+    }
+    assert!(env.finish());
+    // 64 × 5,000 = 320,000 of 1,000,000: 32%, on.
+    let config = env.config_state();
+    assert_eq!((config.last_count_bps, config.active, config.count.counted), (3_200, true, 64));
+    println!("count_landlords, batch of 8: {max_cu} CU");
+    assert!(max_cu < 400_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -2343,21 +2437,105 @@ fn regression_h01_moving_coin_between_landlords_across_counts_counts_nothing() {
 }
 
 #[test]
-fn regression_h01_the_same_coin_cant_be_counted_twice_in_one_transaction() {
+fn regression_h01_moving_coin_to_another_landlord_mid_count_doesnt_count_it_twice() {
     let (mut env, s) = sybil_env();
+    let (a, b) = (s[0].pubkey(), s[1].pubkey());
     assert!(env.count());
     env.warp(COUNT_INTERVAL_SECS);
-    // count, move a → b, count again: the second count is refused.
+
+    // Count a (it held 10% since the last count), move the 10% to b, count b.
+    assert!(env.begin());
+    assert!(env.count_batch(&[a]));
+    let ix = env.coin_transfer_ix(&a, &b, 100_000 * UNIT);
+    assert!(send(&mut env.svm, &[ix], &s[0], &[&s[0]]));
+    assert!(env.count_batch(&[b, s[2].pubkey()]));
+    assert!(env.finish());
+    // b is credited only what it held at its previous count (its 2,000).
+    // 100,000 + 2,000 + 2,000 of 1,000,000.
+    assert_eq!(env.committed_bps(), 1_040);
+}
+
+#[test]
+fn regression_h01_moving_coin_inside_one_transaction_mid_count_doesnt_count_it_twice() {
+    let (mut env, s) = sybil_env();
+    let (a, b) = (s[0].pubkey(), s[1].pubkey());
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.begin());
+    // count a, move the 10% to b, count b, all in one transaction.
     let ixs = [
         compute_limit_ix(1_400_000),
-        env.count_ix(),
-        env.coin_transfer_ix(&s[0].pubkey(), &s[1].pubkey(), 100_000 * UNIT),
-        env.count_ix(),
+        env.count_landlords_ix(env.config(), &[a]),
+        env.coin_transfer_ix(&a, &b, 100_000 * UNIT),
+        env.count_landlords_ix(env.config(), &[b, s[2].pubkey()]),
     ];
-    assert_err!(send(&mut env.svm, &ixs, &s[0], &[&s[0]]), CountTooSoon);
-    // One honest count: 104,000 of 1,000,000.
-    assert!(env.count());
+    assert!(send(&mut env.svm, &ixs, &s[0], &[&s[0]]));
+    assert!(env.finish());
     assert_eq!(env.committed_bps(), 1_040);
+}
+
+/// The residual the refresh closes: coin cycled between two landlord wallets so
+/// each holds it whenever it is counted.
+fn cycle_one_round(env: &mut Env, s: &[Keypair]) {
+    let (a, b) = (s[0].pubkey(), s[1].pubkey());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.begin());
+    assert!(env.count_batch(&[a, s[2].pubkey()]));
+    let to_b = env.coin_transfer_ix(&a, &b, 100_000 * UNIT);
+    assert!(send(&mut env.svm, &[to_b], &s[0], &[&s[0]]));
+    assert!(env.count_batch(&[b]));
+    assert!(env.finish());
+    let back = env.coin_transfer_ix(&b, &a, 100_000 * UNIT);
+    assert!(send(&mut env.svm, &[back], &s[1], &[&s[1]]));
+}
+
+#[test]
+fn residual_coin_cycled_around_every_count_counts_twice_without_a_refresh() {
+    let (mut env, s) = sybil_env();
+    assert!(env.count());
+    cycle_one_round(&mut env, &s); // warm-up: b records 102,000
+    cycle_one_round(&mut env, &s);
+    // 10% counted in both a and b: 100,000 + 102,000 + 2,000.
+    assert_eq!(env.committed_bps(), 2_040);
+    // It is on the public record: every read's raw balance is published and
+    // each round needs two transfers between registered landlord wallets.
+    assert_eq!(env.landlord_state(&s[1].pubkey()).snapshot, 102_000 * UNIT);
+}
+
+#[test]
+fn regression_h01_a_refresh_between_counts_stops_coin_cycled_between_landlords() {
+    let (mut env, s) = sybil_env();
+    let (a, b) = (s[0].pubkey(), s[1].pubkey());
+    assert!(env.count());
+    cycle_one_round(&mut env, &s);
+    // Between counts, anyone refreshes every landlord in one transaction: the
+    // coin can only be in one of the two wallets at that moment.
+    let everyone = env.landlords();
+    assert!(env.refresh(&everyone));
+    assert_eq!(env.landlord_state(&b).snapshot, 2_000 * UNIT);
+    assert_eq!(env.landlord_state(&a).snapshot, 100_000 * UNIT);
+    cycle_one_round(&mut env, &s);
+    // Only real holdings count: 100,000 + 2,000 + 2,000.
+    assert_eq!(env.committed_bps(), 1_040);
+}
+
+#[test]
+fn a_refresh_only_ever_lowers_and_is_open_to_anyone() {
+    let (mut env, owners) = counted_env();
+    assert!(env.count());
+    let o = owners[0].pubkey();
+    // Coin added after a count isn't credited early by a refresh.
+    env.mint_coin(&o, 50_000 * UNIT);
+    assert!(env.refresh(&[o]));
+    assert_eq!(env.landlord_state(&o).snapshot, 100_000 * UNIT);
+    // A drop is recorded at once.
+    env.burn_coin(&owners[0], 120_000 * UNIT);
+    assert!(env.refresh(&[o]));
+    assert_eq!(env.landlord_state(&o).snapshot, 30_000 * UNIT);
+    // A refresh with a foreign coin account is refused.
+    let mut forged = env.refresh_ix(env.config(), &[o]);
+    forged.accounts[2] = AccountMeta::new_readonly(env.inst.coin_account(&owners[1].pubkey()), false);
+    assert_err!(env.crank(&[forged]), InvalidCountAccount);
 }
 
 #[test]

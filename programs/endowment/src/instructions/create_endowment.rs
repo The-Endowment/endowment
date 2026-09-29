@@ -9,7 +9,7 @@ use crate::{
     error::EndowmentError,
     events::EndowmentCreated,
     raydium::{PoolView, CPMM_PROGRAM_ID},
-    state::{validate_donation, Config, CreateParams, PendingParams, Roster},
+    state::{validate_donation, Config, CountRound, CreateParams, PendingParams},
 };
 
 /// Permissionless: anyone can create an endowment for any coin that trades
@@ -35,15 +35,6 @@ pub struct CreateEndowment<'info> {
     /// CHECK: PDA that owns the instance's vaults and receives landlord delegations. Holds no data.
     #[account(seeds = [AUTHORITY_SEED, config.key().as_ref()], bump)]
     pub authority: UncheckedAccount<'info>,
-    #[account(
-        init,
-        payer = creator,
-        space = 8 + Roster::INIT_SPACE,
-        seeds = [ROSTER_SEED, config.key().as_ref()],
-        bump
-    )]
-    pub roster: Box<Account<'info, Roster>>,
-
     #[account(mint::token_program = coin_token_program)]
     pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mint::token_program = dividend_token_program)]
@@ -99,8 +90,6 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     let or_creator = |key: Pubkey| if key == Pubkey::default() { creator } else { key };
     let config_key = ctx.accounts.config.key();
 
-    ctx.accounts.roster.set_inner(Roster { version: ROSTER_VERSION, config: config_key, entries: Vec::new() });
-
     ctx.accounts.config.set_inner(Config {
         version: CONFIG_VERSION,
         creator,
@@ -112,7 +101,6 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         pool: ctx.accounts.pool_state.key(),
         bump: ctx.bumps.config,
         authority_bump: ctx.bumps.authority,
-        roster_bump: ctx.bumps.roster,
         params: create.params,
         pending: PendingParams::default(),
         donation_bps: create.donation_bps,
@@ -124,6 +112,8 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         last_count_at: 0,
         last_count_bps: 0,
         last_committed: 0,
+        landlord_count: 0,
+        count: CountRound::default(),
         buy_allowance: create.params.max_buy_per_tx,
         allowance_updated_at: now,
         last_buy_at: 0,

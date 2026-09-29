@@ -38,9 +38,9 @@ pub enum EndowmentError {
     NotActive,
     #[msg("The endowment is retired: no more sweeps or registrations")]
     Retired,
-    #[msg("A commitment count already ran in the last 24 hours")]
+    #[msg("A commitment count already started in the last 24 hours")]
     CountTooSoon,
-    #[msg("The count must list every landlord's coin and dividend account, in roster order")]
+    #[msg("Each landlord must be passed as its record, registered coin account and registered dividend account")]
     InvalidCountAccount,
     #[msg("The coin vault would shrink")]
     VaultWouldShrink,
@@ -72,10 +72,14 @@ pub enum EndowmentError {
     CpiInvariant,
     #[msg("Landlords must hold at least the minimum stake")]
     StakeTooSmall,
-    #[msg("The roster is full and no smaller landlord was given to replace")]
-    RosterFull,
-    #[msg("Not the landlord with the smallest recorded stake, or not smaller than yours")]
-    InvalidEviction,
+    #[msg("A commitment count is already open")]
+    CountOpen,
+    #[msg("No commitment count is open")]
+    NoOpenCount,
+    #[msg("This landlord isn't part of the open count, or was already counted in it")]
+    NotInCount,
+    #[msg("Not every landlord has been counted and the count hasn't timed out")]
+    CountIncomplete,
     #[msg("This landlord is still delegated and holds the minimum stake")]
     NotPrunable,
     #[msg("Parameters are outside the hard-coded bounds")]
