@@ -19,9 +19,17 @@
 //! (frozen vaults stop sweeps and buybacks, see `health`), as is a transfer fee
 //! within the cap.
 //!
-//! Both of the flagship's mints pass: $PENIS has no authorities and a 3%
-//! transfer fee; PUMP has no authorities and a transfer-hook authority with no
-//! program set.
+//! A fee is also checked against the cap at creation, so an instance can't be
+//! created already unable to trade.
+//!
+//! Both of the flagship's mints pass, and each keeps one live third-party
+//! authority that can stop buybacks (not move funds): $PENIS has no mint or
+//! freeze authority but a 3% transfer fee whose config authority can raise it
+//! (above the cap, trading halts); PUMP has no mint or freeze authority but a
+//! transfer-hook authority that can set a hook program (while one is set,
+//! trading halts). Sweeps halt with them, and a sweep never fills the vault
+//! beyond `MAX_VAULT_DAYS_OF_BUYS` days of buys, which bounds what such a halt
+//! could strand.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_2022::spl_token_2022::{

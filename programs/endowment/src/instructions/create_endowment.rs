@@ -11,6 +11,7 @@ use crate::{
     mint_policy::{check_coin_mint, check_dividend_mint},
     raydium::{PoolView, CPMM_PROGRAM_ID},
     state::{validate_donation, Config, CountRound, CreateParams, PendingParams},
+    transfer::capped_transfer_fee_bps,
 };
 
 /// Permissionless: anyone can create an endowment for any coin that trades
@@ -73,12 +74,16 @@ pub struct CreateEndowment<'info> {
 }
 
 pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreateParams) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
     let coin_mint = ctx.accounts.coin_mint.key();
     let dividend_mint = ctx.accounts.dividend_mint.key();
     require_keys_neq!(coin_mint, dividend_mint, EndowmentError::SameMint);
     check_coin_mint(&ctx.accounts.coin_mint.to_account_info())?;
     check_dividend_mint(&ctx.accounts.dividend_mint.to_account_info())?;
+    // A fee already above the cap would give an instance that can never trade.
+    capped_transfer_fee_bps(&ctx.accounts.coin_mint.to_account_info(), clock.epoch)?;
+    capped_transfer_fee_bps(&ctx.accounts.dividend_mint.to_account_info(), clock.epoch)?;
 
     // The pool must trade exactly this coin against exactly this dividend asset,
     // in either order.

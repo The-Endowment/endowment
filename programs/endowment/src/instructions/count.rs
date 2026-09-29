@@ -19,23 +19,35 @@
 //! move it back before A's next read, so each wallet shows it at each of its own
 //! reads. Each endowment therefore names a `refresher` (a timelocked parameter).
 //! Between counts the refresher re-reads every landlord (`refresh_landlords`),
-//! at times the landlords don't choose, and a landlord only counts if it was so
-//! re-read since its last count read:
-//! - the refresh is decrease-only: each landlord's recorded balance drops to
-//!   what it holds at that moment, and a landlord found not delegated loses its
-//!   record (so approving just for the count, then revoking, counts nothing);
-//! - coin can be in only one wallet at the moment a refresh transaction reads
-//!   them, so a holding X counts at most once per refresh transaction the
-//!   attacker can react between: at most X times the number of refresh
-//!   transactions in a pass (one, for a pass of up to 20 landlords, or sent as a
-//!   single bundle) and, since every hop pays the coin's transfer fee and shows
-//!   on-chain, only as far as the attacker can predict the refresher's timing;
+//! at times the landlords don't choose, and a landlord only counts once it has
+//! been so read `REQUIRED_ATTESTATIONS` times since its last count read, each
+//! read at least `MIN_ATTEST_SPACING_SECS` after the one before:
+//! - every read is decrease-only: the landlord's recorded balance drops to what
+//!   it holds at that moment, and a landlord found not delegated loses its
+//!   record and its reads (so approving just for the count, then revoking,
+//!   counts nothing);
+//! - coin can be in only one wallet at the moment a read lands, so to count a
+//!   holding in two wallets it must be moved into each wallet ahead of each of
+//!   that wallet's reads, several reads in a row, each at a time the attacker
+//!   doesn't choose. The keeper sends every transaction of a pass at once and
+//!   runs several independently shuffled passes a day, so there is little
+//!   between one read and the next to react to; every hop pays the coin's
+//!   transfer fee (if any) and shows on-chain;
+//! - a landlord still short of its reads when it would be counted is left
+//!   pending, not counted as zero: the refresher can read it and it can be
+//!   counted later in the same round (until the round times out), so starting
+//!   a count early can't zero anyone. A count can only start once the refresher
+//!   has read someone since the last one began;
 //! - with no refresher set (or one that never runs) nobody counts, so the
 //!   endowment can't switch on: the defence fails safe.
-//! The refresher can't raise anyone's count or move anything; it can only
-//! withhold attestation, which is no worse than not running the count. A creator
-//! who is its own refresher can of course attest a shuffle it runs itself:
-//! the guarantee is as good as the refresher, which is public on-chain.
+//!
+//! The refresher is trusted. It can't move anything, but it chooses when it
+//! reads: one that colludes with a landlord can time its reads to whenever the
+//! landlord's coin sits in each of its wallets and so have it counted several
+//! times, and it can leave landlords out by not reading them. Every read is
+//! public (`LandlordsAttested` lists the landlords read), the refresher is shown
+//! on each endowment's page, and it can resign (`resign_refresher`) at any time,
+//! which leaves nobody counting.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::Mint;
@@ -70,6 +82,12 @@ pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
     require!(
         config.count.round == 0 || now.saturating_sub(config.count.started_at) >= COUNT_INTERVAL_SECS,
         EndowmentError::CountTooSoon
+    );
+    // Only once the refresher has read someone since the last count began, so
+    // nobody can open (and time out) rounds the refresher hasn't reached.
+    require!(
+        config.count.round == 0 || config.landlord_count == 0 || config.last_attested_at > config.count.started_at,
+        EndowmentError::NotAttested
     );
 
     let round = config.count.round.checked_add(1).ok_or(EndowmentError::Overflow)?;
@@ -183,12 +201,19 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
 
         let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
         let held = landlord.held(balance);
-        let counted = if landlord.attested && delegated && held >= min_stake { held } else { 0 };
+        let eligible = delegated && held > 0 && held >= min_stake;
+        if eligible && landlord.attestations < REQUIRED_ATTESTATIONS {
+            // Would count but hasn't had all its reads: pending, not zero. The
+            // refresher can still read it, and it can be counted later in the
+            // round (or counts zero if the round times out first).
+            continue;
+        }
+        let counted = if eligible { held } else { 0 };
 
-        // The next count credits at most this, and only after a fresh attestation.
+        // The next count credits at most this, and only after fresh reads.
         landlord.snapshot = if delegated { balance } else { 0 };
         landlord.snapshot_valid = delegated;
-        landlord.attested = false;
+        landlord.attestations = 0;
         landlord.counted_round = round;
         landlord.counted_amount = counted;
         landlord.exit(program_id)?;
@@ -228,7 +253,9 @@ pub struct RefreshLandlords<'info> {
 /// Decrease-only: lowers each landlord's recorded balance to what it holds now,
 /// and drops the record of any landlord no longer delegated, so the next count
 /// credits no more than that. Anyone may call it, as often as they like: it can
-/// never raise anything. Only the refresher's calls also attest.
+/// never raise anything. Only the refresher's calls also attest (a read at
+/// least MIN_ATTEST_SPACING_SECS after that landlord's previous one adds one to
+/// its reads), and those are listed in `LandlordsAttested`.
 pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'info>>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
@@ -246,7 +273,7 @@ pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'inf
     )
     .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
 
-    let mut attested: u32 = 0;
+    let mut attested: Vec<Pubkey> = Vec::new();
     for triple in accounts.chunks(3) {
         let (landlord_info, coin_info, dividend_info) = (&triple[0], &triple[1], &triple[2]);
         let Some(mut landlord) = load_landlord(landlord_info, coin_info, dividend_info, &config_key, program_id)?
@@ -256,15 +283,17 @@ pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'inf
         let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
         if delegated {
             landlord.snapshot = landlord.snapshot.min(balance);
+            let spaced = landlord.attestations == 0
+                || now.saturating_sub(landlord.last_attested_at) >= MIN_ATTEST_SPACING_SECS;
+            if attest && spaced {
+                landlord.attestations = landlord.attestations.saturating_add(1);
+                landlord.last_attested_at = now;
+                attested.push(landlord_info.key());
+            }
         } else {
             landlord.snapshot = 0;
             landlord.snapshot_valid = false;
-        }
-        if attest {
-            landlord.attested = delegated;
-            attested += u32::from(delegated);
-        } else if !delegated {
-            landlord.attested = false;
+            landlord.attestations = 0;
         }
         landlord.exit(program_id)?;
     }

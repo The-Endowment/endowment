@@ -4,19 +4,28 @@
 //! not its spot price, so trades earlier in the same transaction or second
 //! can't move it (see `raydium::twap_price_x32`). A buyback accepts no fill worse than
 //!
-//!   floor = amount_in × (1 − dividend_fee) × twap × (1 − coin_fee) × (1 − pool_fee − max_price_impact)
+//!   floor = amount_in × (1 − dividend_fee) × twap × (1 − coin_fee) × (1 − pool_fee − slippage)
+//!   slippage = max_price_impact / 2 + max_twap_deviation + reader_error
 //!
 //! where `twap` is the coin received per dividend, fees are the two mints'
 //! Token-2022 transfer fees and Raydium's fee on input (all capped, see
-//! `constants.rs`), and `max_price_impact` bounds how far this trade, plus any
-//! drift of the spot price from the TWAP, may move the result.
-//!
-//! Each buy is sized to use at most half of the impact budget on its own price
-//! impact (`amount_in ≤ reserve_in × max_price_impact / 2`), leaving the other
-//! half for the spot price drifting from the TWAP.
+//! `constants.rs`). Each buy is sized so its own price impact is at most half
+//! of `max_price_impact` (`amount_in ≤ reserve_in × max_price_impact / 2`);
+//! `max_twap_deviation` is how far the spot price may have drifted from the
+//! TWAP (the band in `buyback` enforces the same line), and `reader_error` is
+//! the TWAP reader's own uncertainty (`TWAP_READER_ERROR_BPS`). So a buy at a
+//! flat price is never refused by the floor (R3-TW-03), and no buy can fill
+//! worse than the TWAP by more than those three together.
+
+use crate::constants::TWAP_READER_ERROR_BPS;
 
 const BPS: u128 = 10_000;
 const Q32: u32 = 32;
+
+/// The floor's allowance beyond fees: see the module docs.
+pub fn floor_slippage_bps(max_price_impact_bps: u16, max_twap_deviation_bps: u16) -> u64 {
+    (max_price_impact_bps as u64).div_ceil(2) + max_twap_deviation_bps as u64 + TWAP_READER_ERROR_BPS
+}
 
 /// Minimum acceptable coin received for `amount_in` dividend, against the TWAP.
 pub fn min_acceptable_out(
@@ -25,13 +34,30 @@ pub fn min_acceptable_out(
     pool_fee_bps: u64,
     dividend_fee_bps: u64,
     coin_fee_bps: u64,
-    max_price_impact_bps: u64,
+    slippage_bps: u64,
 ) -> Option<u64> {
     let net_in = amount_in as u128 * BPS.checked_sub(dividend_fee_bps as u128)? / BPS;
     let at_twap = net_in.checked_mul(twap_price_x32)? >> Q32;
     let after_coin_fee = at_twap * BPS.checked_sub(coin_fee_bps as u128)? / BPS;
-    let allowance = BPS.checked_sub(pool_fee_bps as u128 + max_price_impact_bps as u128)?;
+    let allowance = BPS.checked_sub(pool_fee_bps as u128 + slippage_bps as u128)?;
     u64::try_from(after_coin_fee * allowance / BPS).ok()
+}
+
+/// What the pool pays now for `amount_in` dividend, net of every fee, rounded
+/// down: the constant-product quote on the input left after the dividend's
+/// transfer fee and the pool's fee, less the coin's transfer fee.
+pub fn quote_out(
+    amount_in: u64,
+    reserve_in: u64,
+    reserve_out: u64,
+    pool_fee_bps: u64,
+    dividend_fee_bps: u64,
+    coin_fee_bps: u64,
+) -> u64 {
+    let after = |amount: u128, fee_bps: u64| amount * BPS.saturating_sub(fee_bps as u128) / BPS;
+    let net_in = after(after(amount_in as u128, dividend_fee_bps), pool_fee_bps);
+    let out = reserve_out as u128 * net_in / (reserve_in as u128 + net_in).max(1);
+    after(out, coin_fee_bps).saturating_sub(1) as u64
 }
 
 /// Coin per dividend at the given reserves, Q32.32.
@@ -141,6 +167,33 @@ mod tests {
         // A 1% fee on the dividend going in: 990 × 7 = 6,930 → 6,722 → 6,637.
         assert_eq!(min_acceptable_out(1_000, twap, 25, 100, 300, 100), Some(6_637));
         assert_eq!(min_acceptable_out(1_000, twap, 9_950, 0, 0, 100), None);
+    }
+
+    #[test]
+    fn floor_slippage_is_half_the_impact_plus_the_band_plus_the_reader_error() {
+        assert_eq!(floor_slippage_bps(100, 500), 50 + 500 + TWAP_READER_ERROR_BPS);
+        assert_eq!(floor_slippage_bps(15, 100), 8 + 100 + TWAP_READER_ERROR_BPS);
+    }
+
+    #[test]
+    fn r3tw03_a_flat_price_clears_the_floor_at_the_smallest_settings() {
+        // A buy at the impact cap, the TWAP read 0.78% high (the reader's
+        // worst case at the shortest window), spot exactly at the true price.
+        let (reserve_in, reserve_out) = (1_000_000_000u64, 7_000_000_000u64);
+        let impact = crate::constants::MIN_PRICE_IMPACT_BPS;
+        let deviation = crate::constants::MIN_TWAP_DEVIATION_BPS;
+        let amount = impact_cap(reserve_in, impact);
+        let twap = spot_price_x32(reserve_in, reserve_out).unwrap() * 10_078 / 10_000;
+        let floor = min_acceptable_out(amount, twap, 25, 0, 300, floor_slippage_bps(impact, deviation)).unwrap();
+        let quote = quote_out(amount, reserve_in, reserve_out, 25, 0, 300);
+        assert!(quote >= floor, "{quote} < {floor}");
+    }
+
+    #[test]
+    fn quote_matches_the_constant_product() {
+        // 1,000 into 1,000,000 / 7,000,000, no fees: 7,000,000 × 1,000 / 1,001,000.
+        assert_eq!(quote_out(1_000, 1_000_000, 7_000_000, 0, 0, 0), 6_993 - 1);
+        assert!(quote_out(1_000, 1_000_000, 7_000_000, 25, 0, 300) < 6_993 * 97 / 100);
     }
 
     #[test]

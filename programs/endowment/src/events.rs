@@ -150,13 +150,23 @@ pub struct RetireProposed {
     pub effective_at: i64,
 }
 
-/// A refresh pass by the endowment's refresher: every landlord it read is now
-/// eligible to count at its next count read (if still delegated and holding).
+/// A refresh transaction by the endowment's refresher. `landlords` are the
+/// landlord records whose reads it added to (see REQUIRED_ATTESTATIONS), so
+/// every attestation is public and can be checked against the landlords'
+/// balances at that slot.
 #[event]
 pub struct LandlordsAttested {
     pub config: Pubkey,
-    pub landlords: u32,
+    pub landlords: Vec<Pubkey>,
     pub at: i64,
+}
+
+/// The refresher resigned: nobody's reads attest until a new one is set (which
+/// only the admin can do, through the timelock; never after renounce).
+#[event]
+pub struct RefresherResigned {
+    pub config: Pubkey,
+    pub refresher: Pubkey,
 }
 
 #[event]

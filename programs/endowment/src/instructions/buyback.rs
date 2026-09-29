@@ -17,10 +17,13 @@ use crate::{
     error::EndowmentError,
     events::{Bought, MilestoneReached},
     health::{ensure_tradeable, is_frozen, TradeAccounts},
-    math::{impact_cap, lp_tokens_for, min_acceptable_out, refill, spendable, split_buy, spot_price_x32, zap_swap_amount},
+    math::{
+        floor_slippage_bps, impact_cap, lp_tokens_for, min_acceptable_out, quote_out, refill, spendable, split_buy,
+        spot_price_x32, zap_swap_amount,
+    },
     raydium::{twap_price_x32, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR, SWAP_BASE_INPUT_DISCRIMINATOR},
     state::Config,
-    transfer::read_token_account,
+    transfer::{capped_transfer_fee_bps, hook_enabled, read_token_account},
 };
 
 /// Permissionless: anyone may crank a buyback for an endowment, and is paid a
@@ -36,6 +39,10 @@ use crate::{
 ///
 /// Buybacks refuse to run while either mint has a transfer hook set (see
 /// `health::ensure_tradeable`), so the tip and donation are plain transfers.
+///
+/// An endowment that donates passes the flagship's coin mint as the first
+/// remaining account: the donation is skipped (kept in this vault) while the
+/// flagship coin can't trade, so it doesn't pile up where it can't be spent.
 #[derive(Accounts)]
 pub struct Buyback<'info> {
     #[account(
@@ -133,6 +140,8 @@ struct Plan {
     allowance: u64,
     /// Dividend to swap for the coin (the buy share plus the liquidity share's swap half).
     swap_amount: u64,
+    /// What the pool would pay for `swap_amount` now, net of every fee.
+    quote: u64,
     /// Of `swap_amount`, the part swapped for the liquidity deposit.
     lp_swap: u64,
     /// Dividend to deposit as liquidity alongside the coin from `lp_swap`.
@@ -151,16 +160,20 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     let lp_before = read_token_account(&a.lp_vault)?.map(|t| t.amount).unwrap_or(0);
 
     // 1. Swap the dividend for the coin, protected by the TWAP floor.
+    let params = &a.config.params;
     let floor = min_acceptable_out(
         plan.swap_amount,
         plan.twap_price_x32,
         plan.pool_fee,
         plan.dividend_fee,
         plan.coin_fee,
-        a.config.params.max_price_impact_bps as u64,
+        floor_slippage_bps(params.max_price_impact_bps, params.max_twap_deviation_bps),
     )
     .ok_or(EndowmentError::PriceImpactTooHigh)?;
     require!(floor > 0, EndowmentError::PriceImpactTooHigh);
+    // The spot band passed, but the pool's own quote for this size is still
+    // under the floor: say so, rather than leave it to Raydium's slippage error.
+    require!(plan.quote >= floor, EndowmentError::FloorAboveQuote);
     swap_base_input(&ctx, &config_key, plan.swap_amount, floor.max(min_out))?;
     ctx.accounts.coin_vault.reload()?;
     let received = ctx.accounts.coin_vault.amount.saturating_sub(coin_before);
@@ -229,9 +242,12 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     }
 
     // 5. Send the donation, if this endowment chose one, to the flagship's
-    //    dividend vault, while it exists and isn't frozen (the donor's buybacks
-    //    never depend on the flagship's state).
+    //    dividend vault, while it exists, isn't frozen, and the flagship coin
+    //    can trade (the donor's buybacks never depend on the flagship's state).
     let mut donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
+    if donation > 0 && !flagship_can_trade(ctx.remaining_accounts, clock.epoch)? {
+        donation = 0;
+    }
     if donation > 0 {
         let (flagship_authority, _) =
             Pubkey::find_program_address(&[AUTHORITY_SEED, flagship_config().as_ref()], ctx.program_id);
@@ -327,22 +343,17 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         .unwrap_or(false);
 
     // Price: the TWAP is the reference, from recorded history only; the spot
-    // price may not be far from it in either direction.
+    // price may not be further from it than `max_twap_deviation_bps` either way.
     let reserve_dividend = pool.reserve(dividend_index, a.pool_dividend_vault.amount)?;
     let reserve_coin = pool.reserve(coin_index, a.pool_coin_vault.amount)?;
     let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
     let twap_price_x32 =
         twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, now as u64)?;
+    let deviation = params.max_twap_deviation_bps as u128;
     // Fewer coin per dividend at spot than at the TWAP means the coin got pricier;
-    // more means the TWAP lags a fall, and the floor would be too loose.
-    require!(
-        spot * 10_000 >= twap_price_x32 * (10_000 - MAX_SPOT_ABOVE_TWAP_BPS as u128),
-        EndowmentError::PriceAboveTwap
-    );
-    require!(
-        spot * 10_000 <= twap_price_x32 * (10_000 + MAX_SPOT_ABOVE_TWAP_BPS as u128),
-        EndowmentError::PriceAboveTwap
-    );
+    // more means it got cheaper and the TWAP lags the fall (the floor would be loose).
+    require!(spot * 10_000 >= twap_price_x32 * (10_000 - deviation), EndowmentError::PriceAboveTwap);
+    require!(spot * 10_000 <= twap_price_x32 * (10_000 + deviation), EndowmentError::PriceBelowTwap);
 
     // Size: what the vault can spend, capped per transaction, by the paced
     // allowance, and so this trade's own impact stays within half the budget.
@@ -378,6 +389,7 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         swap_amount > 0 && swap_amount + lp_deposit >= params.min_buy_amount,
         EndowmentError::NothingToBuy
     );
+    let quote = quote_out(swap_amount, reserve_dividend, reserve_coin, pool_fee, dividend_fee, coin_fee);
 
     Ok(Plan {
         dividend_index,
@@ -388,6 +400,7 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         coin_fee,
         allowance,
         swap_amount,
+        quote,
         lp_swap,
         lp_deposit,
     })
@@ -447,6 +460,18 @@ fn swap_base_input(ctx: &Context<Buyback>, config_key: &Pubkey, amount_in: u64, 
     Ok(())
 }
 
+/// Whether the flagship coin can trade, so a donation to it can be spent: the
+/// first remaining account must be its mint, and it must have no transfer hook
+/// and no fee above the cap.
+fn flagship_can_trade(remaining: &[AccountInfo], epoch: u64) -> Result<bool> {
+    let mint = remaining.first().ok_or(EndowmentError::WrongFlagshipVault)?;
+    require_keys_eq!(mint.key(), FLAGSHIP_COIN_MINT, EndowmentError::WrongFlagshipVault);
+    if mint.data_is_empty() || hook_enabled(mint)? {
+        return Ok(false);
+    }
+    Ok(capped_transfer_fee_bps(mint, epoch).is_ok())
+}
+
 /// Deposits the liquidity share into the pool at its current ratio, with the LP
 /// tokens landing in the authority's LP account. Skipped (the share stays in the
 /// vault for a later buy) if the pool's price after our swap has strayed from
@@ -460,7 +485,7 @@ fn deposit_liquidity(ctx: &Context<Buyback>, config_key: &Pubkey, plan: &Plan, c
     let reserve_dividend = pool.reserve(plan.dividend_index, token_amount(&a.pool_dividend_vault.to_account_info())?)?;
     let reserve_coin = pool.reserve(plan.coin_index, token_amount(&a.pool_coin_vault.to_account_info())?)?;
     let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
-    let band = a.config.params.max_price_impact_bps as u128 + MAX_SPOT_ABOVE_TWAP_BPS as u128;
+    let band = a.config.params.max_price_impact_bps as u128 + a.config.params.max_twap_deviation_bps as u128;
     let twap = plan.twap_price_x32;
     if spot * 10_000 < twap * (10_000 - band) || spot * 10_000 > twap * (10_000 + band) {
         return Ok(());
@@ -536,4 +561,42 @@ fn token_amount(info: &AccountInfo) -> Result<u64> {
     let data = info.try_borrow_data()?;
     require!(data.len() >= 72, EndowmentError::WrongPool);
     Ok(u64::from_le_bytes(data[64..72].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    /// The $PENIS mint as fetched from mainnet into the integration fixtures.
+    fn flagship_mint_data() -> Vec<u8> {
+        let path = format!("{}/tests/fixtures/token_1_mint.json", env!("CARGO_MANIFEST_DIR"));
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        base64::engine::general_purpose::STANDARD.decode(json["data"].as_str().unwrap()).unwrap()
+    }
+
+    /// $PENIS TransferFeeConfig: the newer fee's epoch and basis points.
+    const NEWER_FEE_EPOCH: usize = 328;
+    const NEWER_FEE_BPS: usize = 344;
+
+    fn can_trade(key: Pubkey, mut data: Vec<u8>, epoch: u64) -> Result<bool> {
+        let owner = anchor_spl::token_2022::ID;
+        let mut lamports = 1_000_000;
+        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
+        flagship_can_trade(&[info], epoch)
+    }
+
+    #[test]
+    fn r3mint03_the_donation_is_skipped_while_the_flagship_coin_cant_trade() {
+        let data = flagship_mint_data();
+        assert!(can_trade(FLAGSHIP_COIN_MINT, data.clone(), 0).unwrap());
+        // A fee raised above the cap (scheduled for any epoch): skipped.
+        let mut raised = data.clone();
+        raised[NEWER_FEE_BPS..NEWER_FEE_BPS + 2].copy_from_slice(&501u16.to_le_bytes());
+        raised[NEWER_FEE_EPOCH..NEWER_FEE_EPOCH + 8].copy_from_slice(&1_000u64.to_le_bytes());
+        assert!(!can_trade(FLAGSHIP_COIN_MINT, raised, 0).unwrap());
+        // Only the flagship's own mint will do, and it must be passed.
+        assert!(can_trade(Pubkey::new_unique(), data, 0).is_err());
+        assert!(flagship_can_trade(&[], 0).is_err());
+    }
 }

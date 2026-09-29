@@ -115,12 +115,19 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         dividend_account.delegate == Some(ctx.accounts.authority.key()).into(),
         EndowmentError::NotDelegated
     );
-    let amount = ctx.accounts.landlord.sweepable(dividend_account.amount, dividend_account.delegated_amount);
+    // Never more than the vault can spend in MAX_VAULT_DAYS_OF_BUYS days: the
+    // rest stays with the landlord for a later sweep (R3-MINT-01).
+    let vault_before = ctx.accounts.dividend_vault.amount;
+    let vault_cap = config.params.max_buy_per_day.saturating_mul(MAX_VAULT_DAYS_OF_BUYS);
+    let amount = ctx
+        .accounts
+        .landlord
+        .sweepable(dividend_account.amount, dividend_account.delegated_amount)
+        .min(vault_cap.saturating_sub(vault_before));
     if amount == 0 {
         return Ok(());
     }
 
-    let vault_before = ctx.accounts.dividend_vault.amount;
     let bump = [config.authority_bump];
     let seeds = Config::authority_seeds(&config_key, &bump);
     token_interface::transfer_checked(

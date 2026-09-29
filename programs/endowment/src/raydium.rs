@@ -9,7 +9,9 @@
 use anchor_lang::prelude::*;
 
 use crate::{
-    constants::{MAX_STRETCH_SHARE_BPS, RAYDIUM_OBSERVATION_COALESCE_SECONDS, TWAP_WINDOW_SECONDS},
+    constants::{
+        MAX_STRETCH_SHARE_BPS, MIN_TWAP_WINDOW_SECONDS, RAYDIUM_OBSERVATION_COALESCE_SECONDS, TWAP_WINDOW_SECONDS,
+    },
     error::EndowmentError,
 };
 
@@ -152,13 +154,18 @@ pub fn pool_fee_bps(amm_config: &[u8], creator_fee_enabled: bool) -> Result<u64>
 ///   14 s / span whenever swaps had coalesced into the starting record, which an
 ///   attacker can arrange (F-01). Records are taken as of the middle of that
 ///   range instead: no bias either way, and at most ±7 s / span of error at the
-///   start (±0.4% over the 30-minute window), within the floor's drift allowance;
+///   start (±0.78% over the shortest window), which the floor allows for
+///   (`TWAP_READER_ERROR_BPS`);
 /// - it walks back through the records until it has `TWAP_WINDOW_SECONDS` of
 ///   weight, where no single stretch weighs more than `MAX_STRETCH_SHARE_BPS` of
 ///   the window: a longer stretch counts at its own average price, for that
-///   capped time. One coloured stretch is at most half the average, so the spot
-///   band catches it, and a long quiet stretch (whose price is the pool's price
-///   now) needs no more history than any other to average over.
+///   capped time. A long quiet stretch (whose price is the pool's price now)
+///   needs no more history than any other to average over;
+/// - if the records run out first (a busy pool fills Raydium's 100-record ring
+///   in as little as 99 × 15 s = 1,485 s), it averages over what they hold, as
+///   long as that is at least `MIN_TWAP_WINDOW_SECONDS` and no one stretch is
+///   more than `MAX_STRETCH_SHARE_BPS` of it. Either way one coloured stretch
+///   is at most a quarter of the average, so the spot band catches it.
 pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now: u64) -> Result<u128> {
     require!(
         observation.len() == OBSERVATION_STATE_LEN && observation[..8] == OBSERVATION_DISCRIMINATOR,
@@ -183,7 +190,7 @@ pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now
     // The newer end of the stretch being added: its timestamp, cumulative time
     // (the latest record is exact as of `end`), and weighted price and weight so far.
     let (mut newer_ts, mut newer_time, mut newer_cum) = (latest_ts, end, latest_cum);
-    let (mut weighted, mut weight) = (0u128, 0u64);
+    let (mut weighted, mut weight, mut longest) = (0u128, 0u64, 0u64);
     for step in 1..OBSERVATION_NUM {
         let i = (latest + OBSERVATION_NUM - step) % OBSERVATION_NUM;
         let (ts, cum) = cumulative(i);
@@ -202,14 +209,23 @@ pub fn twap_price_x32(observation: &[u8], pool: &Pubkey, token_index: usize, now
         };
         weighted = weighted.checked_add(add).ok_or(EndowmentError::TwapUnavailable)?;
         weight += secs;
+        longest = longest.max(secs);
         if weight >= TWAP_WINDOW_SECONDS {
-            let twap = weighted / weight as u128;
-            require!(twap > 0, EndowmentError::TwapUnavailable);
-            return Ok(twap);
+            break;
         }
         (newer_ts, newer_time, newer_cum) = (ts, time, cum);
     }
-    err!(EndowmentError::TwapUnavailable)
+    // The full window, or (the records having run out) a shorter one of at
+    // least the minimum in which no stretch outweighs its share.
+    require!(
+        weight >= TWAP_WINDOW_SECONDS
+            || (weight >= MIN_TWAP_WINDOW_SECONDS
+                && (longest as u128) * 10_000 <= (weight as u128) * MAX_STRETCH_SHARE_BPS as u128),
+        EndowmentError::TwapUnavailable
+    );
+    let twap = weighted / weight as u128;
+    require!(twap > 0, EndowmentError::TwapUnavailable);
+    Ok(twap)
 }
 
 #[cfg(test)]
@@ -285,18 +301,19 @@ mod tests {
     #[test]
     fn a_long_quiet_stretch_needs_no_more_history_than_the_window() {
         let pool = Pubkey::new_unique();
-        // A day with no swap, then one: the day counts for half the window, at
-        // its own price, and 15 minutes of earlier history fill the rest.
-        let (mut entries, _) = history(&[P; 10], 1_000, 100, 0);
-        let day_end = 1_000 + 9 * 100 + 86_400;
-        entries.push((10, day_end, entries[9].2 + 8 * (1 << 32) * 86_400));
-        let data = observation(&pool, 10, day_end, &entries);
+        // A day with no swap, then one: the day counts for a quarter of the
+        // window, at its own price, and 22.5 minutes of earlier history fill the rest.
+        let (mut entries, _) = history(&[P; 20], 1_000, 100, 0);
+        let day_end = 1_000 + 19 * 100 + 86_400;
+        entries.push((20, day_end, entries[19].2 + 8 * (1 << 32) * 86_400));
+        let data = observation(&pool, 20, day_end, &entries);
         let twap = twap_price_x32(&data, &pool, 0, day_end).unwrap();
-        assert!(twap > (15 << 32) / 2 - P / 100 && twap < (15 << 32) / 2 + P / 100, "{twap}");
+        // (8 + 3 × 7) / 4 = 7.25
+        assert!(twap > (29 << 32) / 4 - P / 100 && twap < (29 << 32) / 4 + P / 100, "{twap}");
     }
 
     #[test]
-    fn r2cc01_one_long_stretch_closed_at_a_moved_price_is_at_most_half_the_weight() {
+    fn r2cc01_one_long_stretch_closed_at_a_moved_price_is_at_most_a_quarter_of_the_weight() {
         let pool = Pubkey::new_unique();
         // A quiet pool: records every 100 s at 7, then an hour with no swap, then
         // coin sent straight into the pool and a swap that prices the hour at 14,
@@ -309,18 +326,23 @@ mod tests {
         entries.push((91, hour_end + 15, cum));
         let data = observation(&pool, 91, hour_end + 15, &entries);
         let twap = twap_price_x32(&data, &pool, 0, hour_end + 15).unwrap();
-        // The hour counts for at most half the 30-minute window: ≤ (7 + 14) / 2.
-        assert!(twap <= P * 3 / 2 + P / 50, "{twap}");
-        assert!(twap > P * 3 / 2 - P / 50, "{twap}");
+        // The hour counts for at most a quarter of the 30-minute window:
+        // ≤ (3 × 7 + 14) / 4 = 8.75.
+        assert!(twap <= P * 5 / 4 + P / 50, "{twap}");
+        assert!(twap > P * 5 / 4 - P / 50, "{twap}");
     }
 
     #[test]
     fn twap_needs_enough_history_and_the_right_pool() {
         let pool = Pubkey::new_unique();
-        let (entries, end) = history(&[P; 5], 1_000, 100, 0);
-        let data = observation(&pool, 4, end, &entries);
-        // 400 s of history is not a window.
+        // 900 s of records (893 s of weight, after the reader's 7 s) is not a window.
+        let (entries, end) = history(&[P; 10], 1_000, 100, 0);
+        let data = observation(&pool, 9, end, &entries);
         assert!(twap_price_x32(&data, &pool, 0, end).is_err());
+        // 1,000 s is.
+        let (entries, end) = history(&[P; 11], 1_000, 100, 0);
+        let data = observation(&pool, 10, end, &entries);
+        assert!(twap_price_x32(&data, &pool, 0, end).is_ok());
         let (entries, end) = history(&[P; 30], 1_000, 100, 0);
         let data = observation(&pool, 29, end, &entries);
         assert!(twap_price_x32(&data, &pool, 0, end).is_ok());
@@ -332,5 +354,54 @@ mod tests {
         // One record, however old, spans nothing.
         let data = observation(&pool, 0, 1_000, &[(0, 1_000, 0)]);
         assert!(twap_price_x32(&data, &pool, 0, 100_000).is_err());
+    }
+
+    /// Fills the whole ring with records `gap` seconds apart, the latest at
+    /// index `latest` (so it wraps), at a constant price.
+    fn full_ring(pool: &Pubkey, gap: u64, latest: usize) -> (Vec<u8>, u64) {
+        let (history, end) = history(&[P; OBSERVATION_NUM], 1_000, gap, 0);
+        let entries: Vec<_> = history
+            .into_iter()
+            .map(|(i, ts, cum)| ((latest + 1 + i) % OBSERVATION_NUM, ts, cum))
+            .collect();
+        (observation(pool, latest as u16, end, &entries), end)
+    }
+
+    #[test]
+    fn r3tw01_a_ring_full_of_records_15_seconds_apart_still_gives_a_twap() {
+        let pool = Pubkey::new_unique();
+        // A busy pool (or a flood of dust swaps): 100 records every 15 s span
+        // 1,485 s, less than the full window. The TWAP averages over all of it.
+        for latest in [99, 0, 37] {
+            let (data, end) = full_ring(&pool, 15, latest);
+            let twap = twap_price_x32(&data, &pool, 0, end).unwrap();
+            assert!(twap.abs_diff(P) <= P * TWAP_READER_ERROR / 10_000, "{latest}: {twap}");
+        }
+    }
+
+    const TWAP_READER_ERROR: u128 = crate::constants::TWAP_READER_ERROR_BPS as u128;
+
+    #[test]
+    fn r3tw01_a_short_ring_is_refused_below_the_minimum_window() {
+        let pool = Pubkey::new_unique();
+        // 100 records 9 s apart (not possible on Raydium, which spaces them at
+        // least 15 s) would span 891 s: below the minimum, refused.
+        let (data, end) = full_ring(&pool, 9, 99);
+        assert!(twap_price_x32(&data, &pool, 0, end).is_err());
+        let (data, end) = full_ring(&pool, 10, 99);
+        assert!(twap_price_x32(&data, &pool, 0, end).is_ok());
+    }
+
+    #[test]
+    fn r3tw04_one_stretch_is_at_most_a_quarter_of_a_short_window() {
+        let pool = Pubkey::new_unique();
+        // A young pool: ten minutes of records, then 450 s closed at 3× the
+        // price. 1,050 s of weight, but one stretch is 43% of it: refused
+        // until more history accrues.
+        let (mut entries, _) = history(&[P; 7], 1_000, 100, 0);
+        let end = 1_000 + 6 * 100 + 450;
+        entries.push((7, end, entries[6].2 + 3 * P * 450));
+        let data = observation(&pool, 7, end, &entries);
+        assert!(twap_price_x32(&data, &pool, 0, end).is_err());
     }
 }

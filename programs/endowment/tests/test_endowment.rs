@@ -21,8 +21,8 @@ use {
     endowment::{
         constants::{
             ACTIVE_MAX_AGE_SECS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
-            FLAGSHIP_COIN_MINT, LANDLORD_SEED, MAX_PAUSE_SECONDS, PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS,
-            PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
+            FLAGSHIP_COIN_MINT, LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, PARAM_APPLY_GRACE_SECONDS,
+            PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS, REQUIRED_ATTESTATIONS,
         },
         error::EndowmentError,
         state::{Config, CreateParams, Landlord, Params},
@@ -41,6 +41,7 @@ const UNIT: u64 = 1_000_000; // one whole token in base units
 const MAX_BUY_PER_TX: u64 = 5_000 * UNIT;
 const MAX_BUY_PER_DAY: u64 = 20_000 * UNIT;
 const MAX_PRICE_IMPACT_BPS: u16 = 100;
+const MAX_TWAP_DEVIATION_BPS: u16 = 500;
 const CONTRIBUTION_CAP: u64 = 200_000_000 * UNIT;
 const INTERVAL: i64 = 600;
 const DAY: i64 = 24 * 60 * 60;
@@ -310,6 +311,7 @@ fn base_params() -> Params {
         max_buy_per_tx: MAX_BUY_PER_TX,
         max_buy_per_day: MAX_BUY_PER_DAY,
         max_price_impact_bps: MAX_PRICE_IMPACT_BPS,
+        max_twap_deviation_bps: MAX_TWAP_DEVIATION_BPS,
         min_buy_amount: 0,
         min_buy_interval_secs: INTERVAL,
         tip_bps: 25,
@@ -659,8 +661,9 @@ impl Env {
         self.buyback_ix_with(self.buyback_accounts(caller), min_out)
     }
 
-    /// As the website builds it: the flagship's vault is passed writable only
-    /// when this endowment donates.
+    /// As the website builds it: the flagship's vault is passed writable, and
+    /// the flagship's coin mint as the first remaining account, only when this
+    /// endowment donates.
     fn buyback_ix_with(&self, accounts: endowment::accounts::Buyback, min_out: u64) -> Instruction {
         let donates = Env::config_at(&self.svm, &accounts.config).donation_bps > 0;
         let vault = accounts.flagship_dividend_vault;
@@ -669,6 +672,7 @@ impl Env {
             for meta in metas.iter_mut().filter(|m| m.pubkey == vault) {
                 meta.is_writable = true;
             }
+            metas.push(AccountMeta::new_readonly(FLAGSHIP_COIN_MINT, false));
         }
         Instruction::new_with_bytes(endowment::id(), &endowment::instruction::Buyback { min_out }.data(), metas)
     }
@@ -851,10 +855,37 @@ impl Env {
         self.attest_of(self.config(), owners)
     }
 
-    /// The refresher's pass over every landlord of `config`, 8 per transaction.
-    fn attest_all_of(&mut self, config: Pubkey) -> bool {
+    /// One refresher pass over every landlord of `config`, 8 per transaction.
+    fn attest_pass_of(&mut self, config: Pubkey) -> bool {
         for batch in self.landlords_of(&config).chunks(8) {
             if !self.attest_of(config, batch) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The refresher's passes before a count, as the keeper runs them:
+    /// REQUIRED_ATTESTATIONS passes, MIN_ATTEST_SPACING_SECS apart.
+    fn attest_all_of(&mut self, config: Pubkey) -> bool {
+        for pass in 0..REQUIRED_ATTESTATIONS {
+            if pass > 0 {
+                self.warp(MIN_ATTEST_SPACING_SECS);
+            }
+            if !self.attest_pass_of(config) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `attest` REQUIRED_ATTESTATIONS times, spaced (the same landlords each time).
+    fn attest_fully(&mut self, owners: &[Pubkey]) -> bool {
+        for pass in 0..REQUIRED_ATTESTATIONS {
+            if pass > 0 {
+                self.warp(MIN_ATTEST_SPACING_SECS);
+            }
+            if !self.attest(owners) {
                 return false;
             }
         }
@@ -1269,7 +1300,7 @@ fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
     let mut env = Env::new();
     env.create();
     let config = env.config_state();
-    assert_eq!(config.version, 2);
+    assert_eq!(config.version, 3);
     assert_eq!(config.creator, env.inst.creator.pubkey());
     assert_eq!(config.admin, env.inst.creator.pubkey());
     assert_eq!(config.guardian, env.guardian.pubkey());
@@ -1407,7 +1438,7 @@ fn register_requires_a_full_delegation() {
     let approve = env.approve_ix(&owner.pubkey(), &account);
     assert!(send(&mut env.svm, &[approve, register], &owner, &[&owner]));
     let landlord = env.landlord_state(&owner.pubkey());
-    assert_eq!((landlord.version, landlord.baseline, landlord.config), (2, 100, env.config()));
+    assert_eq!((landlord.version, landlord.baseline, landlord.config), (3, 100, env.config()));
     assert_eq!(env.config_state().landlord_count, 1);
     assert!(!landlord.snapshot_valid);
     assert_eq!(landlord.joined_round, 0);
@@ -2116,7 +2147,7 @@ fn regression_r2roles05_the_liquidity_share_buys_while_the_pool_has_deposits_dis
 
 #[test]
 fn sweeps_keep_flowing_after_the_milestone() {
-    let mut env = pool_env_with(100_000 * UNIT, |p| {
+    let mut env = pool_env_with(10_000 * UNIT, |p| {
         p.contribution_cap = 1;
         p.params.activate_bps = 0;
         p.params.deactivate_bps = 0;
@@ -2400,13 +2431,17 @@ fn count_switches_sweeps_on_at_30_percent_with_hysteresis() {
 fn count_runs_at_most_once_a_day_and_not_while_paused() {
     let (mut env, _) = counted_env();
     assert!(env.count());
-    assert_err!(env.count(), CountTooSoon);
-    env.warp(COUNT_INTERVAL_SECS - 1);
-    assert_err!(env.count(), CountTooSoon);
+    let config = env.config();
+    assert!(env.attest_pass_of(config));
+    let begin = env.begin_ix(config);
+    assert_err!(env.crank(&[begin.clone()]), CountTooSoon);
+    let started = env.config_state().count.started_at;
+    env.warp(started + COUNT_INTERVAL_SECS - 1 - env.now());
+    assert_err!(env.crank(&[begin.clone()]), CountTooSoon);
     env.warp(1);
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
-    assert_err!(env.count(), Paused);
+    assert_err!(env.crank(&[begin]), Paused);
     env.warp(MAX_PAUSE_SECONDS);
     assert!(env.count());
 }
@@ -3107,9 +3142,9 @@ fn regression_r2cnt01_a_chain_of_k_wallets_counts_one_holding_once() {
     let owners: Vec<Pubkey> = w.iter().map(|k| k.pubkey()).collect();
     assert!(env.count()); // first read: records balances
     for _ in 0..3 {
-        // The refresher's pass (one transaction) lands at a time the attacker
-        // doesn't choose; the coin is in one wallet then.
-        assert!(env.attest(&owners));
+        // The refresher's passes (one transaction each) land at times the
+        // attacker doesn't choose; the coin is in one wallet then.
+        assert!(env.attest_fully(&owners));
         chain_round(&mut env, &w, x);
         let config = env.config_state();
         // Before the fix: 4 × 10% + dust = 4,060 bps, active. Now: what is really held.
@@ -3123,14 +3158,15 @@ fn regression_r2cnt01_a_chain_of_k_wallets_counts_one_holding_once() {
 fn regression_r2cnt01_without_the_refreshers_attestation_nobody_counts() {
     let (mut env, w) = chain_env(4, 100_000 * UNIT, 2_000 * UNIT);
     assert!(env.count());
-    // Rounds run by the attacker alone (no refresher pass): nothing counts.
-    chain_round(&mut env, &w, 100_000 * UNIT);
-    chain_round(&mut env, &w, 100_000 * UNIT);
-    assert_eq!(env.config_state().last_committed, 0);
+    // Rounds run by the attacker alone (no refresher pass) can't even begin
+    // (R3-RF-03), so nothing counts.
+    env.warp(COUNT_INTERVAL_SECS);
+    let begin = env.begin_ix(env.config());
+    assert_err!(env.crank(&[begin.clone()]), NotAttested);
     // An anyone-refresh doesn't attest either.
     let owners: Vec<Pubkey> = w.iter().map(|k| k.pubkey()).collect();
     assert!(env.refresh(&owners));
-    chain_round(&mut env, &w, 100_000 * UNIT);
+    assert_err!(env.crank(&[begin]), NotAttested);
     assert_eq!(env.config_state().last_committed, 0);
     // An endowment with no refresher at all never activates (fails safe).
     let mut env = Env::new();
@@ -3139,38 +3175,54 @@ fn regression_r2cnt01_without_the_refreshers_attestation_nobody_counts() {
     let outsider = env.new_landlord(0).0;
     env.mint_coin(&outsider.pubkey(), 500_000 * UNIT);
     let (whale, _) = env.registered_holder(0, 500_000 * UNIT);
+    assert!(env.count());
     for _ in 0..3 {
-        assert!(env.count());
         env.warp(COUNT_INTERVAL_SECS);
+        assert_err!(env.count(), NotAttested);
     }
     assert_eq!(env.config_state().last_committed, 0);
-    assert!(!env.landlord_state(&whale.pubkey()).attested);
+    assert_eq!(env.landlord_state(&whale.pubkey()).attestations, 0);
 }
 
 #[test]
-fn r2cnt01_the_bound_one_holding_counts_at_most_once_per_refresh_transaction_it_can_react_between() {
-    // The quantified bound. With the refresher's pass in one transaction, a
-    // chain of wallets counts X once. If the pass is split across two
-    // transactions and the attacker moves X between them, X is attested in two
-    // wallets and counts twice: never more than the number of refresh
-    // transactions it can react between.
+fn r2cnt01_the_bound_one_holding_counts_twice_only_if_it_wins_the_race_at_every_read() {
+    // The quantified bound. A landlord counts only after REQUIRED_ATTESTATIONS
+    // spaced reads by the refresher. To have X counted in two wallets, the
+    // attacker must move it between the two wallets' reads in every one of
+    // those passes (R3-RF-02): winning once is not enough.
     let (x, dust) = (100_000 * UNIT, 2_000 * UNIT);
     let (mut env, w) = chain_env(3, x, dust);
     let (a, b, c) = (w[0].pubkey(), w[1].pubkey(), w[2].pubkey());
+    // A pass split in two with a hop in between: a is read holding X, then b is.
+    let split_pass = |env: &mut Env| {
+        assert!(env.attest(&[a]));
+        let hop = env.coin_transfer_ix(&a, &b, x);
+        assert!(send(&mut env.svm, &[hop], &w[0], &[&w[0]]));
+        assert!(env.attest(&[b, c]));
+        let back = env.coin_transfer_ix(&b, &a, x);
+        assert!(send(&mut env.svm, &[back], &w[1], &[&w[1]]));
+    };
     assert!(env.count());
-    // One-transaction pass, then the chain: X once.
+    // One-transaction passes, then the chain: X once.
+    assert!(env.attest_fully(&[a, b, c]));
+    chain_round(&mut env, &w, x);
+    assert_eq!(env.config_state().last_committed, x + 2 * dust);
+    // One pass split (the attacker won one race), two whole: still X once.
+    split_pass(&mut env);
+    env.warp(MIN_ATTEST_SPACING_SECS);
+    assert!(env.attest(&[a, b, c]));
+    env.warp(MIN_ATTEST_SPACING_SECS);
     assert!(env.attest(&[a, b, c]));
     chain_round(&mut env, &w, x);
     assert_eq!(env.config_state().last_committed, x + 2 * dust);
-    // A pass split in two with a hop in between: a is read holding X, then b is.
-    assert!(env.attest(&[a]));
-    let hop = env.coin_transfer_ix(&a, &b, x);
-    assert!(send(&mut env.svm, &[hop], &w[0], &[&w[0]]));
-    assert!(env.attest(&[b, c]));
-    let back = env.coin_transfer_ix(&b, &a, x);
-    assert!(send(&mut env.svm, &[back], &w[1], &[&w[1]]));
+    // Only when every pass is split, and the attacker wins every race: 2 × X.
+    for pass in 0..REQUIRED_ATTESTATIONS {
+        if pass > 0 {
+            env.warp(MIN_ATTEST_SPACING_SECS);
+        }
+        split_pass(&mut env);
+    }
     chain_round(&mut env, &w, x);
-    // Two refresh transactions: 2 × X (+ dust), not 3 × X.
     assert_eq!(env.config_state().last_committed, 2 * x + 2 * dust);
 }
 
@@ -3290,7 +3342,7 @@ fn regression_r2cnt08_a_pause_doesnt_run_out_an_open_rounds_clock() {
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
     env.warp(MAX_PAUSE_SECONDS);
-    // The pause is over, but the round's two hours start again from its end.
+    // The pause is over, but the round's timeout starts again from its end.
     assert_err!(env.finish(), CountIncomplete);
     assert!(env.count_batch(&[owners[1].pubkey(), owners[2].pubkey()]));
     assert!(env.finish());
@@ -3574,7 +3626,7 @@ fn regression_r2cc01_a_transfer_into_a_quiet_pools_vault_doesnt_move_the_twap() 
 }
 
 #[test]
-fn regression_r2cc01_a_transfer_then_a_swap_colours_at_most_half_the_twap() {
+fn regression_r2cc01_a_transfer_then_a_swap_colours_at_most_a_quarter_of_the_twap() {
     let mut env = funded_pool_env(50_000 * UNIT);
     let (trader, pump) = env.new_landlord(0);
     env.set_balance(&pump, 1_000_000 * UNIT);
@@ -3586,8 +3638,8 @@ fn regression_r2cc01_a_transfer_then_a_swap_colours_at_most_half_the_twap() {
     env.warp(15);
     let ix = raydium_swap_ix(&env, &trader.pubkey(), UNIT);
     assert!(send(&mut env.svm, &[ix], &trader, &[&trader]));
-    // The day counts for at most half the TWAP, so the average moves at most
-    // half as far as the spot price, and the spot band refuses the buy.
+    // The day counts for at most a quarter of the TWAP, so the average moves at most
+    // a quarter as far as the spot price, and the spot band refuses the buy.
     assert_err!(env.buy(), PriceAboveTwap);
     assert_eq!(env.config_state().total_dividend_spent, 0);
 }
@@ -3615,4 +3667,314 @@ fn regression_f01_a_coalesced_base_observation_doesnt_lower_the_floor() {
     println!("twap / price = {bps} bps");
     assert!((9_960..=10_040).contains(&bps), "{bps}");
     assert!(env.buy());
+}
+
+// ---------------------------------------------------------------------------
+// Regressions: the round-3 audit's exploits (audit-pocs/round3), which must now fail.
+// ---------------------------------------------------------------------------
+
+fn resign_refresher(env: &mut Env, signer: &Keypair) -> bool {
+    let ix = Instruction::new_with_bytes(
+        endowment::id(),
+        &endowment::instruction::ResignRefresher {}.data(),
+        endowment::accounts::ResignRefresher { refresher: signer.pubkey(), config: env.config() }
+            .to_account_metas(None),
+    );
+    send(&mut env.svm, &[ix], signer, &[signer])
+}
+
+#[test]
+fn regression_r3rf01_the_refresher_can_resign_after_renounce_and_then_sweeps_stop() {
+    let (mut env, owners) = counted_env();
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    assert!(env.config_state().active);
+    let admin = env.admin();
+    assert!(env.renounce(&admin));
+    // Nobody else can resign it.
+    let stranger = env.funded();
+    assert_err!(resign_refresher(&mut env, &stranger), NotRefresher);
+    // A refresher whose key may have leaked shuts itself off, with no admin left.
+    assert!(resign_refresher(&mut env, &refresher()));
+    assert_eq!(env.config_state().params.refresher, Pubkey::default());
+    assert_err!(resign_refresher(&mut env, &refresher()), NotRefresher);
+    // Its reads attest nothing now, so no count can start, and once the last
+    // count is three days old sweeps stop.
+    env.warp(COUNT_INTERVAL_SECS);
+    assert_err!(env.count(), NotAttested);
+    let owner = owners[0].insecure_clone();
+    let account = env.inst.dividend_account(&owner.pubkey());
+    env.airdrop_dividend(&account, 10);
+    env.warp(ACTIVE_MAX_AGE_SECS);
+    assert_err!(env.sweep(&owner.pubkey(), &account), CountStale);
+}
+
+#[test]
+fn regression_r3rf01_a_colluding_refresher_must_time_every_one_of_several_spaced_reads() {
+    // The PoC: the refresher reads each wallet once, timed to when the holding
+    // sits there. One read is no longer enough to count: each wallet is left
+    // pending, and counts zero when the round times out.
+    const K: usize = 4;
+    let (x, dust) = (100_000 * UNIT, 2_000 * UNIT);
+    let (mut env, w) = chain_env(K, x, dust);
+    let owners: Vec<Pubkey> = w.iter().map(|k| k.pubkey()).collect();
+    assert!(env.count());
+    assert!(env.attest_fully(&owners));
+    chain_round(&mut env, &w, x);
+    assert_eq!(env.config_state().last_count_bps, 1_060);
+    env.warp(MIN_ATTEST_SPACING_SECS);
+    for i in 0..K {
+        assert!(env.attest(&[owners[i]]));
+        if i + 1 < K {
+            let hop = env.coin_transfer_ix(&owners[i], &owners[i + 1], x);
+            assert!(send(&mut env.svm, &[hop], &w[i], &[&w[i]]));
+        }
+    }
+    let back = env.coin_transfer_ix(&owners[K - 1], &owners[0], x);
+    assert!(send(&mut env.svm, &[back], &w[K - 1], &[&w[K - 1]]));
+    env.warp(COUNT_INTERVAL_SECS);
+    let begin = env.begin_ix(env.config());
+    assert!(env.crank(&[begin]));
+    assert!(env.count_batch(&owners));
+    assert_eq!(env.config_state().count.counted, 0, "every wallet is pending");
+    env.warp(COUNT_TIMEOUT_SECS);
+    assert!(env.finish());
+    let c = env.config_state();
+    assert_eq!((c.last_committed, c.active), (0, false));
+    // Reads less than MIN_ATTEST_SPACING_SECS apart add up to one.
+    let reads = env.landlord_state(&owners[0]).attestations;
+    assert!(env.attest(&owners[..1]));
+    assert!(env.attest(&owners[..1]));
+    assert_eq!(env.landlord_state(&owners[0]).attestations, reads + 1);
+    env.warp(MIN_ATTEST_SPACING_SECS);
+    assert!(env.attest(&owners[..1]));
+    assert_eq!(env.landlord_state(&owners[0]).attestations, reads + 2);
+}
+
+#[test]
+fn regression_r3rf03_nobody_can_zero_a_round_by_counting_before_the_refresher() {
+    let (mut env, owners) = counted_env();
+    let o: Vec<Pubkey> = owners.iter().map(|k| k.pubkey()).collect();
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    assert!(env.config_state().active);
+    // A round can't begin until the refresher has read someone since the last one began.
+    env.warp(COUNT_INTERVAL_SECS);
+    let begin = env.begin_ix(env.config());
+    assert_err!(env.crank(&[begin.clone()]), NotAttested);
+    // After one pass, a third party begins at once and counts everyone.
+    assert!(env.attest(&o));
+    assert!(env.crank(&[begin]));
+    assert!(env.count_batch(&o));
+    // Nobody was consumed as zero: they're pending, and the round can't finish.
+    assert_eq!(env.config_state().count.counted, 0);
+    assert_err!(env.finish(), CountIncomplete);
+    // The refresher completes its reads; the count then credits what's held.
+    env.warp(MIN_ATTEST_SPACING_SECS);
+    assert!(env.attest(&o));
+    env.warp(MIN_ATTEST_SPACING_SECS);
+    assert!(env.attest(&o));
+    assert!(env.count_batch(&o));
+    assert!(env.finish());
+    let c = env.config_state();
+    assert_eq!((c.last_count_bps, c.active), (3_000, true));
+}
+
+#[test]
+fn regression_r3rf04_deactivate_zero_is_refused_with_an_activation_line() {
+    let (mut env, _) = counted_env();
+    let admin = env.admin();
+    let mut p = env.config_state().params;
+    p.deactivate_bps = 0;
+    assert_err!(env.propose(&admin, p), InvalidActivation);
+    let guardian = env.guardian.pubkey();
+    let mut create = params(guardian, 0);
+    create.params.deactivate_bps = 0;
+    let mut other = Env::new();
+    assert_err!(other.create_with(create), InvalidActivation);
+}
+
+#[test]
+fn regression_r3rf06_renounce_needs_a_refresher() {
+    let (mut env, _) = counted_env();
+    env.change_params(|p| p.refresher = Pubkey::default());
+    let admin = env.admin();
+    assert_err!(env.renounce(&admin), NoRefresher);
+    env.change_params(|p| p.refresher = refresher().pubkey());
+    assert!(env.renounce(&admin));
+}
+
+/// Replaces the pool's price history with a full ring of records 15 s apart
+/// (as a busy pool, or a flood of dust swaps, leaves it), wrapped so the
+/// latest sits mid-ring, at the current price.
+fn busy_history(env: &mut Env) {
+    let now = env.now() as u64;
+    let pump = token_balance(&env.svm, &fixtures::key(fixtures::POOL_PUMP_VAULT)) as u128;
+    let penis = token_balance(&env.svm, &fixtures::key(fixtures::POOL_PENIS_VAULT)) as u128;
+    let (p0, p1) = ((penis << 32) / pump, (pump << 32) / penis);
+    const LATEST: usize = 37;
+    env.poke(&fixtures::key(fixtures::OBSERVATION), |d| {
+        for i in 0..100u64 {
+            let slot = (LATEST + 1 + i as usize) % 100;
+            let at = OBSERVATIONS + 40 * slot;
+            d[at..at + 8].copy_from_slice(&(now - 15 * (100 - i)).to_le_bytes());
+            d[at + 8..at + 24].copy_from_slice(&(p0 * 15 * i as u128).to_le_bytes());
+            d[at + 24..at + 40].copy_from_slice(&(p1 * 15 * i as u128).to_le_bytes());
+        }
+        d[9..11].copy_from_slice(&(LATEST as u16).to_le_bytes());
+        d[OBSERVATION_LAST_UPDATE..OBSERVATION_LAST_UPDATE + 8].copy_from_slice(&(now - 15).to_le_bytes());
+    });
+}
+
+#[test]
+fn regression_r3tw01_a_ring_of_records_15_seconds_apart_still_buys() {
+    let mut env = funded_pool_env(50_000 * UNIT);
+    busy_history(&mut env);
+    // 1,485 s of history, short of the full window: before the fix, TwapUnavailable.
+    assert!(env.buy());
+}
+
+#[test]
+fn regression_r3tw02_the_band_is_a_parameter_and_applies_both_ways() {
+    let mut env = funded_pool_env(50_000 * UNIT);
+    // Spot 4% from the TWAP, coin pricier: within the default ±5%, it buys.
+    donate_to_pool(&mut env, 400);
+    assert!(env.buy());
+    // Tightened to ±3% (timelocked), the same deviation is refused, as "above".
+    env.change_params(|p| p.max_twap_deviation_bps = 300);
+    steady_history(&mut env);
+    donate_to_pool(&mut env, 400);
+    assert_err!(env.buy(), PriceAboveTwap);
+    // The coin 4% cheaper than its TWAP: refused as "below" (R3-TW-05).
+    steady_history(&mut env);
+    let vault = fixtures::key(fixtures::POOL_PENIS_VAULT);
+    let balance = token_balance(&env.svm, &vault);
+    env.set_balance(&vault, balance + balance * 400 / 10_000);
+    assert_err!(env.buy(), PriceBelowTwap);
+    // Out of bounds either way.
+    let admin = env.admin();
+    let mut p = env.config_state().params;
+    p.max_twap_deviation_bps = 99;
+    assert_err!(env.propose(&admin, p), InvalidBuybackLimits);
+    p.max_twap_deviation_bps = 1_001;
+    assert_err!(env.propose(&admin, p), InvalidBuybackLimits);
+}
+
+#[test]
+fn regression_r3tw03_a_flat_price_buys_at_the_smallest_impact_and_band() {
+    let mut env = funded_pool_env(50_000 * UNIT);
+    env.change_params(|p| {
+        p.max_price_impact_bps = 10;
+        p.max_twap_deviation_bps = 100;
+    });
+    steady_history(&mut env);
+    // Before the fix the floor sat above the pool's own quote at any impact
+    // budget up to ~50 bps, and every buy reverted.
+    assert!(env.buy());
+}
+
+#[test]
+fn regression_r3tw04_a_transfer_then_a_swap_colours_at_most_a_quarter_of_the_twap() {
+    let mut env = funded_pool_env(50_000 * UNIT);
+    let before = steady_history(&mut env);
+    let (trader, pump) = env.new_landlord(0);
+    env.set_balance(&pump, 1_000_000 * UNIT);
+    env.warp(DAY);
+    // Coin 20% pricier in dividend terms, then a swap prices the whole quiet day there.
+    donate_to_pool(&mut env, 2_500);
+    let ix = raydium_swap_ix(&env, &trader.pubkey(), UNIT);
+    assert!(send(&mut env.svm, &[ix], &trader, &[&trader]));
+    env.warp(15);
+    let ix = raydium_swap_ix(&env, &trader.pubkey(), UNIT);
+    assert!(send(&mut env.svm, &[ix], &trader, &[&trader]));
+    let data = env.svm.get_account(&fixtures::key(fixtures::OBSERVATION)).unwrap().data;
+    let twap = endowment::raydium::twap_price_x32(&data, &env.inst.pool, 0, env.now() as u64).unwrap();
+    // The day weighs a quarter: the TWAP moved about a quarter of the way.
+    let moved = 10_000 - twap * 10_000 / before;
+    assert!((400..=600).contains(&moved), "{moved}");
+    assert_err!(env.buy(), PriceAboveTwap);
+}
+
+#[test]
+fn regression_r3mint01_a_sweep_never_fills_the_vault_beyond_three_days_of_buys() {
+    let mut env = funded_pool_env(0);
+    env.change_params(|p| {
+        p.activate_bps = 0;
+        p.deactivate_bps = 0;
+        p.min_stake_bps = 0;
+    });
+    let (owner, account) = env.registered_landlord(0);
+    // 50 days of the daily buy cap waiting in the landlord's account.
+    let big = 50 * MAX_BUY_PER_DAY;
+    env.set_balance(&account, big);
+    assert!(env.sweep(&owner.pubkey(), &account));
+    let cap = 3 * MAX_BUY_PER_DAY;
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), cap);
+    assert_eq!(token_balance(&env.svm, &account), big - cap, "the rest stays with the landlord");
+    // A full vault: a sweep is a no-op, not an error.
+    assert!(env.sweep(&owner.pubkey(), &account));
+    assert_eq!(token_balance(&env.svm, &account), big - cap);
+    // A buy makes room again.
+    assert!(env.buy());
+    assert!(env.sweep(&owner.pubkey(), &account));
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), cap);
+    // If PUMP's hook authority now switched a hook on, at most `cap` is stranded.
+    let pump = fixtures::key(fixtures::PUMP_MINT);
+    env.poke(&pump, |d| d[202..234].copy_from_slice(Pubkey::new_unique().as_ref()));
+    env.warp(DAY);
+    assert_err!(env.buy(), TransferHookEnabled);
+    assert!(token_balance(&env.svm, &env.dividend_vault()) <= cap);
+}
+
+#[test]
+fn regression_r3mint04_a_stale_older_fee_stops_halting_once_the_newer_fee_is_in_force() {
+    let mut env = funded_pool_env(50_000 * UNIT);
+    let epoch = env.svm.get_sysvar::<Clock>().epoch;
+    let penis = fixtures::key(fixtures::PENIS_MINT);
+    // The PoC: older = 90% (past), newer = 3% in force since this epoch. Now it buys.
+    env.poke(&penis, |d| {
+        d[PENIS_OLDER_FEE_BPS..PENIS_OLDER_FEE_BPS + 2].copy_from_slice(&9_000u16.to_le_bytes());
+        d[PENIS_NEWER_FEE_BPS - 16..PENIS_NEWER_FEE_BPS - 8].copy_from_slice(&epoch.to_le_bytes());
+        d[PENIS_NEWER_FEE_BPS..PENIS_NEWER_FEE_BPS + 2].copy_from_slice(&300u16.to_le_bytes());
+    });
+    assert!(env.buy());
+    // While the older fee is still the one in force, it halts.
+    env.poke(&penis, |d| {
+        d[PENIS_NEWER_FEE_BPS - 16..PENIS_NEWER_FEE_BPS - 8].copy_from_slice(&(epoch + 1).to_le_bytes());
+    });
+    env.warp(DAY);
+    assert_err!(env.buy(), FeeTooHigh);
+}
+
+#[test]
+fn regression_r3mint05_creation_refuses_a_fee_already_above_the_cap() {
+    let mut env = Env::with_pool();
+    let penis = fixtures::key(fixtures::PENIS_MINT);
+    env.poke(&penis, |d| {
+        d[PENIS_OLDER_FEE_BPS..PENIS_OLDER_FEE_BPS + 2].copy_from_slice(&600u16.to_le_bytes());
+        d[PENIS_NEWER_FEE_BPS..PENIS_NEWER_FEE_BPS + 2].copy_from_slice(&600u16.to_le_bytes());
+    });
+    let guardian = env.guardian.pubkey();
+    assert_err!(env.create_with(params(guardian, 0)), FeeTooHigh);
+}
+
+#[test]
+fn regression_r3mint03_a_donating_buy_must_name_the_flagship_coin() {
+    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 20);
+    env.create_flagship_vault();
+    let caller = env.cranker();
+    let accounts = env.buyback_accounts(&caller.pubkey());
+    let mut ix = env.buyback_ix_with(accounts, 1);
+    // Without the flagship's coin mint, or with another mint in its place: refused.
+    let mint = ix.accounts.pop().unwrap();
+    assert_eq!(mint.pubkey, FLAGSHIP_COIN_MINT);
+    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
+    ix.accounts.push(AccountMeta::new_readonly(env.inst.dividend_mint, false));
+    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
+    ix.accounts.pop();
+    ix.accounts.push(mint);
+    assert!(send(&mut env.svm, &[ix], &caller, &[&caller]));
+    assert!(env.config_state().total_donated > 0);
 }

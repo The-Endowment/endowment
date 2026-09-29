@@ -98,4 +98,14 @@ pub enum EndowmentError {
     RetireNotReady,
     #[msg("This mint has an authority or extension the endowment can't accept")]
     UnsafeMint,
+    #[msg("The coin's price is too far below its time-weighted average")]
+    PriceBelowTwap,
+    #[msg("The pool's quote for this buy is below the TWAP floor")]
+    FloorAboveQuote,
+    #[msg("The refresher hasn't read any landlord since the last count began")]
+    NotAttested,
+    #[msg("Set a refresher before renouncing")]
+    NoRefresher,
+    #[msg("Only the refresher can do this")]
+    NotRefresher,
 }

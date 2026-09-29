@@ -12,6 +12,10 @@ pub struct Params {
     pub max_buy_per_day: u64,
     /// Slippage a single buyback may cause beyond fees, against the TWAP.
     pub max_price_impact_bps: u16,
+    /// How far the spot price may sit from the TWAP, either way, for a buyback
+    /// to run; also the floor's allowance for that drift. See
+    /// MIN/MAX_TWAP_DEVIATION_BPS.
+    pub max_twap_deviation_bps: u16,
     /// Buys smaller than this are skipped (not worth a transaction).
     pub min_buy_amount: u64,
     pub min_buy_interval_secs: i64,
@@ -24,10 +28,15 @@ pub struct Params {
     pub deactivate_bps: u16,
     /// Minimum share of supply a landlord must hold to register and be counted.
     pub min_stake_bps: u16,
-    /// The key whose refreshes make landlords eligible to count (see
-    /// `refresh_landlords`). It can't move funds or raise anyone's count: it
-    /// only confirms, at times nobody else chooses, what each landlord holds.
-    /// `Pubkey::default()` = none, so nobody counts and sweeps stay off.
+    /// The key whose reads make landlords eligible to count (see
+    /// `refresh_landlords`). It can't move funds, and each read can only lower
+    /// a landlord's recorded balance. It is trusted, though: it chooses when
+    /// it reads, so a refresher that colludes with landlords can time its reads
+    /// to when one holding sits in each of several wallets and have it counted
+    /// more than once. `REQUIRED_ATTESTATIONS` spaced reads per landlord per
+    /// round make that a race to win several times over, and every read is
+    /// public (`LandlordsAttested` lists the landlords). `Pubkey::default()` =
+    /// none, so nobody counts and sweeps stay off.
     pub refresher: Pubkey,
 }
 
@@ -38,7 +47,8 @@ impl Params {
         require!(
             self.max_buy_per_tx > 0
                 && self.max_buy_per_tx <= self.max_buy_per_day
-                && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&self.max_price_impact_bps),
+                && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&self.max_price_impact_bps)
+                && (MIN_TWAP_DEVIATION_BPS..=MAX_TWAP_DEVIATION_BPS).contains(&self.max_twap_deviation_bps),
             EndowmentError::InvalidBuybackLimits
         );
         require!(
@@ -50,7 +60,9 @@ impl Params {
             EndowmentError::InvalidBuyParams
         );
         require!(
-            self.activate_bps <= MAX_ACTIVATION_BPS && self.deactivate_bps <= self.activate_bps,
+            self.activate_bps <= MAX_ACTIVATION_BPS
+                && self.deactivate_bps <= self.activate_bps
+                && (self.activate_bps == 0 || self.deactivate_bps >= MIN_DEACTIVATE_BPS),
             EndowmentError::InvalidActivation
         );
         require!(self.min_stake_bps <= MAX_MIN_STAKE_BPS, EndowmentError::InvalidParams);
@@ -287,14 +299,18 @@ pub struct Landlord {
     /// True once a count (or refresh) has read this landlord while delegated.
     /// Cleared whenever it's found not delegated, so re-approving costs a round.
     pub snapshot_valid: bool,
-    /// Set when the endowment's refresher has read this landlord since its last
-    /// count read. A landlord only counts if so: the refresher's reads land at
-    /// times the landlord doesn't choose, so coin can't be shown to it in two
-    /// wallets, and a delegation held only around count time is caught.
-    pub attested: bool,
+    /// Reads by the endowment's refresher since this landlord's last count read,
+    /// each at least MIN_ATTEST_SPACING_SECS after the one before. It counts
+    /// only once this reaches REQUIRED_ATTESTATIONS: the reads land at times
+    /// the landlord doesn't choose, each lowers `snapshot` to what it finds,
+    /// and a delegation held only around count time is caught. Reset by a
+    /// count read and whenever the landlord is found not delegated.
+    pub attestations: u8,
+    /// When the last of those reads was.
+    pub last_attested_at: i64,
 
     /// Room for future fields without a migration.
-    pub reserved: [u8; 64],
+    pub reserved: [u8; 56],
 }
 
 impl Landlord {
@@ -338,8 +354,9 @@ mod tests {
             counted_amount: 0,
             snapshot: 0,
             snapshot_valid: false,
-            attested: false,
-            reserved: [0; 64],
+            attestations: 0,
+            last_attested_at: 0,
+            reserved: [0; 56],
         }
     }
 
@@ -348,6 +365,7 @@ mod tests {
             max_buy_per_tx: 100,
             max_buy_per_day: 1_000,
             max_price_impact_bps: 100,
+            max_twap_deviation_bps: 500,
             min_buy_amount: 10,
             min_buy_interval_secs: 600,
             tip_bps: 25,
@@ -412,6 +430,19 @@ mod tests {
         assert!(with(&|p| p.activate_bps = 5_001).validate(0).is_err());
         assert!(with(&|p| p.deactivate_bps = 3_001).validate(0).is_err());
         assert!(with(&|p| p.min_stake_bps = 501).validate(0).is_err());
+        assert!(with(&|p| p.max_twap_deviation_bps = 99).validate(0).is_err());
+        assert!(with(&|p| p.max_twap_deviation_bps = 100).validate(0).is_ok());
+        assert!(with(&|p| p.max_twap_deviation_bps = 1_000).validate(0).is_ok());
+        assert!(with(&|p| p.max_twap_deviation_bps = 1_001).validate(0).is_err());
+        // R3-RF-04: with an activation line, a count that finds nothing always switches off.
+        assert!(with(&|p| p.deactivate_bps = 0).validate(0).is_err());
+        assert!(with(&|p| p.deactivate_bps = 1).validate(0).is_ok());
+        assert!(with(&|p| {
+            p.activate_bps = 0;
+            p.deactivate_bps = 0
+        })
+        .validate(0)
+        .is_ok());
     }
 
     #[test]

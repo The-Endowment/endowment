@@ -5,7 +5,7 @@ use crate::{
     error::EndowmentError,
     events::{
         AdminAccepted, AdminProposed, AdminRenounced, GuardianChanged, ParamsApplied, ParamsCancelled,
-        ParamsProposed, RetireProposed, Retired,
+        ParamsProposed, RefresherResigned, RetireProposed, Retired,
     },
     state::{Config, Params, PendingParams},
 };
@@ -33,6 +33,19 @@ pub struct ApplyParams<'info> {
         mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
+    )]
+    pub config: Box<Account<'info, Config>>,
+}
+
+#[derive(Accounts)]
+pub struct ResignRefresher<'info> {
+    pub refresher: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
+        bump = config.bump,
+        constraint = config.params.refresher != Pubkey::default()
+            && config.params.refresher == refresher.key() @ EndowmentError::NotRefresher,
     )]
     pub config: Box<Account<'info, Config>>,
 }
@@ -106,7 +119,8 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
 /// funds and doesn't change how buybacks spend what the vault holds. Timelocked
 /// like a parameter change: the first call proposes it (announced by an event),
 /// a call after PARAM_TIMELOCK_SECONDS carries it out, and `cancel_params`
-/// withdraws it in between.
+/// withdraws it in between. Like a parameter proposal it expires
+/// PARAM_EXPIRY_SECONDS after maturing; a call after that proposes it afresh.
 pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
@@ -114,7 +128,8 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
     if config.retired {
         return Ok(());
     }
-    if config.retire_at == 0 {
+    let expired = config.retire_at != 0 && now > config.retire_at.saturating_add(PARAM_EXPIRY_SECONDS);
+    if config.retire_at == 0 || expired {
         config.retire_at = now + PARAM_TIMELOCK_SECONDS;
         emit!(RetireProposed { config: config_key, effective_at: config.retire_at });
         return Ok(());
@@ -129,12 +144,23 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 /// One-way: gives up the admin role for good, freezing every parameter as it
 /// stands. It also clears the guardian and any pending change, so no key is left
 /// that can pause or reconfigure the endowment. It requires production
-/// activation thresholds, so sweeps can't be frozen on, and no pending change
-/// (cancel it first), so nothing half-decided is left behind.
+/// activation thresholds, so sweeps can't be frozen on, no pending change
+/// (cancel it first), so nothing half-decided is left behind, and (unless
+/// retired) a refresher, without which nobody could ever count again.
+///
+/// One live role remains: the refresher, whose reads decide who counts (see
+/// `count`). After renounce it can't be replaced, only resign
+/// (`resign_refresher`), which leaves nobody counting and so switches sweeps
+/// off at the next count: a leaked or distrusted refresher key can always be
+/// retired by whoever holds it, and never handed to anyone else.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     require!(config.pending.effective_at == 0 && config.retire_at == 0, EndowmentError::PendingChange);
+    require!(
+        config.retired || config.params.refresher != Pubkey::default(),
+        EndowmentError::NoRefresher
+    );
     require!(
         config.retired
             || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS
@@ -164,6 +190,20 @@ pub fn handle_propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Resul
     let config_key = ctx.accounts.config.key();
     ctx.accounts.config.pending_admin = new_admin;
     emit!(AdminProposed { config: config_key, pending_admin: new_admin });
+    Ok(())
+}
+
+/// The refresher gives up its role, at once and for good (until the admin, if
+/// any, sets another through the timelock). Resigning is the only change the
+/// refresher can make, and it can only ever move toward fewer landlords
+/// counting, so it needs no timelock: it's how a refresher whose key may have
+/// leaked shuts it off, including after the admin has renounced.
+pub fn handle_resign_refresher(ctx: Context<ResignRefresher>) -> Result<()> {
+    let config_key = ctx.accounts.config.key();
+    let config = &mut ctx.accounts.config;
+    let refresher = config.params.refresher;
+    config.params.refresher = Pubkey::default();
+    emit!(RefresherResigned { config: config_key, refresher });
     Ok(())
 }
 

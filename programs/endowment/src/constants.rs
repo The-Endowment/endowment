@@ -16,8 +16,8 @@ pub const AUTHORITY_SEED: &[u8] = b"authority";
 pub const LANDLORD_SEED: &[u8] = b"landlord";
 
 /// Account layout versions, for future migrations.
-pub const CONFIG_VERSION: u8 = 2;
-pub const LANDLORD_VERSION: u8 = 2;
+pub const CONFIG_VERSION: u8 = 3;
+pub const LANDLORD_VERSION: u8 = 3;
 
 /// A guardian pause lifts on its own after this long, and a new pause can only
 /// start this long after the last one ended. The guardian can therefore stop an
@@ -38,32 +38,52 @@ pub const PARAM_EXPIRY_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const MIN_PRICE_IMPACT_BPS: u16 = 10;
 pub const MAX_PRICE_IMPACT_BPS: u16 = 300;
 
+/// Hard bounds on `max_twap_deviation_bps`: how far the spot price may sit from
+/// the TWAP, in either direction, for a buyback to run. The same value is the
+/// floor's allowance for that drift, so it is also the most a permissionless
+/// caller can make a buy lose to it; hence the ceiling. (Round 3's replay of
+/// nine days of this pair's prices: ±3% allowed buys about half the time,
+/// ±5% about 78%.)
+pub const MIN_TWAP_DEVIATION_BPS: u16 = 100;
+pub const MAX_TWAP_DEVIATION_BPS: u16 = 1_000;
+
 /// Buybacks fail closed if the pool's fee (trade + creator) or either mint's
 /// transfer fee (current or scheduled) exceeds these.
 pub const MAX_POOL_FEE_BPS: u64 = 200;
 pub const MAX_TRANSFER_FEE_BPS: u64 = 500;
 
 /// The buyback price floor is measured against the pool's time-weighted average
-/// price over at least this window, read from Raydium's observation account.
-/// Long enough that the uncertainty in where Raydium's records begin (±7 s,
-/// see `raydium::twap_price_x32`) is at most ±0.4% of the average.
+/// price, read from Raydium's observation account, over this window when the
+/// record holds that much history.
 pub const TWAP_WINDOW_SECONDS: u64 = 30 * 60;
+
+/// ...and never over less than this. Raydium's record is a ring of 100
+/// observations at least 15 s apart, so it always spans at least 99 × 15 s =
+/// 1,485 s: a busy pool (or a flood of dust swaps) can shorten the window to
+/// what the ring holds, but never below this minimum, so frequent trading can't
+/// make the TWAP unavailable (R3-TW-01). Shorter would make the average cheaper
+/// to push; the start-of-window uncertainty (±7 s, see `TWAP_READER_ERROR_BPS`)
+/// grows as the window shrinks.
+pub const MIN_TWAP_WINDOW_SECONDS: u64 = 15 * 60;
 
 /// Raydium coalesces swaps within this many seconds of an observation's
 /// timestamp into that observation, so a historical observation's cumulative
 /// price may run up to this long past its recorded timestamp.
 pub const RAYDIUM_OBSERVATION_COALESCE_SECONDS: u64 = 14;
 
-/// No single stretch of the price record counts for more than this share of the
-/// TWAP window (a longer one counts at its average price, for that capped time).
-/// Raydium prices a stretch at the moment it closes, so a token transfer
-/// straight into a pool vault just before a swap colours the whole stretch
-/// before it; this caps what one such move can weigh.
-pub const MAX_STRETCH_SHARE_BPS: u64 = 5_000;
+/// The reader takes each older record as of the middle of that range, so the
+/// average's start is uncertain by ±7 s: ±7 / 900 ≈ ±0.78% at the shortest
+/// window. The floor allows for it explicitly (R3-TW-03), so a flat price never
+/// reads as a loss.
+pub const TWAP_READER_ERROR_BPS: u64 = 80;
 
-/// A buyback is refused if the coin's spot price is this far from its TWAP, in
-/// either direction.
-pub const MAX_SPOT_ABOVE_TWAP_BPS: u64 = 300;
+/// No single stretch of the price record counts for more than this share of the
+/// full TWAP window (a longer one counts at its average price, for that capped
+/// time). Raydium prices a stretch at the moment it closes, so a token transfer
+/// straight into a pool vault just before a swap colours the whole stretch
+/// before it; this caps what one such move can weigh: a quarter, so an attacker
+/// needs four coloured stretches to own the average (R3-TW-04).
+pub const MAX_STRETCH_SHARE_BPS: u64 = 2_500;
 
 /// Landlord sweeps switch on at `activate_bps` of the coin's supply committed
 /// and off below `deactivate_bps`. Both are bounded by this.
@@ -73,6 +93,11 @@ pub const MAX_ACTIVATION_BPS: u16 = 5_000;
 /// can never be frozen on.
 pub const MIN_RENOUNCE_ACTIVATE_BPS: u16 = 1_000;
 pub const MIN_RENOUNCE_DEACTIVATE_BPS: u16 = 500;
+
+/// Whenever the activation threshold is above 0, the deactivation threshold
+/// must be at least this, so a count that finds nothing always switches sweeps
+/// off (R3-RF-04). A threshold of 0/0 is a founders-only test window.
+pub const MIN_DEACTIVATE_BPS: u16 = 1;
 
 /// A landlord must hold at least `min_stake_bps` of the coin's supply to register
 /// and to be counted. Bounded by this.
@@ -87,8 +112,25 @@ pub const COUNT_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// Once a count has been open this long (not counting any pause), anyone can
 /// finish it; landlords not yet counted count as zero for that round. Nobody can
-/// freeze the count by starting it and walking away.
-pub const COUNT_TIMEOUT_SECS: i64 = 2 * 60 * 60;
+/// freeze the count by starting it and walking away. Long enough for the
+/// refresher to complete its reads of landlords left pending (see below).
+pub const COUNT_TIMEOUT_SECS: i64 = 4 * 60 * 60;
+
+/// A landlord only counts after this many reads by the endowment's refresher
+/// since its last count read, each at least `MIN_ATTEST_SPACING_SECS` after the
+/// previous one. Each read lowers the landlord's recorded balance to what it
+/// holds at that moment, so to have one holding counted in several wallets an
+/// attacker must have it in each wallet at each of that wallet's reads: it must
+/// win the race against every one of several reads at times it doesn't choose,
+/// not just one (R3-RF-02).
+pub const REQUIRED_ATTESTATIONS: u8 = 3;
+pub const MIN_ATTEST_SPACING_SECS: i64 = 30 * 60;
+
+/// A sweep never takes the dividend vault above this many days of the daily buy
+/// allowance: what's already in the vault is what could be stranded if a
+/// third-party authority (a fee or hook authority, say) stopped buybacks for
+/// good, so it's kept to a few days' worth (R3-MINT-01).
+pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 
 /// Sweeps stop if no count has finished for this long (a count that nobody runs
 /// can't keep an endowment switched on). Not applied while the activation

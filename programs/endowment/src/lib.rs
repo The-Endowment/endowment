@@ -126,4 +126,9 @@ pub mod endowment {
     pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
         instructions::roles::handle_accept_admin(ctx)
     }
+
+    /// The refresher gives up its role at once; works after renounce too.
+    pub fn resign_refresher(ctx: Context<ResignRefresher>) -> Result<()> {
+        instructions::roles::handle_resign_refresher(ctx)
+    }
 }
