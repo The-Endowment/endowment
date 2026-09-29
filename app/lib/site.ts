@@ -3,7 +3,7 @@ export const MAIN_POOL = "AXTq4JHNYHSnooqjoDmtL9WW5eEgnkkMSWq76Kznidnz";
 
 export const links = {
   x: "https://x.com/PenisEndowment",
-  github: "https://github.com/thepenisendowment/web",
+  github: "https://github.com/The-PENIS-Endowment/endowment",
   stonkfun: `https://www.stonkfun.xyz/token/${PENIS_MINT}`,
   dexscreener: `https://dexscreener.com/solana/${MAIN_POOL.toLowerCase()}`,
   solscan: `https://solscan.io/token/${PENIS_MINT}`,

@@ -3,13 +3,6 @@ import { CopyAddress } from "@/components/CopyAddress";
 import { DotLogo } from "@/components/Logo";
 import { links, PENIS_MINT } from "@/lib/site";
 
-const splits = [
-  { condition: "Accumulating to 20% of supply", buyback: "95%", liquidity: "0%", marketing: "up to 5%", current: true },
-  { condition: "Steady state", buyback: "85%", liquidity: "10%", marketing: "5%" },
-  { condition: "Deepening liquidity", buyback: "40%", liquidity: "50%", marketing: "10%" },
-  { condition: "Boosting volume", buyback: "60%", liquidity: "10%", marketing: "30%" },
-];
-
 const faqs = [
   {
     q: "What is PUMP?",
@@ -25,7 +18,7 @@ const faqs = [
   },
   {
     q: "Who runs it?",
-    a: "The landlords, meaning the largest holders. The pause switch and admin controls will be multisigs held by landlords, and every action is posted publicly. The endowment has no connection to the coin's creators.",
+    a: "No one, by design. After a public testing period, the key that can change the contract is destroyed, so no one can ever change its rules or move its $PENIS, including us. Every action is posted publicly, and the endowment has no connection to the coin's creators.",
   },
   {
     q: "Can I check the code?",
@@ -33,7 +26,7 @@ const faqs = [
   },
   {
     q: "When does it open?",
-    a: "Once the landlords agree on the final rules. It will open to the founding landlords first, then to everyone.",
+    a: "It switches on once committed landlords hold 30% of all $PENIS. It opens to the founding landlords first, then to everyone.",
   },
 ];
 
@@ -49,8 +42,8 @@ export default function Home() {
             <em>Firm</em> commitments.
           </h1>
           <p className="lede">
-            The $PENIS Endowment holds $PENIS forever and spends only the PUMP it earns, on buybacks, liquidity and
-            growth. It is the one holder that can never pull out.
+            The $PENIS Endowment turns every PUMP it earns into more $PENIS, and holds it forever. It is the one
+            holder that can never pull out.
           </p>
           <div className="actions">
             <Link href="#how" className="button button-primary">
@@ -91,45 +84,25 @@ export default function Home() {
         <section className="row">
           <h2 className="row-label">How it spends</h2>
           <div className="row-body">
-            <h3 className="statement">It reads the market, then spends.</h3>
+            <h3 className="statement">Every PUMP buys $PENIS.</h3>
             <p>
-              First it accumulates. Once it holds a fifth of all $PENIS, it becomes a thermostat: each day it reads how
-              deep the trading pool is and how much PUMP it earned, which tracks volume, and splits the day&rsquo;s
-              income by fixed, public rules.
+              The endowment buys in small amounts on a randomized schedule, with whatever PUMP it holds. Nothing is
+              sold, and nothing is spent on anything else.
             </p>
             <div className="figures">
               <div className="figure">
                 <span className="figure-value">200,000,000</span>
-                <span className="figure-label">$PENIS to accumulate first</span>
+                <span className="figure-label">$PENIS from landlord contributions</span>
               </div>
               <div className="figure">
                 <span className="figure-value">20%</span>
                 <span className="figure-label">of all $PENIS, held forever</span>
               </div>
             </div>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Mode</th>
-                  <th className="num">Buyback</th>
-                  <th className="num">Liquidity</th>
-                  <th className="num">Marketing</th>
-                </tr>
-              </thead>
-              <tbody>
-                {splits.map((s) => (
-                  <tr key={s.condition} className={s.current ? "current" : undefined}>
-                    <td>
-                      {s.condition}
-                      {s.current && <span className="tag">first</span>}
-                    </td>
-                    <td className="num">{s.buyback}</td>
-                    <td className="num">{s.liquidity}</td>
-                    <td className="num">{s.marketing}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <p>
+              At 200 million, landlord contributions close. The endowment&rsquo;s own dividends keep working forever:
+              part buys more $PENIS, and part becomes permanent liquidity that can never be withdrawn.
+            </p>
           </div>
         </section>
 
@@ -149,6 +122,10 @@ export default function Home() {
               <li>
                 <strong>The pause is limited</strong>
                 <span>It can&rsquo;t move funds, and it lifts on its own after seven days.</span>
+              </li>
+              <li>
+                <strong>Locked forever</strong>
+                <span>After a public testing period, the upgrade key is destroyed. No one can change the rules.</span>
               </li>
               <li>
                 <strong>Everything is public</strong>
@@ -213,7 +190,7 @@ export default function Home() {
           <div className="row-body">
             <h3 className="statement">Built, tested, and ready for the landlords.</h3>
             <p>
-              The contract is written and tested. Delegation opens once the landlords agree on the final rules,
+              The contract is written and tested. It switches on once committed landlords hold 30% of all $PENIS,
               starting with the founding landlords. The leaderboard and the full ledger go live the same
               day. Follow <a href={links.x}>@PenisEndowment</a> for the announcement.
             </p>
