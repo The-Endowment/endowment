@@ -15,19 +15,66 @@ pub const AUTHORITY_SEED: &[u8] = b"authority";
 #[constant]
 pub const LANDLORD_SEED: &[u8] = b"landlord";
 
-/// A guardian pause lifts on its own after this long.
+/// Roster PDA seeds: [ROSTER_SEED, config]. Every registered landlord, in the
+/// order the commitment count reads them.
+#[constant]
+pub const ROSTER_SEED: &[u8] = b"roster";
+
+/// Account layout versions, for future migrations.
+pub const CONFIG_VERSION: u8 = 1;
+pub const LANDLORD_VERSION: u8 = 1;
+pub const ROSTER_VERSION: u8 = 1;
+
+/// A guardian pause lifts on its own after this long, and a new pause can only
+/// start this long after the last one ended. The guardian can therefore stop an
+/// endowment at most half the time, and never for good.
 pub const MAX_PAUSE_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const PAUSE_COOLDOWN_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// Parameter changes wait this long between proposal and effect.
+pub const PARAM_TIMELOCK_SECONDS: i64 = 72 * 60 * 60;
 
 /// Hard bounds on how much slippage one buyback may cause.
 pub const MIN_PRICE_IMPACT_BPS: u16 = 10;
 pub const MAX_PRICE_IMPACT_BPS: u16 = 300;
 
+/// Buybacks fail closed if the pool's fee (trade + creator) or either mint's
+/// transfer fee (current or scheduled) exceeds these.
+pub const MAX_POOL_FEE_BPS: u64 = 200;
+pub const MAX_TRANSFER_FEE_BPS: u64 = 500;
+
+/// The buyback price floor is measured against the pool's time-weighted average
+/// price over at least this window, read from Raydium's observation account.
+pub const TWAP_WINDOW_SECONDS: u64 = 10 * 60;
+
+/// A buyback is refused if the coin's spot price is this much above its TWAP.
+pub const MAX_SPOT_ABOVE_TWAP_BPS: u64 = 300;
+
 /// Landlord sweeps switch on at `activate_bps` of the coin's supply committed
 /// and off below `deactivate_bps`. Both are bounded by this.
 pub const MAX_ACTIVATION_BPS: u16 = 5_000;
 
-/// A commitment count can start at most once per this many seconds.
+/// The admin can only renounce once the thresholds are at least this, so sweeps
+/// can never be frozen on.
+pub const MIN_RENOUNCE_ACTIVATE_BPS: u16 = 1_000;
+pub const MIN_RENOUNCE_DEACTIVATE_BPS: u16 = 500;
+
+/// A landlord must hold at least `min_stake_bps` of the coin's supply to register
+/// and to be counted. Bounded by this.
+pub const MAX_MIN_STAKE_BPS: u16 = 500;
+
+/// A landlord counts toward activation only while its dividend account still
+/// delegates at least this much to the endowment (the website approves u64::MAX).
+pub const MIN_DELEGATION: u64 = u64::MAX / 2;
+
+/// The commitment count runs at most once per this many seconds.
 pub const COUNT_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// The commitment count reads every landlord in one instruction, two accounts
+/// each (coin + dividend). With the count's five fixed accounts and a compute
+/// budget instruction, this keeps the transaction within Solana's 64-account
+/// lock limit (it needs an address lookup table to fit the 1,232-byte size limit).
+pub const MAX_LANDLORDS: usize = 28;
 
 /// Minimum time between buybacks, bounds.
 pub const MIN_BUY_INTERVAL_BOUNDS: (i64, i64) = (60, 24 * 60 * 60);

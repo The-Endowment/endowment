@@ -4,10 +4,10 @@ use crate::{
     constants::*,
     error::EndowmentError,
     events::{
-        ActivationChanged, AdminAccepted, AdminProposed, AdminRenounced, BuyParamsChanged, BuybackLimitsChanged,
-        ContributionsClosed, GuardianChanged,
+        AdminAccepted, AdminProposed, AdminRenounced, GuardianChanged, ParamsApplied, ParamsCancelled,
+        ParamsProposed, Retired,
     },
-    state::{validate_activation, validate_buy_params, validate_limits, Config},
+    state::{Config, Params, PendingParams},
 };
 
 #[derive(Accounts)]
@@ -18,6 +18,17 @@ pub struct AdminOnly<'info> {
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
         has_one = admin @ EndowmentError::NotAdmin,
+    )]
+    pub config: Account<'info, Config>,
+}
+
+/// Permissionless: applies a proposed parameter change once its timelock ends.
+#[derive(Accounts)]
+pub struct ApplyParams<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
+        bump = config.bump,
     )]
     pub config: Account<'info, Config>,
 }
@@ -35,82 +46,82 @@ pub struct AcceptAdmin<'info> {
     pub config: Account<'info, Config>,
 }
 
-/// Adjusts buyback limits within the hard-coded bounds.
-pub fn handle_set_buyback_limits(
-    ctx: Context<AdminOnly>,
-    max_buy_per_tx: u64,
-    max_buy_per_day: u64,
-    max_price_impact_bps: u16,
-) -> Result<()> {
-    validate_limits(max_buy_per_tx, max_buy_per_day, max_price_impact_bps)?;
+/// Proposes a full new parameter set, within the hard-coded bounds. It takes
+/// effect no sooner than PARAM_TIMELOCK_SECONDS later, announced by an event.
+/// A new proposal replaces a pending one and restarts the clock.
+pub fn handle_propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    config.max_buy_per_tx = max_buy_per_tx;
-    config.max_buy_per_day = max_buy_per_day;
-    config.max_price_impact_bps = max_price_impact_bps;
-    emit!(BuybackLimitsChanged { config: config_key, max_buy_per_tx, max_buy_per_day, max_price_impact_bps });
+    params.validate(config.donation_bps)?;
+    let effective_at = now + PARAM_TIMELOCK_SECONDS;
+    config.pending = PendingParams { params, effective_at };
+    emit!(ParamsProposed { config: config_key, params, effective_at });
     Ok(())
 }
 
-/// Adjusts the post-close buy/liquidity split, buyback pacing and the crank
-/// tip, within the hard-coded bounds. The donation rate is locked at creation.
-pub fn handle_set_buy_params(
-    ctx: Context<AdminOnly>,
-    buy_bps: u16,
-    min_buy_interval_secs: i64,
-    tip_bps: u16,
-) -> Result<()> {
-    validate_buy_params(buy_bps, min_buy_interval_secs, tip_bps)?;
+pub fn handle_cancel_params(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
-    let config = &mut ctx.accounts.config;
-    require!(
-        tip_bps + config.donation_bps <= MAX_TIP_PLUS_DONATION_BPS,
-        EndowmentError::InvalidBuyParams
-    );
-    config.buy_bps = buy_bps;
-    config.min_buy_interval_secs = min_buy_interval_secs;
-    config.tip_bps = tip_bps;
-    emit!(BuyParamsChanged { config: config_key, buy_bps, min_buy_interval_secs, tip_bps });
+    require!(ctx.accounts.config.pending.effective_at != 0, EndowmentError::NoPendingParams);
+    ctx.accounts.config.pending = PendingParams::default();
+    emit!(ParamsCancelled { config: config_key });
     Ok(())
 }
 
-/// Sets the activation thresholds and re-applies them to the last count, so
-/// setting `activate_bps` to 0 turns sweeps on at once (for a founders-only test).
-pub fn handle_set_activation(ctx: Context<AdminOnly>, activate_bps: u16, deactivate_bps: u16) -> Result<()> {
-    validate_activation(activate_bps, deactivate_bps)?;
+pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    config.activate_bps = activate_bps;
-    config.deactivate_bps = deactivate_bps;
-    let last = config.count.last_committed_bps;
+    let pending = config.pending;
+    require!(pending.effective_at != 0, EndowmentError::NoPendingParams);
+    require!(now >= pending.effective_at, EndowmentError::TimelockNotElapsed);
+    config.params = pending.params;
+    config.pending = PendingParams::default();
+    // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
+    config.buy_allowance = config.buy_allowance.min(config.params.max_buy_per_tx);
+    // New thresholds apply to the last count at once.
+    let last = config.last_count_bps;
     config.apply_committed_bps(last);
-    emit!(ActivationChanged { config: config_key, activate_bps, deactivate_bps, active: config.active });
+    emit!(ParamsApplied { config: config_key, params: config.params, active: config.active });
     Ok(())
 }
 
-/// One-way: closes landlord contributions early. It can never move funds.
+/// One-way: stops landlord sweeps and new registrations for good. It never moves
+/// funds and doesn't change how buybacks spend what the vault holds.
 pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    if !config.closed {
-        config.closed = true;
-        emit!(ContributionsClosed { config: config_key, by_cap: false, coin_held: 0 });
+    if !config.retired {
+        config.retired = true;
+        emit!(Retired { config: config_key });
     }
     Ok(())
 }
 
-/// One-way: gives up the admin role for good, freezing every bounded
-/// parameter as it stands.
+/// One-way: gives up the admin role for good, freezing every parameter as it
+/// stands. It also clears the guardian and any pending change, so no key is left
+/// that can pause or reconfigure the endowment. It requires production
+/// activation thresholds, so sweeps can't be frozen on.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
+    require!(
+        config.retired
+            || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS
+                && config.params.deactivate_bps >= MIN_RENOUNCE_DEACTIVATE_BPS),
+        EndowmentError::RenounceThresholds
+    );
     config.admin = Pubkey::default();
     config.pending_admin = Pubkey::default();
+    config.guardian = Pubkey::default();
+    config.pending = PendingParams::default();
     emit!(AdminRenounced { config: config_key });
+    emit!(GuardianChanged { config: config_key, guardian: Pubkey::default() });
     Ok(())
 }
 
-/// Immediate: the guardian can only pause, so rotating it is low risk.
+/// Immediate: the guardian can only pause (within its limits), so rotating it
+/// is low risk. `Pubkey::default()` removes it.
 pub fn handle_set_guardian(ctx: Context<AdminOnly>, new_guardian: Pubkey) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     ctx.accounts.config.guardian = new_guardian;

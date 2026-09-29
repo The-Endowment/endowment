@@ -8,39 +8,36 @@ use anchor_lang::{
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
     token::Token,
-    token_2022::{
-        spl_token_2022::{
-            extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
-            state::Mint as MintState,
-        },
-        Token2022,
-    },
+    token_2022::Token2022,
     token_interface::{Mint, TokenAccount, TokenInterface},
 };
 
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{Bought, ContributionsClosed},
-    math::{buy_amount, lp_tokens_for, min_acceptable_out, roll_day, split_buy},
+    events::{Bought, MilestoneReached},
+    math::{impact_cap, lp_tokens_for, min_acceptable_out, refill, spendable, split_buy, spot_price_x32, zap_swap_amount},
     raydium::{
-        pool_fee_bps, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR,
+        pool_fee_bps, twap_price_x32, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR,
         SWAP_BASE_INPUT_DISCRIMINATOR,
     },
     state::Config,
-    transfer::transfer_checked_with_hook,
+    transfer::{capped_transfer_fee_bps, hook_enabled, read_token_account, transfer_checked_with_hook},
 };
 
 /// Permissionless: anyone may crank a buyback for an endowment, and is paid a
-/// small tip in the dividend asset for it. The contract decides the size. The
-/// dividend can only leave the dividend vault through the endowment's own
+/// small tip in the dividend asset for it. The contract decides the size, and
+/// measures the price against the pool's time-weighted average, so nothing the
+/// caller does in the same transaction can worsen the fill.
+///
+/// The dividend can only leave the dividend vault through the endowment's own
 /// Raydium pool, as the capped tip, or as the donation locked in at creation;
-/// the coin can only land in the endowment's coin vault. After contributions
-/// close, part of each buyback becomes liquidity whose LP tokens land in an
+/// the coin can only land in the endowment's coin vault. After the milestone,
+/// part of each buyback becomes liquidity whose LP tokens land in an
 /// authority-owned account that nothing can withdraw from.
 ///
-/// Remaining accounts: dividend transfer-hook extras for the tip and donation,
-/// only if the dividend mint's hook is ever switched on (see `transfer.rs`).
+/// Remaining accounts: dividend transfer-hook extras for the tip and donation.
+/// (Unused today: buybacks refuse to run while either mint's hook is set.)
 #[derive(Accounts)]
 pub struct Buyback<'info> {
     #[account(
@@ -101,15 +98,15 @@ pub struct Buyback<'info> {
     /// The pool's coin vault; checked against the pool in the handler.
     #[account(mut)]
     pub pool_coin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the pool's observation account; checked in the handler.
+    /// CHECK: the pool's observation account (its price history); checked and read in the handler.
     #[account(mut, owner = CPMM_PROGRAM_ID)]
     pub observation_state: UncheckedAccount<'info>,
     /// CHECK: the pool's LP mint; checked against the pool in the handler.
     #[account(mut)]
     pub lp_mint: UncheckedAccount<'info>,
-    /// CHECK: the authority's LP token account (its associated token account
-    /// for the LP mint); checked in the handler. Only used after contributions
-    /// close. No instruction can move tokens out of it.
+    /// CHECK: the authority's LP token account (its associated token account for
+    /// the LP mint); checked in the handler. Must exist once the milestone is
+    /// reached. No instruction can move tokens out of it.
     #[account(mut)]
     pub lp_vault: UncheckedAccount<'info>,
     /// CHECK: the flagship endowment's dividend vault. Only touched, and then
@@ -125,177 +122,154 @@ pub struct Buyback<'info> {
     pub token_2022_program: Program<'info, Token2022>,
 }
 
+/// Everything the buy is priced and sized from, read before any CPI.
+struct Plan {
+    dividend_index: usize,
+    coin_index: usize,
+    twap_price_x32: u128,
+    pool_fee: u64,
+    dividend_fee: u64,
+    coin_fee: u64,
+    allowance: u64,
+    /// Dividend to swap for the coin (the buy share plus the liquidity share's swap half).
+    swap_amount: u64,
+    /// Of `swap_amount`, the part swapped for the liquidity deposit.
+    lp_swap: u64,
+    /// Dividend to deposit as liquidity alongside the coin from `lp_swap`.
+    lp_deposit: u64,
+}
+
 pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
-    let accounts = &ctx.accounts;
-    let config = &accounts.config;
-    require!(!config.is_paused(now), EndowmentError::Paused);
-    require!(
-        config.last_buy_at == 0 || now.saturating_sub(config.last_buy_at) >= config.min_buy_interval_secs,
-        EndowmentError::BuyTooSoon
-    );
+    let plan = plan_buy(&ctx.accounts, clock.epoch, now)?;
 
-    // The contract sizes the buy, leaving room for the tip and donation.
-    let (day_start, bought_today) = roll_day(config.day_start, config.bought_today, now);
-    let left_today = config.max_buy_per_day.saturating_sub(bought_today);
-    let extra_bps = config.tip_bps + config.donation_bps;
-    let amount_in = buy_amount(accounts.dividend_vault.amount, extra_bps, config.max_buy_per_tx, left_today);
-    require!(amount_in > 0, EndowmentError::NothingToBuy);
-    let bought_today = bought_today.checked_add(amount_in).ok_or(EndowmentError::Overflow)?;
+    let a = &ctx.accounts;
+    let coin_before = a.coin_vault.amount;
+    let dividend_before = a.dividend_vault.amount;
+    let lp_before = read_token_account(&a.lp_vault)?.map(|t| t.amount).unwrap_or(0);
 
-    // Every Raydium account must belong to the configured pool, in whichever
-    // order the pool holds the two mints.
-    let pool = PoolView::parse(&accounts.pool_state.try_borrow_data()?)?;
-    let dividend_index = pool.index_of(&config.dividend_mint)?;
-    let coin_index = pool.index_of(&config.coin_mint)?;
-    require_keys_eq!(accounts.amm_config.key(), pool.amm_config, EndowmentError::WrongPool);
-    require_keys_eq!(accounts.observation_state.key(), pool.observation, EndowmentError::WrongPool);
-    require_keys_eq!(accounts.pool_dividend_vault.key(), pool.vaults[dividend_index], EndowmentError::WrongPool);
-    require_keys_eq!(accounts.pool_coin_vault.key(), pool.vaults[coin_index], EndowmentError::WrongPool);
-
-    // Contributions close as soon as the vault reaches the cap.
-    let mut closing_now = false;
-    let closed = config.closed || {
-        closing_now = accounts.coin_vault.amount >= config.contribution_cap;
-        closing_now
-    };
-    let (swap_amount, deposit_dividend, lp_swap) =
-        if closed { split_buy(amount_in, config.buy_bps) } else { (amount_in, 0, 0) };
-
-    let transfer_fee = transfer_fee_bps(&accounts.coin_mint.to_account_info(), clock.epoch)?;
-    let coin_before = accounts.coin_vault.amount;
-    let dividend_before = accounts.dividend_vault.amount;
-
-    // 1. Swap the dividend for the coin, protected by the price floor.
-    let mut received = 0;
-    let mut floor = 0;
-    if swap_amount > 0 {
-        let reserve_in = accounts.pool_dividend_vault.amount.saturating_sub(pool.reserved_fees[dividend_index]);
-        let reserve_out = accounts.pool_coin_vault.amount.saturating_sub(pool.reserved_fees[coin_index]);
-        let pool_fee = pool_fee_bps(&accounts.amm_config.try_borrow_data()?, pool.creator_fee_enabled)?;
-        floor = min_acceptable_out(
-            swap_amount,
-            reserve_in,
-            reserve_out,
-            pool_fee,
-            transfer_fee,
-            config.max_price_impact_bps as u64,
-        )
-        .ok_or(EndowmentError::PriceImpactTooHigh)?;
-
-        swap_base_input(&ctx, &config_key, swap_amount, floor.max(min_out))?;
-        ctx.accounts.coin_vault.reload()?;
-        received = ctx.accounts.coin_vault.amount.saturating_sub(coin_before);
-        require!(received >= floor, EndowmentError::PriceImpactTooHigh);
-        require!(received >= min_out, EndowmentError::SlippageExceeded);
-    }
-
-    // 2. After close: deposit the liquidity share into the pool, locking the LP tokens.
-    let mut lp_tokens = 0;
-    if deposit_dividend > 0 && received > 0 {
-        let coin_budget = (received as u128 * lp_swap as u128 / swap_amount as u128) as u64;
-        lp_tokens = deposit_liquidity(
-            &ctx,
-            &config_key,
-            &pool,
-            dividend_index,
-            coin_index,
-            deposit_dividend,
-            coin_budget,
-            transfer_fee,
-        )?;
-    }
-
-    // The endowment's coin never shrinks.
+    // 1. Swap the dividend for the coin, protected by the TWAP floor.
+    let floor = min_acceptable_out(
+        plan.swap_amount,
+        plan.twap_price_x32,
+        plan.pool_fee,
+        plan.dividend_fee,
+        plan.coin_fee,
+        a.config.params.max_price_impact_bps as u64,
+    )
+    .ok_or(EndowmentError::PriceImpactTooHigh)?;
+    require!(floor > 0, EndowmentError::PriceImpactTooHigh);
+    swap_base_input(&ctx, &config_key, plan.swap_amount, floor.max(min_out))?;
     ctx.accounts.coin_vault.reload()?;
-    let coin_after = ctx.accounts.coin_vault.amount;
-    require!(coin_after >= coin_before, EndowmentError::VaultWouldShrink);
+    let received = ctx.accounts.coin_vault.amount.saturating_sub(coin_before);
+    require!(received >= floor, EndowmentError::PriceImpactTooHigh);
+    require!(received >= min_out, EndowmentError::SlippageExceeded);
 
-    let bump = [ctx.accounts.config.authority_bump];
+    // 2. After the milestone: deposit the liquidity share, locking the LP tokens.
+    if plan.lp_deposit > 0 && plan.lp_swap > 0 {
+        let coin_budget = (received as u128 * plan.lp_swap as u128 / plan.swap_amount as u128) as u64;
+        deposit_liquidity(&ctx, &config_key, &plan, coin_budget)?;
+    }
+
+    // 3. Nothing Raydium did may shrink the coin vault or the LP vault, take
+    //    more dividend than planned, or leave a delegate or close authority behind.
+    ctx.accounts.coin_vault.reload()?;
+    ctx.accounts.dividend_vault.reload()?;
+    let a = &ctx.accounts;
+    let coin_after = a.coin_vault.amount;
+    let dividend_after = a.dividend_vault.amount;
+    require!(coin_after >= coin_before, EndowmentError::VaultWouldShrink);
+    require!(dividend_after <= dividend_before, EndowmentError::CpiInvariant);
+    let spent = dividend_before - dividend_after;
+    require!(spent <= plan.swap_amount + plan.lp_deposit, EndowmentError::CpiInvariant);
+    let lp_view = read_token_account(&a.lp_vault)?;
+    let lp_after = lp_view.as_ref().map(|t| t.amount).unwrap_or(0);
+    require!(lp_after >= lp_before, EndowmentError::CpiInvariant);
+    for vault in [a.dividend_vault.to_account_info(), a.coin_vault.to_account_info()] {
+        let view = read_token_account(&vault)?.ok_or(EndowmentError::CpiInvariant)?;
+        require!(view.delegate.is_none() && view.close_authority.is_none(), EndowmentError::CpiInvariant);
+    }
+    if let Some(view) = lp_view {
+        require!(view.delegate.is_none() && view.close_authority.is_none(), EndowmentError::CpiInvariant);
+    }
+
+    let bump = [a.config.authority_bump];
     let seeds = Config::authority_seeds(&config_key, &bump);
 
-    // 3. Pay the caller's tip.
-    let tip = (amount_in as u128 * ctx.accounts.config.tip_bps as u128 / 10_000) as u64;
+    // 4. Tip the caller, on what was actually spent.
+    let tip = (spent as u128 * a.config.params.tip_bps as u128 / 10_000) as u64;
     if tip > 0 {
         transfer_checked_with_hook(
-            &ctx.accounts.dividend_token_program.to_account_info(),
-            &ctx.accounts.dividend_vault.to_account_info(),
-            &ctx.accounts.dividend_mint.to_account_info(),
-            &ctx.accounts.caller_dividend_account.to_account_info(),
-            &ctx.accounts.authority.to_account_info(),
+            &a.dividend_token_program.to_account_info(),
+            &a.dividend_vault.to_account_info(),
+            &a.dividend_mint.to_account_info(),
+            &a.caller_dividend_account.to_account_info(),
+            &a.authority.to_account_info(),
             ctx.remaining_accounts,
             tip,
-            ctx.accounts.dividend_mint.decimals,
+            a.dividend_mint.decimals,
             &[&seeds],
         )?;
     }
 
-    // 4. Send the donation, if this endowment chose one, to the flagship's dividend vault.
-    let donation = (amount_in as u128 * ctx.accounts.config.donation_bps as u128 / 10_000) as u64;
+    // 5. Send the donation, if this endowment chose one, to the flagship's dividend vault.
+    let donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
     if donation > 0 {
         let (flagship_authority, _) =
             Pubkey::find_program_address(&[AUTHORITY_SEED, FLAGSHIP_CONFIG.as_ref()], ctx.program_id);
         let expected = get_associated_token_address_with_program_id(
             &flagship_authority,
-            &ctx.accounts.dividend_mint.key(),
-            &ctx.accounts.dividend_token_program.key(),
+            &a.dividend_mint.key(),
+            &a.dividend_token_program.key(),
         );
-        require_keys_eq!(
-            ctx.accounts.flagship_dividend_vault.key(),
-            expected,
-            EndowmentError::WrongFlagshipVault
-        );
+        require_keys_eq!(a.flagship_dividend_vault.key(), expected, EndowmentError::WrongFlagshipVault);
         transfer_checked_with_hook(
-            &ctx.accounts.dividend_token_program.to_account_info(),
-            &ctx.accounts.dividend_vault.to_account_info(),
-            &ctx.accounts.dividend_mint.to_account_info(),
-            &ctx.accounts.flagship_dividend_vault.to_account_info(),
-            &ctx.accounts.authority.to_account_info(),
+            &a.dividend_token_program.to_account_info(),
+            &a.dividend_vault.to_account_info(),
+            &a.dividend_mint.to_account_info(),
+            &a.flagship_dividend_vault.to_account_info(),
+            &a.authority.to_account_info(),
             ctx.remaining_accounts,
             donation,
-            ctx.accounts.dividend_mint.decimals,
+            a.dividend_mint.decimals,
             &[&seeds],
         )?;
     }
 
-    ctx.accounts.dividend_vault.reload()?;
-    let dividend_spent = dividend_before
-        .saturating_sub(ctx.accounts.dividend_vault.amount)
-        .saturating_sub(tip)
-        .saturating_sub(donation);
-    let liquidity_dividend = dividend_spent.saturating_sub(swap_amount);
-
+    // 6. Accounting.
+    let liquidity_dividend = spent.saturating_sub(plan.swap_amount);
+    let liquidity_coin = (coin_before + received).saturating_sub(coin_after);
+    let lp_tokens = lp_after - lp_before;
     let config = &mut ctx.accounts.config;
-    if closing_now && !config.closed {
-        config.closed = true;
-        emit!(ContributionsClosed { config: config_key, by_cap: true, coin_held: coin_before });
-    }
-    if !config.closed && coin_after >= config.contribution_cap {
-        config.closed = true;
-        emit!(ContributionsClosed { config: config_key, by_cap: true, coin_held: coin_after });
-    }
-    config.day_start = day_start;
-    config.bought_today = bought_today;
+    config.buy_allowance = plan.allowance.saturating_sub(spent);
+    config.allowance_updated_at = now;
     config.last_buy_at = now;
-    config.total_dividend_spent =
-        config.total_dividend_spent.checked_add(dividend_spent).ok_or(EndowmentError::Overflow)?;
+    config.total_dividend_spent = config.total_dividend_spent.checked_add(spent).ok_or(EndowmentError::Overflow)?;
     config.total_coin_bought = config.total_coin_bought.checked_add(received).ok_or(EndowmentError::Overflow)?;
+    config.total_coin_retained =
+        config.total_coin_retained.checked_add(coin_after - coin_before).ok_or(EndowmentError::Overflow)?;
+    config.total_liquidity_dividend =
+        config.total_liquidity_dividend.checked_add(liquidity_dividend).ok_or(EndowmentError::Overflow)?;
+    config.total_liquidity_coin =
+        config.total_liquidity_coin.checked_add(liquidity_coin).ok_or(EndowmentError::Overflow)?;
+    config.total_lp_tokens = config.total_lp_tokens.checked_add(lp_tokens).ok_or(EndowmentError::Overflow)?;
     config.total_tips = config.total_tips.checked_add(tip).ok_or(EndowmentError::Overflow)?;
     config.total_donated = config.total_donated.checked_add(donation).ok_or(EndowmentError::Overflow)?;
-    config.total_liquidity_dividend = config
-        .total_liquidity_dividend
-        .checked_add(liquidity_dividend)
-        .ok_or(EndowmentError::Overflow)?;
-    config.total_lp_tokens = config.total_lp_tokens.checked_add(lp_tokens).ok_or(EndowmentError::Overflow)?;
+    if !config.milestone_reached && config.total_coin_bought >= config.contribution_cap {
+        config.milestone_reached = true;
+        emit!(MilestoneReached { config: config_key, total_coin_bought: config.total_coin_bought });
+    }
 
     emit!(Bought {
         config: config_key,
-        dividend_in: amount_in,
+        dividend_spent: spent,
         coin_out: received,
         min_acceptable: floor,
+        twap_price_x32: plan.twap_price_x32,
         liquidity_dividend,
+        liquidity_coin,
         lp_tokens,
         tip,
         donation,
@@ -305,14 +279,101 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     Ok(())
 }
 
-/// A Token-2022 mint's transfer fee for this epoch, in basis points (0 if none,
-/// including for original SPL Token mints).
-fn transfer_fee_bps(mint: &AccountInfo, epoch: u64) -> Result<u64> {
-    let data = mint.try_borrow_data()?;
-    let state = StateWithExtensions::<MintState>::unpack(&data)?;
-    Ok(match state.get_extension::<TransferFeeConfig>() {
-        Ok(config) => u16::from(config.get_epoch_fee(epoch).transfer_fee_basis_points) as u64,
-        Err(_) => 0,
+/// Every check and number the buy needs, before touching anything.
+fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
+    let config = &a.config;
+    let params = &config.params;
+    require!(!config.is_paused(now), EndowmentError::Paused);
+    require!(
+        config.last_buy_at == 0 || now.saturating_sub(config.last_buy_at) >= params.min_buy_interval_secs,
+        EndowmentError::BuyTooSoon
+    );
+    // Raydium can't pass transfer-hook accounts, so a hooked mint can't trade.
+    require!(
+        !hook_enabled(&a.dividend_mint.to_account_info())? && !hook_enabled(&a.coin_mint.to_account_info())?,
+        EndowmentError::TransferHookEnabled
+    );
+
+    // Every Raydium account must belong to the configured pool, in whichever
+    // order the pool holds the two mints.
+    let pool = PoolView::parse(&a.pool_state.try_borrow_data()?)?;
+    let dividend_index = pool.index_of(&config.dividend_mint)?;
+    let coin_index = pool.index_of(&config.coin_mint)?;
+    require_keys_eq!(a.amm_config.key(), pool.amm_config, EndowmentError::WrongPool);
+    require_keys_eq!(a.observation_state.key(), pool.observation, EndowmentError::WrongPool);
+    require_keys_eq!(a.pool_dividend_vault.key(), pool.vaults[dividend_index], EndowmentError::WrongPool);
+    require_keys_eq!(a.pool_coin_vault.key(), pool.vaults[coin_index], EndowmentError::WrongPool);
+    require_keys_eq!(a.lp_mint.key(), pool.lp_mint, EndowmentError::WrongPool);
+    let expected_lp_vault =
+        get_associated_token_address_with_program_id(&a.authority.key(), &pool.lp_mint, &a.lp_token_program.key());
+    require_keys_eq!(a.lp_vault.key(), expected_lp_vault, EndowmentError::WrongPool);
+    require!(pool.swaps_enabled(), EndowmentError::PoolSwapDisabled);
+
+    // Fees, all capped: a raised fee halts buybacks instead of lowering the floor.
+    let pool_fee = pool_fee_bps(&a.amm_config.try_borrow_data()?, pool.creator_fee_enabled)?;
+    require!(pool_fee <= MAX_POOL_FEE_BPS, EndowmentError::FeeTooHigh);
+    let dividend_fee = capped_transfer_fee_bps(&a.dividend_mint.to_account_info(), epoch)?;
+    let coin_fee = capped_transfer_fee_bps(&a.coin_mint.to_account_info(), epoch)?;
+
+    // Price: the TWAP is the reference; the spot price may not be much worse.
+    let reserve_dividend = pool.reserve(dividend_index, a.pool_dividend_vault.amount)?;
+    let reserve_coin = pool.reserve(coin_index, a.pool_coin_vault.amount)?;
+    let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
+    let twap_price_x32 =
+        twap_price_x32(&a.observation_state.try_borrow_data()?, &a.pool_state.key(), dividend_index, spot, now as u64)?;
+    // Fewer coin per dividend at spot than at the TWAP means the coin got pricier.
+    require!(
+        spot * 10_000 >= twap_price_x32 * (10_000 - MAX_SPOT_ABOVE_TWAP_BPS as u128),
+        EndowmentError::PriceAboveTwap
+    );
+
+    // Size: what the vault can spend, capped per transaction, by the paced
+    // allowance, and so this trade's own impact stays within half the budget.
+    let allowance = refill(
+        config.buy_allowance,
+        config.allowance_updated_at,
+        now,
+        params.max_buy_per_day,
+        params.max_buy_per_tx,
+    );
+    let extra_bps = params.tip_bps + config.donation_bps;
+    let amount = spendable(a.dividend_vault.amount, extra_bps)
+        .min(params.max_buy_per_tx)
+        .min(allowance)
+        .min(impact_cap(reserve_dividend, params.max_price_impact_bps));
+
+    // After the milestone, split into buying and liquidity (liquidity waits while
+    // the pool has deposits disabled).
+    let (to_buy, to_liquidity) = if config.milestone_reached {
+        let (to_buy, to_liquidity) = split_buy(amount, params.buy_bps);
+        (to_buy, if pool.deposits_enabled() { to_liquidity } else { 0 })
+    } else {
+        (amount, 0)
+    };
+    let lp_swap = if to_liquidity > 0 {
+        zap_swap_amount(to_liquidity, reserve_dividend, pool_fee + dividend_fee + coin_fee)
+    } else {
+        0
+    };
+    let lp_deposit = to_liquidity - lp_swap;
+    let swap_amount = to_buy + lp_swap;
+    // Dust isn't worth a transaction; failing here leaves the buy interval unused.
+    require!(
+        swap_amount > 0 && swap_amount + lp_deposit >= params.min_buy_amount,
+        EndowmentError::NothingToBuy
+    );
+
+    Ok(Plan {
+        dividend_index,
+        coin_index,
+        twap_price_x32,
+        pool_fee,
+        dividend_fee,
+        coin_fee,
+        allowance,
+        swap_amount,
+        lp_swap,
+        lp_deposit,
     })
 }
 
@@ -370,56 +431,52 @@ fn swap_base_input(ctx: &Context<Buyback>, config_key: &Pubkey, amount_in: u64, 
     Ok(())
 }
 
-/// Deposits up to `dividend` and `coin_budget` into the pool at its current
-/// ratio, with the LP tokens landing in the authority's LP account. Returns the
-/// LP tokens minted (0 if the amounts are too small to mint any).
-#[allow(clippy::too_many_arguments)]
-fn deposit_liquidity(
-    ctx: &Context<Buyback>,
-    config_key: &Pubkey,
-    pool_before_swap: &PoolView,
-    dividend_index: usize,
-    coin_index: usize,
-    dividend: u64,
-    coin_budget: u64,
-    transfer_fee_bps: u64,
-) -> Result<u64> {
+/// Deposits the liquidity share into the pool at its current ratio, with the LP
+/// tokens landing in the authority's LP account. Skipped (the share stays in the
+/// vault for a later buy) if the pool's price after our swap has strayed from
+/// the TWAP by more than the impact budget plus the allowed drift, or if the
+/// amounts are too small to mint any LP.
+fn deposit_liquidity(ctx: &Context<Buyback>, config_key: &Pubkey, plan: &Plan, coin_budget: u64) -> Result<()> {
     let a = &ctx.accounts;
-    require_keys_eq!(a.lp_mint.key(), pool_before_swap.lp_mint, EndowmentError::WrongPool);
-    let expected_lp_vault =
-        get_associated_token_address_with_program_id(&a.authority.key(), &a.lp_mint.key(), &a.lp_token_program.key());
-    require_keys_eq!(a.lp_vault.key(), expected_lp_vault, EndowmentError::WrongPool);
+    require!(a.lp_vault.lamports() > 0, EndowmentError::WrongPool);
 
     // Reserves after our own swap, as Raydium will see them.
     let pool = PoolView::parse(&a.pool_state.try_borrow_data()?)?;
-    let reserve_dividend =
-        token_amount(&a.pool_dividend_vault.to_account_info())?.saturating_sub(pool.reserved_fees[dividend_index]);
-    let reserve_coin =
-        token_amount(&a.pool_coin_vault.to_account_info())?.saturating_sub(pool.reserved_fees[coin_index]);
-
-    // The coin may pay a transfer fee on the way in; budget for what arrives.
-    let coin_net = (coin_budget as u128 * (10_000 - transfer_fee_bps as u128) / 10_000) as u64;
-    let lp_amount = lp_tokens_for(dividend, coin_net.saturating_sub(1), reserve_dividend, reserve_coin, pool.lp_supply);
-    if lp_amount == 0 {
-        return Ok(0);
+    let reserve_dividend = pool.reserve(plan.dividend_index, token_amount(&a.pool_dividend_vault.to_account_info())?)?;
+    let reserve_coin = pool.reserve(plan.coin_index, token_amount(&a.pool_coin_vault.to_account_info())?)?;
+    let spot = spot_price_x32(reserve_dividend, reserve_coin).ok_or(EndowmentError::InvalidPoolData)?;
+    let band = a.config.params.max_price_impact_bps as u128 + MAX_SPOT_ABOVE_TWAP_BPS as u128;
+    let twap = plan.twap_price_x32;
+    if spot * 10_000 < twap * (10_000 - band) || spot * 10_000 > twap * (10_000 + band) {
+        return Ok(());
     }
 
-    let lp_before = token_amount(&a.lp_vault.to_account_info())?;
+    // Both sides may pay a transfer fee on the way in; budget for what arrives.
+    let net = |amount: u64, fee_bps: u64| (amount as u128 * (10_000 - fee_bps as u128) / 10_000) as u64;
+    let dividend_net = net(plan.lp_deposit, plan.dividend_fee).saturating_sub(1);
+    let coin_net = net(coin_budget, plan.coin_fee).saturating_sub(1);
+    let lp_amount = lp_tokens_for(dividend_net, coin_net, reserve_dividend, reserve_coin, pool.lp_supply);
+    if lp_amount == 0 {
+        return Ok(());
+    }
+
     let mut max = [0u64; 2];
-    max[dividend_index] = dividend;
-    max[coin_index] = coin_budget;
+    max[plan.dividend_index] = plan.lp_deposit;
+    max[plan.coin_index] = coin_budget;
     let mut data = DEPOSIT_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&lp_amount.to_le_bytes());
     data.extend_from_slice(&max[0].to_le_bytes());
     data.extend_from_slice(&max[1].to_le_bytes());
 
-    let our_account =
-        |i: usize| if i == dividend_index { a.dividend_vault.to_account_info() } else { a.coin_vault.to_account_info() };
-    let pool_vault = |i: usize| {
-        if i == dividend_index { a.pool_dividend_vault.to_account_info() } else { a.pool_coin_vault.to_account_info() }
+    let our_account = |i: usize| {
+        if i == plan.dividend_index { a.dividend_vault.to_account_info() } else { a.coin_vault.to_account_info() }
     };
-    let mint =
-        |i: usize| if i == dividend_index { a.dividend_mint.to_account_info() } else { a.coin_mint.to_account_info() };
+    let pool_vault = |i: usize| {
+        if i == plan.dividend_index { a.pool_dividend_vault.to_account_info() } else { a.pool_coin_vault.to_account_info() }
+    };
+    let mint = |i: usize| {
+        if i == plan.dividend_index { a.dividend_mint.to_account_info() } else { a.coin_mint.to_account_info() }
+    };
 
     // Account order from the IDL: owner, authority, pool_state, owner_lp_token,
     // token_0_account, token_1_account, token_0_vault, token_1_vault,
@@ -456,9 +513,7 @@ fn deposit_liquidity(
     let bump = [a.config.authority_bump];
     let seeds = Config::authority_seeds(config_key, &bump);
     invoke_signed(&ix, &all, &[&seeds])?;
-
-    let lp_after = token_amount(&a.lp_vault.to_account_info())?;
-    Ok(lp_after.saturating_sub(lp_before))
+    Ok(())
 }
 
 /// Balance of an SPL token account (legacy or Token-2022), from its raw data.

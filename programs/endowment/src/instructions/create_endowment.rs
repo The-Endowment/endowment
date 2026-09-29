@@ -9,7 +9,7 @@ use crate::{
     error::EndowmentError,
     events::EndowmentCreated,
     raydium::{PoolView, CPMM_PROGRAM_ID},
-    state::{validate_activation, validate_buy_params, validate_donation, validate_limits, CommitmentCount, Config, CreateParams},
+    state::{validate_donation, Config, CreateParams, PendingParams, Roster},
 };
 
 /// Permissionless: anyone can create an endowment for any coin that trades
@@ -35,13 +35,21 @@ pub struct CreateEndowment<'info> {
     /// CHECK: PDA that owns the instance's vaults and receives landlord delegations. Holds no data.
     #[account(seeds = [AUTHORITY_SEED, config.key().as_ref()], bump)]
     pub authority: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = creator,
+        space = 8 + Roster::INIT_SPACE,
+        seeds = [ROSTER_SEED, config.key().as_ref()],
+        bump
+    )]
+    pub roster: Box<Account<'info, Roster>>,
 
     #[account(mint::token_program = coin_token_program)]
     pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mint::token_program = dividend_token_program)]
     pub dividend_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Receives landlord sweeps and the endowment's own dividends.
+    /// Receives landlord sweeps.
     #[account(
         init_if_needed,
         payer = creator,
@@ -70,7 +78,8 @@ pub struct CreateEndowment<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle_create_endowment(ctx: Context<CreateEndowment>, params: CreateParams) -> Result<()> {
+pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreateParams) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let coin_mint = ctx.accounts.coin_mint.key();
     let dividend_mint = ctx.accounts.dividend_mint.key();
     require_keys_neq!(coin_mint, dividend_mint, EndowmentError::SameMint);
@@ -82,61 +91,60 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, params: CreatePara
     let dividend_index = pool.index_of(&dividend_mint)?;
     require!(coin_index != dividend_index, EndowmentError::WrongPool);
 
-    validate_limits(params.max_buy_per_tx, params.max_buy_per_day, params.max_price_impact_bps)?;
-    validate_activation(params.activate_bps, params.deactivate_bps)?;
-    validate_buy_params(params.buy_bps, params.min_buy_interval_secs, params.tip_bps)?;
-    validate_donation(params.donation_bps, &dividend_mint, &ctx.accounts.config.key())?;
-    require!(params.contribution_cap > 0, EndowmentError::InvalidContributionCap);
-    require!(
-        params.tip_bps + params.donation_bps <= MAX_TIP_PLUS_DONATION_BPS,
-        EndowmentError::InvalidBuyParams
-    );
+    create.params.validate(create.donation_bps)?;
+    validate_donation(create.donation_bps, &dividend_mint, &ctx.accounts.config.key())?;
+    require!(create.contribution_cap > 0, EndowmentError::InvalidContributionCap);
 
     let creator = ctx.accounts.creator.key();
     let or_creator = |key: Pubkey| if key == Pubkey::default() { creator } else { key };
+    let config_key = ctx.accounts.config.key();
+
+    ctx.accounts.roster.set_inner(Roster { version: ROSTER_VERSION, config: config_key, entries: Vec::new() });
 
     ctx.accounts.config.set_inner(Config {
+        version: CONFIG_VERSION,
         creator,
-        admin: or_creator(params.admin),
+        admin: or_creator(create.admin),
         pending_admin: Pubkey::default(),
-        guardian: or_creator(params.guardian),
+        guardian: or_creator(create.guardian),
         coin_mint,
         dividend_mint,
-        paused_until: 0,
-        total_swept: 0,
-        landlord_count: 0,
+        pool: ctx.accounts.pool_state.key(),
         bump: ctx.bumps.config,
         authority_bump: ctx.bumps.authority,
-        pool: ctx.accounts.pool_state.key(),
-        max_buy_per_tx: params.max_buy_per_tx,
-        max_buy_per_day: params.max_buy_per_day,
-        max_price_impact_bps: params.max_price_impact_bps,
-        day_start: 0,
-        bought_today: 0,
+        roster_bump: ctx.bumps.roster,
+        params: create.params,
+        pending: PendingParams::default(),
+        donation_bps: create.donation_bps,
+        contribution_cap: create.contribution_cap,
+        paused_until: 0,
+        retired: false,
+        milestone_reached: false,
+        active: false,
+        last_count_at: 0,
+        last_count_bps: 0,
+        last_committed: 0,
+        buy_allowance: create.params.max_buy_per_tx,
+        allowance_updated_at: now,
+        last_buy_at: 0,
+        total_swept: 0,
         total_dividend_spent: 0,
         total_coin_bought: 0,
-        min_buy_interval_secs: params.min_buy_interval_secs,
-        last_buy_at: 0,
-        tip_bps: params.tip_bps,
-        total_tips: 0,
-        donation_bps: params.donation_bps,
-        total_donated: 0,
-        activate_bps: params.activate_bps,
-        deactivate_bps: params.deactivate_bps,
-        active: false,
-        count: CommitmentCount::default(),
-        contribution_cap: params.contribution_cap,
-        closed: false,
-        buy_bps: params.buy_bps,
+        total_coin_retained: 0,
         total_liquidity_dividend: 0,
+        total_liquidity_coin: 0,
         total_lp_tokens: 0,
+        total_tips: 0,
+        total_donated: 0,
+        reserved: [0; 128],
     });
-    // An activation threshold of 0 means sweeps run from the start.
+    // An activation threshold of 0 means sweeps run from the start (for a
+    // founders-only test window; renouncing requires production thresholds).
     let config = &mut ctx.accounts.config;
     config.apply_committed_bps(0);
 
     emit!(EndowmentCreated {
-        config: config.key(),
+        config: config_key,
         creator,
         coin_mint,
         dividend_mint,

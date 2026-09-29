@@ -26,21 +26,31 @@ pub struct Unpause<'info> {
     pub config: Account<'info, Config>,
 }
 
-/// Blocks cranks for MAX_PAUSE_SECONDS. Calling it again restarts the clock,
-/// and every call is a public event.
+/// A circuit breaker, not a switch: a pause lasts MAX_PAUSE_SECONDS and can't be
+/// extended, and a new one can only start PAUSE_COOLDOWN_SECONDS after the last
+/// one ended. So the guardian can stop an endowment at most half the time, and
+/// never for good. Leaving (revoke, deregister) is never paused.
 pub fn handle_pause(ctx: Context<Pause>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
-    ctx.accounts.config.paused_until = now + MAX_PAUSE_SECONDS;
-    emit!(PauseChanged { config: config_key, paused_until: ctx.accounts.config.paused_until });
+    let config = &mut ctx.accounts.config;
+    require!(
+        config.paused_until == 0 || now >= config.paused_until.saturating_add(PAUSE_COOLDOWN_SECONDS),
+        EndowmentError::PauseCooldown
+    );
+    config.paused_until = now + MAX_PAUSE_SECONDS;
+    emit!(PauseChanged { config: config_key, paused_until: config.paused_until });
     Ok(())
 }
 
-/// Lifting a pause early takes the admin, so a single guardian key can stop
-/// the endowment but can't restart it on its own.
+/// Lifting a pause early takes the admin. The cooldown runs from now.
 pub fn handle_unpause(ctx: Context<Unpause>) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
-    ctx.accounts.config.paused_until = 0;
-    emit!(PauseChanged { config: config_key, paused_until: 0 });
+    let config = &mut ctx.accounts.config;
+    if config.is_paused(now) {
+        config.paused_until = now;
+    }
+    emit!(PauseChanged { config: config_key, paused_until: config.paused_until });
     Ok(())
 }

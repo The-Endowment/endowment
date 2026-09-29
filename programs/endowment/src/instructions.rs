@@ -1,19 +1,21 @@
 pub mod buyback;
-pub mod close_contributions;
 pub mod count;
 pub mod create_endowment;
 pub mod deregister_landlord;
 pub mod pause;
+pub mod prune_landlord;
 pub mod register_landlord;
+pub mod resync_baseline;
 pub mod roles;
 pub mod sweep;
 
 pub use buyback::*;
-pub use close_contributions::*;
 pub use count::*;
 pub use create_endowment::*;
 pub use deregister_landlord::*;
 pub use pause::*;
+pub use prune_landlord::*;
 pub use register_landlord::*;
+pub use resync_baseline::*;
 pub use roles::*;
 pub use sweep::*;

@@ -2,82 +2,130 @@ use anchor_lang::prelude::*;
 
 use crate::{constants::*, error::EndowmentError};
 
+/// Every tunable parameter. Set at creation; afterwards changed only through
+/// `propose_params` → 72h → `apply_params`, and frozen for good by `renounce_admin`.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
+pub struct Params {
+    /// Buyback limits, in dividend base units.
+    pub max_buy_per_tx: u64,
+    /// The buy allowance refills at this much per 24 hours.
+    pub max_buy_per_day: u64,
+    /// Slippage a single buyback may cause beyond fees, against the TWAP.
+    pub max_price_impact_bps: u16,
+    /// Buys smaller than this are skipped (not worth a transaction).
+    pub min_buy_amount: u64,
+    pub min_buy_interval_secs: i64,
+    pub tip_bps: u16,
+    /// After the milestone, the share of each buyback that buys the coin; the
+    /// rest becomes permanently locked liquidity.
+    pub buy_bps: u16,
+    /// Landlord sweeps switch on at `activate_bps` of supply committed, off below `deactivate_bps`.
+    pub activate_bps: u16,
+    pub deactivate_bps: u16,
+    /// Minimum share of supply a landlord must hold to register and be counted.
+    pub min_stake_bps: u16,
+}
+
+impl Params {
+    /// Every hard-coded bound. `donation_bps` is locked at creation and checked with it.
+    pub fn validate(&self, donation_bps: u16) -> Result<()> {
+        let (lo, hi) = MIN_BUY_INTERVAL_BOUNDS;
+        require!(
+            self.max_buy_per_tx > 0
+                && self.max_buy_per_tx <= self.max_buy_per_day
+                && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&self.max_price_impact_bps),
+            EndowmentError::InvalidBuybackLimits
+        );
+        require!(
+            self.min_buy_amount <= self.max_buy_per_tx
+                && (lo..=hi).contains(&self.min_buy_interval_secs)
+                && self.tip_bps <= MAX_TIP_BPS
+                && self.buy_bps <= 10_000
+                && self.tip_bps + donation_bps <= MAX_TIP_PLUS_DONATION_BPS,
+            EndowmentError::InvalidBuyParams
+        );
+        require!(
+            self.activate_bps <= MAX_ACTIVATION_BPS && self.deactivate_bps <= self.activate_bps,
+            EndowmentError::InvalidActivation
+        );
+        require!(self.min_stake_bps <= MAX_MIN_STAKE_BPS, EndowmentError::InvalidParams);
+        Ok(())
+    }
+}
+
+/// A parameter change waiting out the timelock.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
+pub struct PendingParams {
+    pub params: Params,
+    /// 0 = nothing pending.
+    pub effective_at: i64,
+}
+
 /// One endowment instance. Seeds: [CONFIG_SEED, coin_mint, creator].
 #[account]
 #[derive(InitSpace)]
 pub struct Config {
+    pub version: u8,
     /// Whoever created the instance; part of its address.
     pub creator: Pubkey,
-    /// Adjusts bounded parameters. Can be renounced for good.
+    /// Proposes bounded, timelocked parameter changes. Can be renounced for good.
     pub admin: Pubkey,
     /// Proposed next admin; must sign `accept_admin`. Default = none.
     pub pending_admin: Pubkey,
-    /// Can pause cranks for at most MAX_PAUSE_SECONDS. Cannot move funds.
+    /// Can pause for at most MAX_PAUSE_SECONDS, then must wait out a cooldown.
+    /// Cleared when the admin renounces. Cannot move funds.
     pub guardian: Pubkey,
     /// The meme coin this endowment holds forever.
     pub coin_mint: Pubkey,
     /// The asset the coin pays its holders (e.g. PUMP), which the endowment spends.
     pub dividend_mint: Pubkey,
-    /// Unix timestamp; cranks are blocked while `now < paused_until`.
-    pub paused_until: i64,
-    pub total_swept: u64,
-    pub landlord_count: u32,
-    pub bump: u8,
-    pub authority_bump: u8,
-
     /// The Raydium CPMM coin/dividend pool buybacks trade against. Checked at creation.
     pub pool: Pubkey,
-    /// Buyback limits, in dividend base units, bounded by `validate_limits`.
-    pub max_buy_per_tx: u64,
-    pub max_buy_per_day: u64,
-    /// Slippage a single buyback may cause, beyond fees.
-    pub max_price_impact_bps: u16,
-    /// Rolling 24-hour buyback window.
-    pub day_start: i64,
-    pub bought_today: u64,
-    pub total_dividend_spent: u64,
-    pub total_coin_bought: u64,
+    pub bump: u8,
+    pub authority_bump: u8,
+    pub roster_bump: u8,
 
-    /// Buyback pacing and the crank tip.
-    pub min_buy_interval_secs: i64,
-    pub last_buy_at: i64,
-    pub tip_bps: u16,
-    pub total_tips: u64,
-
+    pub params: Params,
+    pub pending: PendingParams,
     /// Locked at creation: share of each buyback donated to the flagship endowment.
     pub donation_bps: u16,
+    /// In coin base units. Once the endowment has bought this much, buybacks
+    /// switch to the buy/liquidity split. Contributions keep flowing.
+    pub contribution_cap: u64,
+
+    /// Unix timestamp; everything but leaving is blocked while `now < paused_until`.
+    pub paused_until: i64,
+    /// One-way: no more sweeps or registrations. Set only by the admin.
+    pub retired: bool,
+    /// One-way: set when `total_coin_bought` reaches `contribution_cap`.
+    pub milestone_reached: bool,
+
+    /// Landlord sweeps run only while `active`. See `count_commitment`.
+    pub active: bool,
+    pub last_count_at: i64,
+    pub last_count_bps: u16,
+    pub last_committed: u64,
+
+    /// Buy pacing: a token bucket holding at most `max_buy_per_tx`, refilling at
+    /// `max_buy_per_day` per 24 hours.
+    pub buy_allowance: u64,
+    pub allowance_updated_at: i64,
+    pub last_buy_at: i64,
+
+    pub total_swept: u64,
+    pub total_dividend_spent: u64,
+    /// Coin received from swaps (including coin later deposited as liquidity).
+    pub total_coin_bought: u64,
+    /// Coin kept in the vault (net of liquidity deposits).
+    pub total_coin_retained: u64,
+    pub total_liquidity_dividend: u64,
+    pub total_liquidity_coin: u64,
+    pub total_lp_tokens: u64,
+    pub total_tips: u64,
     pub total_donated: u64,
 
-    /// Landlord sweeps run only while `active`. See `CommitmentCount`.
-    pub activate_bps: u16,
-    pub deactivate_bps: u16,
-    pub active: bool,
-    pub count: CommitmentCount,
-
-    /// One-way: once set, landlord sweeps are closed forever.
-    pub contribution_cap: u64,
-    pub closed: bool,
-    /// After `closed`, the share of each buyback that buys the coin; the rest
-    /// becomes permanently locked liquidity.
-    pub buy_bps: u16,
-    pub total_liquidity_dividend: u64,
-    pub total_lp_tokens: u64,
-}
-
-/// A daily, permissionless count of how much of the coin the registered landlords hold.
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, Debug, PartialEq)]
-pub struct CommitmentCount {
-    /// Increments each time a count starts; landlords remember the last round they were counted in.
-    pub round: u64,
-    pub open: bool,
-    pub started_at: i64,
-    /// Landlords that must be counted before the round can finish.
-    pub expected: u32,
-    pub counted: u32,
-    pub committed: u64,
-    /// Result of the last finished round.
-    pub last_committed_bps: u16,
-    pub last_finished_at: i64,
+    /// Room for future fields without a migration.
+    pub reserved: [u8; 128],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -88,16 +136,9 @@ pub struct CreateParams {
     pub admin: Pubkey,
     /// `Pubkey::default()` means the creator.
     pub guardian: Pubkey,
-    pub max_buy_per_tx: u64,
-    pub max_buy_per_day: u64,
-    pub max_price_impact_bps: u16,
-    /// In coin base units. Contributions close for good once the vault holds this.
+    pub params: Params,
+    /// In coin base units. See `Config::contribution_cap`.
     pub contribution_cap: u64,
-    pub activate_bps: u16,
-    pub deactivate_bps: u16,
-    pub buy_bps: u16,
-    pub min_buy_interval_secs: i64,
-    pub tip_bps: u16,
     /// One of ALLOWED_DONATION_BPS. Locked forever.
     pub donation_bps: u16,
 }
@@ -110,9 +151,9 @@ impl Config {
     /// Hysteresis: on at or above `activate_bps`, off below `deactivate_bps`,
     /// unchanged in between.
     pub fn apply_committed_bps(&mut self, committed_bps: u16) {
-        if committed_bps >= self.activate_bps {
+        if committed_bps >= self.params.activate_bps {
             self.active = true;
-        } else if committed_bps < self.deactivate_bps {
+        } else if committed_bps < self.params.deactivate_bps {
             self.active = false;
         }
     }
@@ -121,33 +162,11 @@ impl Config {
     pub fn authority_seeds<'a>(config: &'a Pubkey, bump: &'a [u8; 1]) -> [&'a [u8]; 3] {
         [AUTHORITY_SEED, config.as_ref(), &bump[..]]
     }
-}
 
-pub fn validate_limits(max_buy_per_tx: u64, max_buy_per_day: u64, max_price_impact_bps: u16) -> Result<()> {
-    require!(
-        max_buy_per_tx > 0
-            && max_buy_per_tx <= max_buy_per_day
-            && (MIN_PRICE_IMPACT_BPS..=MAX_PRICE_IMPACT_BPS).contains(&max_price_impact_bps),
-        EndowmentError::InvalidBuybackLimits
-    );
-    Ok(())
-}
-
-pub fn validate_activation(activate_bps: u16, deactivate_bps: u16) -> Result<()> {
-    require!(
-        activate_bps <= MAX_ACTIVATION_BPS && deactivate_bps <= activate_bps,
-        EndowmentError::InvalidActivation
-    );
-    Ok(())
-}
-
-pub fn validate_buy_params(buy_bps: u16, min_buy_interval_secs: i64, tip_bps: u16) -> Result<()> {
-    let (lo, hi) = MIN_BUY_INTERVAL_BOUNDS;
-    require!(
-        buy_bps <= 10_000 && (lo..=hi).contains(&min_buy_interval_secs) && tip_bps <= MAX_TIP_BPS,
-        EndowmentError::InvalidBuyParams
-    );
-    Ok(())
+    /// The minimum coin a landlord must hold, given the coin's current supply.
+    pub fn min_stake(&self, supply: u64) -> u64 {
+        (supply as u128 * self.params.min_stake_bps as u128).div_ceil(10_000) as u64
+    }
 }
 
 pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pubkey) -> Result<()> {
@@ -161,44 +180,73 @@ pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pub
     Ok(())
 }
 
+/// One registered landlord, as the commitment count sees it.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
+pub struct RosterEntry {
+    pub owner: Pubkey,
+    pub coin_account: Pubkey,
+    pub dividend_account: Pubkey,
+    /// Coin balance read at the last count (or at registration, before any).
+    pub snapshot: u64,
+    /// False until the landlord's first count. A landlord counts only from its
+    /// second count on, and then for min(balance now, balance at the last count),
+    /// so coin must be held across a full count interval to count.
+    pub snapshot_valid: bool,
+}
+
+/// Every landlord of one endowment. Seeds: [ROSTER_SEED, config].
+#[account]
+#[derive(InitSpace)]
+pub struct Roster {
+    pub version: u8,
+    pub config: Pubkey,
+    #[max_len(MAX_LANDLORDS)]
+    pub entries: Vec<RosterEntry>,
+}
+
+impl Roster {
+    pub fn position(&self, owner: &Pubkey) -> Option<usize> {
+        self.entries.iter().position(|e| e.owner == *owner)
+    }
+
+    /// The entry with the smallest recorded stake (the one a larger landlord replaces).
+    pub fn smallest(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.snapshot)
+            .map(|(i, _)| i)
+    }
+}
+
 /// A landlord of one endowment. Seeds: [LANDLORD_SEED, config, owner].
 #[account]
 #[derive(InitSpace)]
 pub struct Landlord {
+    pub version: u8,
     /// The endowment this landlord belongs to.
     pub config: Pubkey,
     pub owner: Pubkey,
     /// The owner's dividend associated token account the endowment is delegated on.
     pub dividend_account: Pubkey,
-    /// Dividend the landlord keeps. Only the balance above this is swept.
+    /// The owner's coin associated token account, counted toward activation.
+    pub coin_account: Pubkey,
+    /// Dividend the landlord keeps. Only the balance above this is swept. Only
+    /// the owner can change it (`resync_baseline`).
     pub baseline: u64,
     pub total_contributed: u64,
     pub registered_at: i64,
     pub last_sweep_at: i64,
     pub bump: u8,
-    /// The owner's coin associated token account, counted toward the activation threshold.
-    pub coin_account: Pubkey,
-    /// The last commitment round this landlord was counted in (or joined during).
-    pub counted_round: u64,
-    /// Coin counted for this landlord in `counted_round`.
-    pub counted_balance: u64,
-    /// The round that was open when this landlord registered (0 if none).
-    pub joined_round: u64,
+    /// Room for future fields without a migration.
+    pub reserved: [u8; 64],
 }
 
 impl Landlord {
-    /// Whether this landlord was actually counted in `round` (as opposed to
-    /// having joined during it).
-    pub fn counted_in(&self, round: u64) -> bool {
-        round != 0 && self.counted_round == round && self.joined_round != round
-    }
-
-    /// How much of `balance` is sweepable, lowering the baseline first if the
-    /// landlord has spent below it. Returns (amount, new_baseline).
-    pub fn sweepable(&self, balance: u64, delegated: u64) -> (u64, u64) {
-        let baseline = self.baseline.min(balance);
-        let amount = (balance - baseline).min(delegated);
-        (amount, baseline)
+    /// How much of `balance` is sweepable: only what sits above the baseline,
+    /// capped by the remaining delegation. The baseline never moves here.
+    pub fn sweepable(&self, balance: u64, delegated: u64) -> u64 {
+        balance.saturating_sub(self.baseline).min(delegated)
     }
 }
 
@@ -208,41 +256,55 @@ mod tests {
 
     fn landlord(baseline: u64) -> Landlord {
         Landlord {
+            version: LANDLORD_VERSION,
             config: Pubkey::default(),
             owner: Pubkey::default(),
             dividend_account: Pubkey::default(),
+            coin_account: Pubkey::default(),
             baseline,
             total_contributed: 0,
             registered_at: 0,
             last_sweep_at: 0,
             bump: 0,
-            coin_account: Pubkey::default(),
-            counted_round: 0,
-            counted_balance: 0,
-            joined_round: 0,
+            reserved: [0; 64],
+        }
+    }
+
+    fn valid_params() -> Params {
+        Params {
+            max_buy_per_tx: 100,
+            max_buy_per_day: 1_000,
+            max_price_impact_bps: 100,
+            min_buy_amount: 10,
+            min_buy_interval_secs: 600,
+            tip_bps: 25,
+            buy_bps: 10_000,
+            activate_bps: 3_000,
+            deactivate_bps: 2_500,
+            min_stake_bps: 10,
         }
     }
 
     #[test]
     fn sweeps_only_above_baseline() {
-        assert_eq!(landlord(100).sweepable(350, u64::MAX), (250, 100));
+        assert_eq!(landlord(100).sweepable(350, u64::MAX), 250);
     }
 
     #[test]
-    fn baseline_drops_when_landlord_spends_below_it() {
-        assert_eq!(landlord(100).sweepable(40, u64::MAX), (0, 40));
+    fn a_dip_below_baseline_sweeps_nothing() {
+        assert_eq!(landlord(100).sweepable(40, u64::MAX), 0);
     }
 
     #[test]
     fn capped_by_remaining_delegation() {
-        assert_eq!(landlord(0).sweepable(500, 120), (120, 0));
+        assert_eq!(landlord(0).sweepable(500, 120), 120);
     }
 
     #[test]
     fn activation_has_hysteresis() {
         let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
-        config.activate_bps = 3_000;
-        config.deactivate_bps = 2_500;
+        config.params.activate_bps = 3_000;
+        config.params.deactivate_bps = 2_500;
         config.apply_committed_bps(2_999);
         assert!(!config.active);
         config.apply_committed_bps(3_000);
@@ -253,6 +315,46 @@ mod tests {
         assert!(!config.active);
         config.apply_committed_bps(2_900);
         assert!(!config.active, "between the lines, state is unchanged");
+    }
+
+    #[test]
+    fn params_bounds() {
+        assert!(valid_params().validate(0).is_ok());
+        let with = |f: &dyn Fn(&mut Params)| {
+            let mut p = valid_params();
+            f(&mut p);
+            p
+        };
+        assert!(with(&|p| p.max_buy_per_tx = 0).validate(0).is_err());
+        assert!(with(&|p| p.max_buy_per_tx = 1_001).validate(0).is_err());
+        assert!(with(&|p| p.max_price_impact_bps = 301).validate(0).is_err());
+        assert!(with(&|p| p.min_buy_amount = 101).validate(0).is_err());
+        assert!(with(&|p| p.min_buy_interval_secs = 59).validate(0).is_err());
+        assert!(with(&|p| p.tip_bps = 51).validate(0).is_err());
+        assert!(with(&|p| p.tip_bps = 51).validate(0).is_err());
+        assert!(with(&|p| p.tip_bps = 50).validate(30).is_ok());
+        assert!(with(&|p| p.tip_bps = 50).validate(40).is_err());
+        assert!(with(&|p| p.buy_bps = 10_001).validate(0).is_err());
+        assert!(with(&|p| p.activate_bps = 5_001).validate(0).is_err());
+        assert!(with(&|p| p.deactivate_bps = 3_001).validate(0).is_err());
+        assert!(with(&|p| p.min_stake_bps = 501).validate(0).is_err());
+    }
+
+    #[test]
+    fn min_stake_rounds_up() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.params.min_stake_bps = 10;
+        assert_eq!(config.min_stake(1_000_000), 1_000);
+        assert_eq!(config.min_stake(1_000_001), 1_001);
+        config.params.min_stake_bps = 0;
+        assert_eq!(config.min_stake(1_000_000), 0);
+    }
+
+    #[test]
+    fn roster_smallest_is_the_lowest_snapshot() {
+        let entry = |snapshot| RosterEntry { owner: Pubkey::new_unique(), snapshot, ..Default::default() };
+        let roster = Roster { version: 1, config: Pubkey::default(), entries: vec![entry(50), entry(10), entry(30)] };
+        assert_eq!(roster.smallest(), Some(1));
     }
 
     #[test]

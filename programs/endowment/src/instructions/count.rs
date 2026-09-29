@@ -1,154 +1,104 @@
 //! The daily commitment count, per endowment.
 //!
-//! Landlord sweeps run only while the endowment's registered landlords together
-//! hold enough of its coin. Anyone can run the count, at most once a day:
+//! Landlord sweeps run only while the endowment's landlords together hold
+//! enough of its coin. Anyone can run the count, at most once a day, and it
+//! reads **every landlord in one instruction**, so the same coin can never be
+//! counted twice by moving it between landlords mid-count.
 //!
-//! 1. `begin_count` opens a round and fixes how many landlords it expects.
-//! 2. `count_landlords` (any number of calls) reads each landlord's coin
-//!    balance straight from its registered token account.
-//! 3. `finish_count` succeeds only once every expected landlord is counted,
-//!    then switches sweeps on at `activate_bps` of supply and off below
-//!    `deactivate_bps`.
+//! Each landlord counts for the smaller of its coin balance now and its balance
+//! at the previous count (and nothing at its first count), so coin must be held
+//! across a full count interval to count: borrowing or buying coin just before a
+//! count adds nothing. A landlord counts only while its dividend account still
+//! delegates to the endowment and it holds the minimum stake.
 //!
-//! A landlord can be counted at most once per round, and only in its own
-//! endowment's count. Landlords who register mid-round sit it out; landlords
-//! who leave mid-round are removed from it. A round can therefore always be
-//! finished, and nothing is counted twice.
+//! The count then switches sweeps on at `activate_bps` of supply and off below
+//! `deactivate_bps`, unchanged in between.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token_interface::{Mint, TokenAccount};
+use anchor_spl::token_interface::Mint;
 
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{CountFinished, CountStarted},
-    state::{Config, Landlord},
+    events::CommitmentCounted,
+    state::{Config, Roster},
+    transfer::read_token_account,
 };
 
+/// Remaining accounts: for each roster entry, in roster order, its registered
+/// coin account and then its registered dividend account (either may be closed).
 #[derive(Accounts)]
-pub struct BeginCount<'info> {
+pub struct CountCommitment<'info> {
     #[account(
         mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
     )]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, seeds = [ROSTER_SEED, config.key().as_ref()], bump = config.roster_bump)]
+    pub roster: Box<Account<'info, Roster>>,
+    #[account(address = config.coin_mint)]
+    pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
 }
 
-pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
+pub fn handle_count_commitment<'info>(ctx: Context<'info, CountCommitment<'info>>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
-    let config = &mut ctx.accounts.config;
-    let landlord_count = config.landlord_count;
-    let count = &mut config.count;
-    require!(!count.open, EndowmentError::CountOpen);
+    let config = &ctx.accounts.config;
+    require!(!config.is_paused(now), EndowmentError::Paused);
     require!(
-        count.round == 0 || now.saturating_sub(count.started_at) >= COUNT_INTERVAL_SECS,
+        config.last_count_at == 0 || now.saturating_sub(config.last_count_at) >= COUNT_INTERVAL_SECS,
         EndowmentError::CountTooSoon
     );
-    count.round = count.round.checked_add(1).ok_or(EndowmentError::Overflow)?;
-    count.open = true;
-    count.started_at = now;
-    count.expected = landlord_count;
-    count.counted = 0;
-    count.committed = 0;
-    emit!(CountStarted { config: config_key, round: count.round, expected: count.expected });
-    Ok(())
-}
-
-/// Remaining accounts: pairs of `[landlord PDA (writable), its registered coin account]`.
-#[derive(Accounts)]
-pub struct CountLandlords<'info> {
-    #[account(
-        mut,
-        seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
-        bump = config.bump,
-    )]
-    pub config: Account<'info, Config>,
-}
-
-pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>) -> Result<()> {
-    let config_key = ctx.accounts.config.key();
-    let coin_mint = ctx.accounts.config.coin_mint;
-    let count = &mut ctx.accounts.config.count;
-    require!(count.open, EndowmentError::CountNotOpen);
-    let pairs = ctx.remaining_accounts;
-    require!(!pairs.is_empty() && pairs.len() % 2 == 0, EndowmentError::InvalidCountAccount);
-
-    for pair in pairs.chunks(2) {
-        let (landlord_info, coin_info) = (&pair[0], &pair[1]);
-        require!(landlord_info.is_writable, EndowmentError::InvalidCountAccount);
-        // Owner and discriminator are checked; only this program creates Landlords.
-        let mut landlord: Account<Landlord> = Account::try_from(landlord_info)?;
-        // Only this endowment's landlords, at their canonical address.
-        require_keys_eq!(landlord.config, config_key, EndowmentError::InvalidCountAccount);
-        let expected = Pubkey::create_program_address(
-            &[LANDLORD_SEED, config_key.as_ref(), landlord.owner.as_ref(), &[landlord.bump]],
-            ctx.program_id,
-        )
-        .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
-        require_keys_eq!(landlord_info.key(), expected, EndowmentError::InvalidCountAccount);
-        require!(landlord.counted_round < count.round, EndowmentError::InvalidCountAccount);
-        require_keys_eq!(coin_info.key(), landlord.coin_account, EndowmentError::InvalidCountAccount);
-
-        // A closed coin account holds nothing; any live one must be the
-        // landlord's own account for this endowment's coin.
-        let balance = if coin_info.data_is_empty() {
-            0
-        } else {
-            let account: InterfaceAccount<TokenAccount> = InterfaceAccount::try_from(coin_info)
-                .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
-            require_keys_eq!(account.mint, coin_mint, EndowmentError::InvalidCountAccount);
-            require_keys_eq!(account.owner, landlord.owner, EndowmentError::InvalidCountAccount);
-            account.amount
-        };
-
-        landlord.counted_round = count.round;
-        landlord.counted_balance = balance;
-        landlord.exit(ctx.program_id)?;
-
-        count.committed = count.committed.checked_add(balance).ok_or(EndowmentError::Overflow)?;
-        count.counted = count.counted.checked_add(1).ok_or(EndowmentError::Overflow)?;
-    }
-    Ok(())
-}
-
-#[derive(Accounts)]
-pub struct FinishCount<'info> {
-    #[account(
-        mut,
-        seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
-        bump = config.bump,
-    )]
-    pub config: Account<'info, Config>,
-    #[account(address = config.coin_mint)]
-    pub coin_mint: InterfaceAccount<'info, Mint>,
-}
-
-pub fn handle_finish_count(ctx: Context<FinishCount>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
+    let authority = Pubkey::create_program_address(
+        &[AUTHORITY_SEED, config_key.as_ref(), &[config.authority_bump]],
+        ctx.program_id,
+    )
+    .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
     let supply = ctx.accounts.coin_mint.supply;
-    let config_key = ctx.accounts.config.key();
+    let min_stake = config.min_stake(supply);
+    let coin_mint = config.coin_mint;
+
+    let accounts = ctx.remaining_accounts;
+    let roster = &mut ctx.accounts.roster;
+    // Every landlord, exactly once, in roster order.
+    require!(accounts.len() == 2 * roster.entries.len(), EndowmentError::InvalidCountAccount);
+
+    let mut committed: u64 = 0;
+    for (entry, pair) in roster.entries.iter_mut().zip(accounts.chunks(2)) {
+        let (coin_info, dividend_info) = (&pair[0], &pair[1]);
+        require_keys_eq!(coin_info.key(), entry.coin_account, EndowmentError::InvalidCountAccount);
+        require_keys_eq!(dividend_info.key(), entry.dividend_account, EndowmentError::InvalidCountAccount);
+
+        let balance = match read_token_account(coin_info)? {
+            Some(coin) => {
+                require_keys_eq!(coin.mint, coin_mint, EndowmentError::InvalidCountAccount);
+                require_keys_eq!(coin.owner, entry.owner, EndowmentError::InvalidCountAccount);
+                coin.amount
+            }
+            None => 0,
+        };
+        let delegated = read_token_account(dividend_info)?
+            .map(|d| d.owner == entry.owner && d.delegates_to(&authority))
+            .unwrap_or(false);
+
+        let held = if entry.snapshot_valid { balance.min(entry.snapshot) } else { 0 };
+        let counted = if delegated && held >= min_stake { held } else { 0 };
+        committed = committed.checked_add(counted).ok_or(EndowmentError::Overflow)?;
+
+        entry.snapshot = balance;
+        entry.snapshot_valid = true;
+    }
+
+    let committed_bps =
+        if supply == 0 { 0 } else { ((committed as u128 * 10_000) / supply as u128).min(10_000) as u16 };
+    let landlords = roster.entries.len() as u32;
     let config = &mut ctx.accounts.config;
-    require!(config.count.open, EndowmentError::CountNotOpen);
-    require!(config.count.counted >= config.count.expected, EndowmentError::CountIncomplete);
-
-    let committed_bps = if supply == 0 {
-        0
-    } else {
-        ((config.count.committed as u128 * 10_000) / supply as u128).min(10_000) as u16
-    };
     config.apply_committed_bps(committed_bps);
-    config.count.open = false;
-    config.count.last_committed_bps = committed_bps;
-    config.count.last_finished_at = now;
+    config.last_count_at = now;
+    config.last_count_bps = committed_bps;
+    config.last_committed = committed;
 
-    emit!(CountFinished {
-        config: config_key,
-        round: config.count.round,
-        committed: config.count.committed,
-        committed_bps,
-        active: config.active,
-    });
+    emit!(CommitmentCounted { config: config_key, landlords, committed, committed_bps, active: config.active });
     Ok(())
 }
