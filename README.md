@@ -2,7 +2,7 @@
 
 Permanent capital. The only holder that can never pull out.
 
-Website: [penis-endowment.vercel.app](https://penis-endowment.vercel.app) ([source](https://github.com/The-Endowment/website))
+Website: [thepenisendowment.com](https://thepenisendowment.com) ([source](https://github.com/The-Endowment/website))
 
 This is a Solana program for **endowments**: vaults that hold a dividend-paying meme coin forever and turn every dividend they receive into more of it. The largest holders ("landlords") opt in by delegating their dividend rewards, and nothing else.
 
