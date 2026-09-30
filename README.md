@@ -4,9 +4,9 @@ Permanent capital. The only holder that can never pull out.
 
 Website: [thepenisendowment.com](https://thepenisendowment.com) ([source](https://github.com/The-Endowment/website))
 
-This is a Solana program for **endowments**: vaults that hold a dividend-paying meme coin forever and turn every dividend they receive into more of it. The largest holders ("landlords") opt in by delegating their dividend rewards, and nothing else.
+This is a Solana program for **endowments**: vaults that hold a dividend-paying meme coin and reinvest the rewards they receive. Participating holders ("landlords") opt in by delegating their reward-token account. The current collection mechanism treats all reward-token balance above the recorded baseline as eligible, including transfers from unrelated sources. Authenticated collection of PENIS-derived PUMP alone remains a release blocker.
 
-**One shared contract, many endowments.** Anyone can create an endowment for their own coin on this same deployed, audited program. $PENIS (paid in PUMP) is the flagship. Every endowment gets the same guarantees, enforced by the same code, and each one is fully isolated from the others.
+**One shared contract, many endowments.** The program supports separate endowments for different coins. $PENIS (paid in PUMP) is the flagship. This review branch contains proposed changes and local test results; it is not a production deployment or independent audit certification.
 
 ## How it works
 
@@ -20,10 +20,10 @@ This is a Solana program for **endowments**: vaults that hold a dividend-paying 
    - **Public.** Each landlord's record (counted amount, round, recorded balance, reads) is on-chain, and every refresher transaction publishes the landlords it read as an event.
 4. **Sweep.** When a dividend drop lands, anyone can call `sweep`. It moves only the dividend above the baseline into the endowment's dividend vault and adds it to the landlord's on-chain contribution total. A sweep never fills the vault beyond three days of what buybacks can actually spend (the smaller of the daily cap and what the per-buy cap allows at the minimum buy interval); anything more waits in the landlord's own account for a later sweep. Only the landlord can move its own baseline (`resync_baseline`), which the website does whenever a landlord opts back in, so what a landlord already holds always stays theirs.
 5. **Buy.** Anyone can call `buyback`, at most once per interval (10 minutes by default). The contract decides the size: whatever the vault holds, within the per-trade cap, a smoothly refilling daily allowance, and what the pool can absorb within the price-impact budget. It swaps that for the coin in the endowment's pool and pays the caller a small tip to cover network fees.
-6. **The milestone.** Once an endowment has bought its milestone amount of the coin (200,000,000 $PENIS for the flagship), each buyback splits between buying the coin and adding permanent liquidity to the pool. Landlord contributions keep flowing.
+6. **The milestone.** The goal is the spendable coin held directly in the endowment's coin vault: 200,000,000 $PENIS for the flagship. Direct donations count; liquidity-pool holdings and cumulative purchase totals are reported separately. Every sweep checks this balance before collecting, and buybacks check it before and after trading. Reaching the goal permanently stops holder sweeps. A sweep that records completion succeeds without transferring PUMP, so the completion flag persists. Once completion is recorded, new registrations are rejected. Funds already in the endowment and future treasury yield continue through the configured buy/liquidity split.
 7. **Opt out.** The landlord calls the token program's `Revoke`, and `deregister_landlord` to get its rent back. Neither can be blocked, even while the endowment is paused.
 
-An endowment's own coin earns dividends too. They land directly in its dividend vault and are bought back like everything else.
+The intended ongoing funding source is the endowment's own rewards. The live distributor must confirm that the program-owned vault is eligible and that its rewards arrive in the intended dividend vault before public fundraising.
 
 ## Guarantees in the code
 
@@ -94,7 +94,7 @@ Pre-launch, in testing.
 
 ## Development
 
-Requires Rust, the Solana CLI, and Anchor 1.1.2 (`avm install 1.1.2`).
+The local suite was run with Rust 1.89.0, Solana CLI 3.1.10 (platform-tools v1.52), and Anchor 1.1.2. Anchor 1.1.2 requests platform-tools v1.52 internally; newer build tools defaulting to SBPFv3 are incompatible with that compiler. This reproduces the local test environment; production deployment requires separate validation against the target cluster's supported bytecode versions.
 
 ```sh
 ./scripts/test.sh   # builds the program and IDL, and a test build, then runs every test

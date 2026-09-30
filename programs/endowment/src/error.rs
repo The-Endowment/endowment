@@ -108,4 +108,6 @@ pub enum EndowmentError {
     NoRefresher,
     #[msg("Only the refresher can do this")]
     NotRefresher,
+    #[msg("The endowment's direct coin vault has reached its funding goal")]
+    Completed,
 }

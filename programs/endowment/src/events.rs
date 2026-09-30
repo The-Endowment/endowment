@@ -82,6 +82,8 @@ pub struct Bought {
 pub struct MilestoneReached {
     pub config: Pubkey,
     pub total_coin_bought: u64,
+    /// Spendable coin held directly in the vault when completion was recorded.
+    pub coin_vault_balance: u64,
 }
 
 #[event]

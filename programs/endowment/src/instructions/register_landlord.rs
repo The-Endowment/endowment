@@ -69,6 +69,7 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     require!(!config.retired, EndowmentError::Retired);
+    require!(!config.milestone_reached, EndowmentError::Completed);
     require!(!config.is_paused(now), EndowmentError::Paused);
 
     let coin_held = ctx.accounts.coin_account.amount;

@@ -15,7 +15,7 @@ use anchor_spl::{
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{Bought, MilestoneReached},
+    events::Bought,
     health::{ensure_tradeable, is_frozen, TradeAccounts},
     math::{
         floor_slippage_bps, impact_cap, lp_tokens_for, min_acceptable_out, quote_out, refill, spendable, split_buy,
@@ -154,6 +154,8 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
+    // Direct donations count toward the goal before choosing the buy/LP split.
+    ctx.accounts.config.record_completion(config_key, ctx.accounts.coin_vault.amount);
     let plan = plan_buy(&ctx.accounts, clock.epoch, now)?;
 
     let a = &ctx.accounts;
@@ -298,10 +300,7 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     config.total_lp_tokens = config.total_lp_tokens.checked_add(lp_tokens).ok_or(EndowmentError::Overflow)?;
     config.total_tips = config.total_tips.checked_add(tip).ok_or(EndowmentError::Overflow)?;
     config.total_donated = config.total_donated.checked_add(donation).ok_or(EndowmentError::Overflow)?;
-    if !config.milestone_reached && config.total_coin_bought >= config.contribution_cap {
-        config.milestone_reached = true;
-        emit!(MilestoneReached { config: config_key, total_coin_bought: config.total_coin_bought });
-    }
+    config.record_completion(config_key, coin_after);
 
     emit!(Bought {
         config: config_key,

@@ -125,8 +125,9 @@ pub struct Config {
     pub pending: PendingParams,
     /// Locked at creation: share of each buyback donated to the flagship endowment.
     pub donation_bps: u16,
-    /// In coin base units. Once the endowment has bought this much, buybacks
-    /// switch to the buy/liquidity split. Contributions keep flowing.
+    /// Immutable target in spendable coin base units held directly in the coin
+    /// vault. Reaching it permanently stops holder sweeps and enables the
+    /// buy/liquidity split for funds already contributed and future vault yield.
     pub contribution_cap: u64,
 
     /// Unix timestamp; everything but leaving is blocked while `now < paused_until`.
@@ -136,7 +137,7 @@ pub struct Config {
     pub retired: bool,
     /// When a proposed retirement can take effect; 0 = none proposed.
     pub retire_at: i64,
-    /// One-way: set when `total_coin_bought` reaches `contribution_cap`.
+    /// One-way: set when the direct coin vault reaches `contribution_cap`.
     pub milestone_reached: bool,
 
     /// Landlord sweeps run only while `active`. See the daily count
@@ -197,6 +198,22 @@ pub struct CreateParams {
 }
 
 impl Config {
+    /// Record completion from the authenticated direct vault's spendable balance.
+    /// A completed sweep succeeds without transferring funds so this state change
+    /// persists, including when a direct donation reached the goal.
+    pub fn record_completion(&mut self, config: Pubkey, coin_vault_balance: u64) -> bool {
+        if !self.milestone_reached && coin_vault_balance >= self.contribution_cap {
+            self.milestone_reached = true;
+            self.active = false;
+            emit!(crate::events::MilestoneReached {
+                config,
+                total_coin_bought: self.total_coin_bought,
+                coin_vault_balance,
+            });
+        }
+        self.milestone_reached
+    }
+
     pub fn is_paused(&self, now: i64) -> bool {
         now < self.paused_until
     }
@@ -205,7 +222,8 @@ impl Config {
     /// only while a count has finished recently: a count nobody runs can't keep
     /// an endowment switched on.
     pub fn sweeps_on(&self, now: i64) -> bool {
-        self.active
+        !self.milestone_reached
+            && self.active
             && (self.params.activate_bps == 0 || now.saturating_sub(self.last_count_at) <= ACTIVE_MAX_AGE_SECS)
     }
 
@@ -222,6 +240,10 @@ impl Config {
     /// Hysteresis: on at or above `activate_bps`, off below `deactivate_bps`,
     /// unchanged in between.
     pub fn apply_committed_bps(&mut self, committed_bps: u16) {
+        if self.milestone_reached {
+            self.active = false;
+            return;
+        }
         if committed_bps >= self.params.activate_bps {
             self.active = true;
         } else if committed_bps < self.params.deactivate_bps {

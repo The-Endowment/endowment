@@ -2071,8 +2071,8 @@ fn a_donating_endowment_leaves_room_for_the_donation_when_sizing() {
 }
 
 // ---------------------------------------------------------------------------
-// The milestone: after the endowment has bought `contribution_cap` of its coin,
-// part of each buyback becomes locked liquidity. Contributions keep flowing.
+// The milestone: after the direct vault holds `contribution_cap` of its coin,
+// holder contributions stop and part of each buyback becomes locked liquidity.
 // ---------------------------------------------------------------------------
 
 /// An endowment whose milestone is reached on its first buy, with a 50/50 split after.
@@ -2154,7 +2154,7 @@ fn regression_r2roles05_the_liquidity_share_buys_while_the_pool_has_deposits_dis
 }
 
 #[test]
-fn sweeps_keep_flowing_after_the_milestone() {
+fn sweeps_stop_permanently_after_the_milestone() {
     let mut env = pool_env_with(10_000 * UNIT, |p| {
         p.contribution_cap = 1;
         p.params.activate_bps = 0;
@@ -2168,9 +2168,10 @@ fn sweeps_keep_flowing_after_the_milestone() {
     env.set_balance(&account, 700 * UNIT);
     let vault_before = token_balance(&env.svm, &env.dividend_vault());
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert!(token_balance(&env.svm, &env.dividend_vault()) > vault_before);
-    assert_eq!(token_balance(&env.svm, &account), 0);
-    assert!(env.config_state().total_swept > 0);
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), vault_before);
+    assert_eq!(token_balance(&env.svm, &account), 700 * UNIT);
+    assert_eq!(env.config_state().total_swept, 0);
+    assert!(!env.config_state().active);
 }
 
 #[test]
@@ -3067,15 +3068,17 @@ fn regression_i09_dust_is_skipped_without_using_up_the_interval() {
 }
 
 #[test]
-fn regression_l13_coin_sent_to_the_vault_doesnt_reach_the_milestone() {
+fn direct_coin_donations_reach_the_milestone_and_enable_the_liquidity_split() {
     let mut env = pool_env_with(50_000 * UNIT, |p| p.params.buy_bps = 5_000);
     let coin_vault = env.coin_vault();
     env.set_balance(&coin_vault, CONTRIBUTION_CAP + 1);
     assert!(env.buy());
     let config = env.config_state();
-    // Still all buying: the milestone counts only coin the endowment bought.
-    assert!(!config.milestone_reached);
-    assert_eq!((config.total_lp_tokens, config.total_dividend_spent), (0, MAX_BUY_PER_TX));
+    // Direct holdings include donations, and principal stays in the vault.
+    assert!(config.milestone_reached);
+    assert!(config.total_lp_tokens > 0);
+    assert!(config.total_dividend_spent > 0 && config.total_dividend_spent <= MAX_BUY_PER_TX);
+    assert!(token_balance(&env.svm, &coin_vault) >= CONTRIBUTION_CAP + 1);
 }
 
 #[test]
@@ -4138,3 +4141,6 @@ fn regression_band_an_attacker_who_pushes_the_price_down_first_only_loses() {
 
 #[path = "regressions/refresher_changes.rs"]
 mod refresher_changes;
+
+#[path = "regressions/completion.rs"]
+mod completion;

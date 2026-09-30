@@ -18,8 +18,9 @@ use crate::{
 /// and only the part above the landlord's baseline. A sweep never changes the
 /// baseline: a dip below it sweeps nothing and leaves it where it is.
 ///
-/// Sweeps keep running after the milestone; they stop for good only if the admin
-/// retires the endowment. They run only while the endowment is active and a count
+/// Sweeps stop permanently at the direct-vault goal or administrative retirement.
+/// A sweep records completion without collecting anything when a direct donation
+/// has reached the goal. Otherwise it runs only while active and a count
 /// has finished recently (`Config::sweeps_on`), and they fail closed whenever a
 /// buyback couldn't run (`health::ensure_tradeable`): a transfer hook switched
 /// on, either mint's transfer fee above the cap, the pool's swaps disabled or
@@ -62,16 +63,18 @@ pub struct Sweep<'info> {
     /// What a buyback would trade through; read only, to check it can.
     #[account(address = config.coin_mint)]
     pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
-    /// CHECK: the endowment's coin vault, at its derived address; only its
-    /// frozen state is read.
+    /// The direct coin vault: authenticate its spendable balance and frozen state.
     #[account(
         address = get_associated_token_address_with_program_id(
             &authority.key(),
             &config.coin_mint,
             coin_mint.to_account_info().owner,
         ) @ EndowmentError::WrongPool,
+        token::mint = coin_mint,
+        token::authority = authority,
+        owner = *coin_mint.to_account_info().owner,
     )]
-    pub coin_vault: UncheckedAccount<'info>,
+    pub coin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: the endowment's pool; parsed by `ensure_tradeable`.
     #[account(address = config.pool @ EndowmentError::WrongPool, owner = CPMM_PROGRAM_ID)]
     pub pool_state: UncheckedAccount<'info>,
@@ -90,6 +93,9 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
+    if ctx.accounts.config.record_completion(config_key, ctx.accounts.coin_vault.amount) {
+        return Ok(());
+    }
     let config = &ctx.accounts.config;
     require!(!config.is_paused(now), EndowmentError::Paused);
     require!(!config.retired, EndowmentError::Retired);
