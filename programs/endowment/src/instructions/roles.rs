@@ -108,8 +108,8 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
     config.params = pending.params;
     config.pending = PendingParams::default();
     if refresher_changes {
-        // Reads made under the previous refresher stop counting (FC-R3-03).
-        config.refresher_epoch = config.refresher_epoch.wrapping_add(1);
+        // Invalidate both in-progress and finalized counts made under the old key.
+        config.retire_refresher_reads();
     }
     // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
     config.buy_allowance = config.buy_allowance.min(config.params.max_buy_per_tx);

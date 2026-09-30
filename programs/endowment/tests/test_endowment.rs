@@ -4135,3 +4135,6 @@ fn regression_band_an_attacker_who_pushes_the_price_down_first_only_loses() {
     println!("attacker: dumped {dump}, got back {back}");
     assert!(back < dump);
 }
+
+#[path = "regressions/refresher_changes.rs"]
+mod refresher_changes;

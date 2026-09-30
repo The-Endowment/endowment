@@ -254,7 +254,7 @@ impl Config {
         }
     }
 
-    /// The refresher resigns: reads made under it stop counting, an open round
+    /// The refresher resigns or changes: reads made under it stop counting, an open round
     /// (whose tally rests on those reads) closes without a result, and sweeps
     /// switch off until a count under a new refresher switches them back on
     /// (FC-R3-03).
@@ -262,6 +262,10 @@ impl Config {
         self.refresher_epoch = self.refresher_epoch.wrapping_add(1);
         self.count.open = false;
         self.active = false;
+        // A later parameter change must not reactivate sweeps from an old result.
+        self.last_count_bps = 0;
+        self.last_count_at = 0;
+        self.last_committed = 0;
     }
 
     /// The minimum coin a landlord must hold, given the coin's current supply.
