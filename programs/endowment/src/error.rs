@@ -110,4 +110,24 @@ pub enum EndowmentError {
     InvalidAllowance,
     #[msg("Only the endowment's creator can create it")]
     NotFlagshipCreator,
+    #[msg("Collection requires distinct, nonzero collector and reviewer keys")]
+    InvalidCollectionPolicy,
+    #[msg("The collection authorization is invalid, expired, or stale")]
+    InvalidCollection,
+    #[msg("The holder must explicitly consent to refundable collection")]
+    CollectionConsentRequired,
+    #[msg("Only the configured collector may collect rewards")]
+    NotCollector,
+    #[msg("Only the configured reviewer may clear a collection")]
+    NotReviewer,
+    #[msg("The 24-hour holding period has not elapsed")]
+    HoldNotElapsed,
+    #[msg("The collection has expired and must be refunded")]
+    CollectionExpired,
+    #[msg("The collection has not been reviewed")]
+    CollectionNotReviewed,
+    #[msg("Only the holder or reviewer may refund before expiry or cancellation")]
+    RefundNotAllowed,
+    #[msg("This dividend mint cannot support exact refundable custody")]
+    UnsupportedRefundMint,
 }

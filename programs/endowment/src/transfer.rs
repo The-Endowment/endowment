@@ -91,3 +91,20 @@ pub fn read_token_account(info: &AccountInfo) -> Result<Option<TokenView>> {
         close_authority: if tag(129) == 1 { Some(key(133)) } else { None },
     }))
 }
+
+/// Exact refunds exclude fee-bearing and seizure-enabled dividends. Metadata
+/// and an inactive hook are accepted for PUMP. Its retained hook authority can
+/// still halt transfers later: this is an external mint risk, not something an
+/// endowment contract can remove or an expiry timer can override.
+pub fn ensure_refundable_dividend(mint: &AccountInfo) -> Result<()> {
+    use anchor_spl::token_2022::spl_token_2022::extension::ExtensionType;
+    let data = mint.try_borrow_data()?;
+    let state = StateWithExtensions::<MintState>::unpack(&data)?;
+    require!(state.base.freeze_authority.is_none(), EndowmentError::UnsupportedRefundMint);
+    for extension in state.get_extension_types()? {
+        require!(matches!(extension, ExtensionType::MetadataPointer | ExtensionType::TokenMetadata
+            | ExtensionType::TransferHook), EndowmentError::UnsupportedRefundMint);
+    }
+    require!(!hook_enabled(mint)?, EndowmentError::TransferHookEnabled);
+    Ok(())
+}
