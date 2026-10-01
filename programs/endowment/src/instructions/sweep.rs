@@ -1,30 +1,17 @@
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
-    token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
+    token_interface::{Mint, TokenAccount, TokenInterface},
 };
 
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::Swept,
-    health::{ensure_tradeable, TradeAccounts},
     raydium::CPMM_PROGRAM_ID,
     state::{Config, Landlord},
 };
 
-/// Permissionless: anyone may crank a sweep. Funds can only move from the
-/// landlord's delegated dividend account into this endowment's dividend vault,
-/// and only the part above the landlord's baseline. A sweep never changes the
-/// baseline: a dip below it sweeps nothing and leaves it where it is.
-///
-/// Sweeps stop permanently at the direct-vault goal or administrative retirement.
-/// A sweep records completion without collecting anything when a direct donation
-/// has reached the goal. Otherwise it runs only while active and a count
-/// has finished recently (`Config::sweeps_on`), and they fail closed whenever a
-/// buyback couldn't run (`health::ensure_tradeable`): a transfer hook switched
-/// on, either mint's transfer fee above the cap, the pool's swaps disabled or
-/// its fee above the cap, or a vault frozen. Dividends then stay with landlords.
+/// Shared authenticated collection accounts. The legacy sweep entrypoint is disabled.
 #[derive(Accounts)]
 pub struct Sweep<'info> {
     #[account(
@@ -87,87 +74,4 @@ pub struct Sweep<'info> {
     pub pool_coin_vault: UncheckedAccount<'info>,
 
     pub dividend_token_program: Interface<'info, TokenInterface>,
-}
-
-pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
-    let clock = Clock::get()?;
-    let now = clock.unix_timestamp;
-    let config_key = ctx.accounts.config.key();
-    if ctx.accounts.config.record_completion(config_key, ctx.accounts.coin_vault.amount) {
-        return Ok(());
-    }
-    let config = &ctx.accounts.config;
-    require!(!config.is_paused(now), EndowmentError::Paused);
-    require!(!config.retired, EndowmentError::Retired);
-    require!(config.active, EndowmentError::NotActive);
-    require!(config.sweeps_on(now), EndowmentError::CountStale);
-    let a = &ctx.accounts;
-    ensure_tradeable(
-        config,
-        &TradeAccounts {
-            dividend_mint: &a.dividend_mint.to_account_info(),
-            coin_mint: &a.coin_mint.to_account_info(),
-            pool_state: &a.pool_state.to_account_info(),
-            amm_config: &a.amm_config.to_account_info(),
-            pool_dividend_vault: &a.pool_dividend_vault.to_account_info(),
-            pool_coin_vault: &a.pool_coin_vault.to_account_info(),
-            vaults: [&a.dividend_vault.to_account_info(), &a.coin_vault.to_account_info()],
-        },
-        clock.epoch,
-    )?;
-
-    let dividend_account = &ctx.accounts.dividend_account;
-    require!(
-        dividend_account.delegate == Some(ctx.accounts.authority.key()).into(),
-        EndowmentError::NotDelegated
-    );
-    // Never more than the vault can spend in MAX_VAULT_DAYS_OF_BUYS days: the
-    // rest stays with the landlord for a later sweep (R3-MINT-01, FC-R3-04).
-    let vault_before = ctx.accounts.dividend_vault.amount;
-    let vault_cap = config.vault_cap();
-    let amount = ctx
-        .accounts
-        .landlord
-        .sweepable(dividend_account.amount, dividend_account.delegated_amount)
-        .min(vault_cap.saturating_sub(vault_before));
-    if amount == 0 {
-        return Ok(());
-    }
-
-    let bump = [config.authority_bump];
-    let seeds = Config::authority_seeds(&config_key, &bump);
-    token_interface::transfer_checked(
-        CpiContext::new_with_signer(
-            ctx.accounts.dividend_token_program.key(),
-            TransferChecked {
-                from: ctx.accounts.dividend_account.to_account_info(),
-                mint: ctx.accounts.dividend_mint.to_account_info(),
-                to: ctx.accounts.dividend_vault.to_account_info(),
-                authority: ctx.accounts.authority.to_account_info(),
-            },
-            &[&seeds],
-        ),
-        amount,
-        ctx.accounts.dividend_mint.decimals,
-    )?;
-    // What actually arrived, net of any transfer fee on the dividend.
-    ctx.accounts.dividend_vault.reload()?;
-    let received = ctx.accounts.dividend_vault.amount.saturating_sub(vault_before);
-
-    let landlord = &mut ctx.accounts.landlord;
-    landlord.total_contributed = landlord.total_contributed.checked_add(amount).ok_or(EndowmentError::Overflow)?;
-    landlord.last_sweep_at = now;
-    let config = &mut ctx.accounts.config;
-    config.total_swept = config.total_swept.checked_add(received).ok_or(EndowmentError::Overflow)?;
-    config.last_sweep_at = now;
-
-    emit!(Swept {
-        config: config_key,
-        owner: landlord.owner,
-        amount,
-        received,
-        baseline: landlord.baseline,
-        total_contributed: landlord.total_contributed,
-    });
-    Ok(())
 }

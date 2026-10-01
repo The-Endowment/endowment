@@ -338,6 +338,7 @@ pub fn handle_finish_count(ctx: Context<FinishCount>) -> Result<()> {
     };
     config.count.open = false;
     config.apply_committed_bps(committed_bps);
+    config.invalidate_reports()?;
     config.last_count_at = now;
     config.last_count_bps = committed_bps;
     config.last_committed = count.committed;

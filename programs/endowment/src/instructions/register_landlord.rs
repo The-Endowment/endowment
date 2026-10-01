@@ -8,13 +8,8 @@ use crate::{
     state::{Config, Landlord},
 };
 
-/// Sent in the same transaction as the landlord's unlimited
-/// `Approve(dividend_account → authority)` for this endowment. There is no limit
-/// on the number of landlords.
-///
-/// The wallet is the unit of commitment: all the coin in `coin_account` counts
-/// toward activation, and all new dividend arriving in `dividend_account` is
-/// swept. To commit only part of a holding, keep the rest in another wallet.
+/// Owner-signed consent to reporter-authorized reward collection.
+/// SPL delegation remains revocable directly through the token program.
 #[derive(Accounts)]
 pub struct RegisterLandlord<'info> {
     #[account(mut)]
@@ -61,13 +56,18 @@ pub struct RegisterLandlord<'info> {
 
     pub dividend_token_program: Interface<'info, TokenInterface>,
     pub coin_token_program: Interface<'info, TokenInterface>,
+    #[account(seeds = [REPORTER_SEED, config.key().as_ref()], bump = reporter_policy.bump,
+        has_one = config, constraint = !reporter_policy.disabled @ EndowmentError::NotReporter)]
+    pub reporter_policy: Box<Account<'info, crate::reports::ReporterPolicy>>,
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
+pub fn handle_enroll_rewards(ctx: Context<RegisterLandlord>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
+    require!(config.version == CONFIG_VERSION, EndowmentError::UnsupportedCollectionVersion);
+    let consent_id = config.new_consent()?;
     require!(!config.retired, EndowmentError::Retired);
     require!(!config.milestone_reached, EndowmentError::Completed);
     require!(!config.is_paused(now), EndowmentError::Paused);
@@ -99,9 +99,12 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
         attestations: 0,
         last_attested_at: 0,
         attestation_epoch: 0,
-        reserved: [0; 52],
+        consent_id,
+        last_report_nonce: 0,
+        reserved: [0; 36],
     });
 
+    emit!(crate::events::CollectionConsent { config: config_key, owner, consent_id });
     emit!(LandlordRegistered { config: config_key, owner, baseline, coin_held });
     Ok(())
 }

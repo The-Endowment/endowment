@@ -178,8 +178,11 @@ pub struct Config {
     /// Reads made under an earlier epoch don't count (FC-R3-03).
     pub refresher_epoch: u32,
 
-    /// Room for future fields without a migration.
-    pub reserved: [u8; 124],
+    /// Invalidates reports at count, pause and parameter boundaries.
+    pub collection_epoch: u64,
+    /// Globally unique consent IDs survive landlord closure and recreation.
+    pub next_consent_id: u64,
+    pub reserved: [u8; 108],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -198,6 +201,16 @@ pub struct CreateParams {
 }
 
 impl Config {
+    pub fn invalidate_reports(&mut self) -> Result<()> {
+        self.collection_epoch = self.collection_epoch.checked_add(1).ok_or(EndowmentError::Overflow)?;
+        Ok(())
+    }
+
+    pub fn new_consent(&mut self) -> Result<u64> {
+        self.next_consent_id = self.next_consent_id.checked_add(1).ok_or(EndowmentError::Overflow)?;
+        Ok(self.next_consent_id)
+    }
+
     /// Record completion from the authenticated direct vault's spendable balance.
     /// A completed sweep succeeds without transferring funds so this state change
     /// persists, including when a direct donation reached the goal.
@@ -281,6 +294,7 @@ impl Config {
     /// switch off until a count under a new refresher switches them back on
     /// (FC-R3-03).
     pub fn retire_refresher_reads(&mut self) {
+        self.collection_epoch = self.collection_epoch.saturating_add(1);
         self.refresher_epoch = self.refresher_epoch.wrapping_add(1);
         self.count.open = false;
         self.active = false;
@@ -338,8 +352,8 @@ pub struct Landlord {
     pub dividend_account: Pubkey,
     /// The owner's coin associated token account, counted toward activation.
     pub coin_account: Pubkey,
-    /// Dividend the landlord keeps. Only the balance above this is swept. Only
-    /// the owner can change it (`resync_baseline`).
+    /// Historical enrollment balance, retained for layout compatibility.
+    /// Never authorizes a collection in version 4.
     pub baseline: u64,
     pub total_contributed: u64,
     pub registered_at: i64,
@@ -372,17 +386,12 @@ pub struct Landlord {
     /// an earlier epoch (a refresher since resigned or replaced) don't count.
     pub attestation_epoch: u32,
 
-    /// Room for future fields without a migration.
-    pub reserved: [u8; 52],
+    pub consent_id: u64,
+    pub last_report_nonce: u64,
+    pub reserved: [u8; 36],
 }
 
 impl Landlord {
-    /// How much of `balance` is sweepable: only what sits above the baseline,
-    /// capped by the remaining delegation. The baseline never moves here.
-    pub fn sweepable(&self, balance: u64, delegated: u64) -> u64 {
-        balance.saturating_sub(self.baseline).min(delegated)
-    }
-
     /// What this landlord's coin balance now is worth, before the delegation,
     /// attestation and minimum-stake checks: the smaller of that and its
     /// recorded balance (zero at its first count, or after it was found not
@@ -420,7 +429,9 @@ mod tests {
             attestations: 0,
             last_attested_at: 0,
             attestation_epoch: 0,
-            reserved: [0; 52],
+            consent_id: 1,
+            last_report_nonce: 0,
+            reserved: [0; 36],
         }
     }
 
@@ -439,21 +450,6 @@ mod tests {
             min_stake_bps: 10,
             refresher: Pubkey::new_unique(),
         }
-    }
-
-    #[test]
-    fn sweeps_only_above_baseline() {
-        assert_eq!(landlord(100).sweepable(350, u64::MAX), 250);
-    }
-
-    #[test]
-    fn a_dip_below_baseline_sweeps_nothing() {
-        assert_eq!(landlord(100).sweepable(40, u64::MAX), 0);
-    }
-
-    #[test]
-    fn capped_by_remaining_delegation() {
-        assert_eq!(landlord(0).sweepable(500, 120), 120);
     }
 
     #[test]

@@ -105,6 +105,7 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
         EndowmentError::ApplyGrace
     );
     let refresher_changes = pending.params.refresher != config.params.refresher;
+    config.invalidate_reports()?;
     config.params = pending.params;
     config.pending = PendingParams::default();
     if refresher_changes {
@@ -153,17 +154,20 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 }
 
 /// One-way: gives up the admin role for good, freezing every parameter as it
-/// stands. It also clears the guardian and any pending change, so no key is left
-/// that can pause or reconfigure the endowment. It requires production
+/// stands. It also clears the guardian and pending parameter state, so no key
+/// can invoke the guardian pause or reconfigure the endowment. It requires production
 /// activation thresholds, so sweeps can't be frozen on, no pending change
 /// (cancel it first), so nothing half-decided is left behind, and (unless
 /// retired) a refresher, without which nobody could ever count again.
 ///
-/// One live role remains: the refresher, whose reads decide who counts (see
-/// `count`). After renounce it can't be replaced, only resign
+/// The refresher and reward reporter remain live roles. The refresher's reads
+/// decide who counts (see `count`). After renounce it can't be replaced, only resign
 /// (`resign_refresher`), which switches sweeps off at once and voids its
 /// reads: a leaked or distrusted refresher key can always be retired by
 /// whoever holds it, and never handed to anyone else.
+/// The reporter can still authorize rewards or permanently disable itself,
+/// but replacement (including a pending proposal) and lost-key recovery are
+/// impossible once the admin has renounced.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;

@@ -7,6 +7,7 @@ pub mod math;
 pub mod mint_policy;
 pub mod raydium;
 pub mod state;
+pub mod reports;
 pub mod transfer;
 
 use anchor_lang::prelude::*;
@@ -14,6 +15,7 @@ use anchor_lang::prelude::*;
 pub use constants::*;
 pub use instructions::*;
 pub use state::*;
+pub use reports::*;
 
 declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
 
@@ -40,11 +42,13 @@ pub mod endowment {
 
     /// Landlords.
     pub fn register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
-        instructions::register_landlord::handle_register_landlord(ctx)
+        let _ = ctx;
+        err!(error::EndowmentError::LegacyCollectionDisabled)
     }
 
     pub fn resync_baseline(ctx: Context<ResyncBaseline>) -> Result<()> {
-        instructions::resync_baseline::handle_resync_baseline(ctx)
+        let _ = ctx;
+        err!(error::EndowmentError::LegacyCollectionDisabled)
     }
 
     pub fn deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {
@@ -57,8 +61,32 @@ pub mod endowment {
     }
 
     pub fn sweep(ctx: Context<Sweep>) -> Result<()> {
-        instructions::sweep::handle_sweep(ctx)
+        let _ = ctx;
+        err!(error::EndowmentError::LegacyCollectionDisabled)
     }
+
+    /// New consent is required; old registrations do not authorize reported collection.
+    pub fn enroll_rewards(ctx: Context<RegisterLandlord>) -> Result<()> {
+        instructions::register_landlord::handle_enroll_rewards(ctx)
+    }
+
+    pub fn renew_reward_consent(ctx: Context<ResyncBaseline>) -> Result<()> {
+        instructions::resync_baseline::handle_renew_reward_consent(ctx)
+    }
+
+    pub fn collect_reward(ctx: Context<CollectReward>, report: RewardReport) -> Result<()> {
+        instructions::collect_reward::handle_collect_reward(ctx, report)
+    }
+
+    pub fn initialize_reporter(ctx: Context<InitializeReporter>, reporter: Pubkey) -> Result<()> {
+        instructions::reporter::initialize(ctx, reporter)
+    }
+    pub fn propose_reporter(ctx: Context<ManageReporter>, reporter: Pubkey) -> Result<()> {
+        instructions::reporter::propose(ctx, reporter)
+    }
+    pub fn cancel_reporter(ctx: Context<ManageReporter>) -> Result<()> { instructions::reporter::cancel(ctx) }
+    pub fn apply_reporter(ctx: Context<ManageReporter>) -> Result<()> { instructions::reporter::apply(ctx) }
+    pub fn disable_reporter(ctx: Context<ManageReporter>) -> Result<()> { instructions::reporter::disable(ctx) }
 
     pub fn buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) -> Result<()> {
         instructions::buyback::handle_buyback(ctx, min_out)

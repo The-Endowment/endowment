@@ -70,4 +70,3 @@ fn audit_completion_is_recorded_even_while_sweeping_is_paused() {
     assert_eq!(token_balance(&env.svm, &account), 100 * UNIT);
     assert!(env.config_state().milestone_reached);
 }
-

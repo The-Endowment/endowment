@@ -110,4 +110,24 @@ pub enum EndowmentError {
     NotRefresher,
     #[msg("The endowment's direct coin vault has reached its funding goal")]
     Completed,
+    #[msg("Legacy balance-based collection and enrollment are disabled")]
+    LegacyCollectionDisabled,
+    #[msg("Explicit version 4 collection consent is required")]
+    UnsupportedCollectionVersion,
+    #[msg("Only the enabled reporter may collect rewards")]
+    NotReporter,
+    #[msg("Report does not match the current consent, policy or collection epoch")]
+    StaleReport,
+    #[msg("Report nonce must be the next unused nonce")]
+    ReportReplay,
+    #[msg("Report has expired, is from the future, or exceeds its maximum lifetime")]
+    ReportExpired,
+    #[msg("The source token balance changed since the report")]
+    SourceBalanceChanged,
+    #[msg("Report amount exceeds a collection limit or available balance")]
+    CollectionLimit,
+    #[msg("Reporter address must be nonzero")]
+    InvalidReporter,
+    #[msg("Reporter policy is frozen after admin renunciation")]
+    ReporterFrozen,
 }

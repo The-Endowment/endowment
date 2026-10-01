@@ -19,3 +19,8 @@ pub use register_landlord::*;
 pub use resync_baseline::*;
 pub use roles::*;
 pub use sweep::*;
+
+pub mod collect_reward;
+pub mod reporter;
+pub use collect_reward::*;
+pub use reporter::*;

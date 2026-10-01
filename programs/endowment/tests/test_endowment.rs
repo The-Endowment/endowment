@@ -1,3 +1,4 @@
+use reported_rewards::reporter_pda;
 use {
     anchor_lang::{
         error::ERROR_CODE_OFFSET,
@@ -560,9 +561,20 @@ impl Env {
     }
 
     fn create_inst(&mut self, inst: &Inst, params: CreateParams) -> bool {
+        let admin = params.admin;
         let ix = self.create_ix_for(inst, params);
         let creator = inst.creator.insecure_clone();
-        send(&mut self.svm, &[ix], &creator, &[&creator])
+        let ok = send(&mut self.svm, &[ix], &creator, &[&creator]);
+        if ok && (admin == Pubkey::default() || admin == creator.pubkey()) {
+            let init = Instruction::new_with_bytes(endowment::id(),
+                &endowment::instruction::InitializeReporter { reporter: creator.pubkey() }.data(),
+                endowment::accounts::InitializeReporter {
+                    admin: creator.pubkey(), config: inst.config(), reporter_policy: reporter_pda(&inst.config()),
+                    system_program: system_program::ID,
+                }.to_account_metas(None));
+            assert!(send(&mut self.svm, &[init], &creator, &[&creator]));
+        }
+        ok
     }
 
     fn create_with(&mut self, params: CreateParams) -> bool {
@@ -1027,10 +1039,6 @@ impl Env {
         self.transfer_ix(&self.inst.coin_mint, &self.inst.coin_program, from, to, amount)
     }
 
-    fn dividend_transfer_ix(&self, from: &Pubkey, to: &Pubkey, amount: u64) -> Instruction {
-        self.transfer_ix(&self.inst.dividend_mint, &self.inst.dividend_program, from, to, amount)
-    }
-
     /// Simulates a dividend drop landing in a holder's account.
     fn airdrop_dividend(&mut self, account: &Pubkey, amount: u64) {
         let (mint, program) = (self.inst.dividend_mint, self.inst.dividend_program);
@@ -1088,6 +1096,7 @@ impl Env {
             coin_account: self.inst.coin_account(owner),
             dividend_token_program: self.inst.dividend_program,
             coin_token_program: self.inst.coin_program,
+            reporter_policy: reporter_pda(&config),
             system_program: system_program::ID,
         }
     }
@@ -1095,7 +1104,7 @@ impl Env {
     fn register_ix_with(&self, accounts: endowment::accounts::RegisterLandlord) -> Instruction {
         Instruction::new_with_bytes(
             endowment::id(),
-            &endowment::instruction::RegisterLandlord {}.data(),
+            &endowment::instruction::EnrollRewards {}.data(),
             accounts.to_account_metas(None),
         )
     }
@@ -1204,15 +1213,19 @@ impl Env {
         }
     }
 
+    // Existing pool/count fixtures supply an explicit amount based on their
+    // fixture balance. This helper is NOT a reward classifier; reporter tests
+    // below construct amounts independently of enrollment balances.
     fn sweep_with(&mut self, accounts: endowment::accounts::Sweep) -> bool {
-        let ix = Instruction::new_with_bytes(
-            endowment::id(),
-            &endowment::instruction::Sweep {}.data(),
-            accounts.to_account_metas(None),
-        );
-        // Anyone can crank a sweep.
-        let cranker = self.funded();
-        send(&mut self.svm, &[ix], &cranker, &[&cranker])
+        let data = self.svm.get_account(&accounts.landlord).unwrap().data;
+        let landlord = Landlord::try_deserialize(&mut &data[..]).unwrap();
+        let balance = token_balance(&self.svm, &accounts.dividend_account);
+        let config = Self::config_at(&self.svm, &accounts.config);
+        let amount = balance.saturating_sub(landlord.baseline)
+            .min(config.vault_cap().saturating_sub(token_balance(&self.svm, &accounts.dividend_vault)));
+        let report = self.report(&accounts, amount);
+        let signer = self.inst.creator.insecure_clone();
+        self.collect(accounts, report, &signer)
     }
 
     fn sweep(&mut self, owner: &Pubkey, account: &Pubkey) -> bool {
@@ -1308,7 +1321,7 @@ fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
     let mut env = Env::new();
     env.create();
     let config = env.config_state();
-    assert_eq!(config.version, 3);
+    assert_eq!(config.version, 4);
     assert_eq!(config.creator, env.inst.creator.pubkey());
     assert_eq!(config.admin, env.inst.creator.pubkey());
     assert_eq!(config.guardian, env.guardian.pubkey());
@@ -1446,7 +1459,7 @@ fn register_requires_a_full_delegation() {
     let approve = env.approve_ix(&owner.pubkey(), &account);
     assert!(send(&mut env.svm, &[approve, register], &owner, &[&owner]));
     let landlord = env.landlord_state(&owner.pubkey());
-    assert_eq!((landlord.version, landlord.baseline, landlord.config), (3, 100, env.config()));
+    assert_eq!((landlord.version, landlord.baseline, landlord.config), (4, 100, env.config()));
     assert_eq!(env.config_state().landlord_count, 1);
     assert!(!landlord.snapshot_valid);
     assert_eq!(landlord.joined_round, 0);
@@ -1465,66 +1478,6 @@ fn register_requires_the_minimum_stake() {
     assert_err!(env.register(&small), StakeTooSmall);
     env.mint_coin(&small.pubkey(), 3 * UNIT);
     assert!(env.register(&small));
-}
-
-#[test]
-fn sweeps_only_what_sits_above_the_baseline() {
-    let mut env = Env::new();
-    env.create_active();
-    let (owner, account) = env.registered_landlord(100);
-    let program = env.inst.dividend_program;
-    let mint = env.inst.dividend_mint;
-
-    // A dividend drop lands; the sweep takes only the new amount.
-    env.airdrop_dividend(&account, 250);
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &account), 100);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 250);
-    assert_eq!(env.landlord_state(&owner.pubkey()).total_contributed, 250);
-    assert_eq!(env.config_state().total_swept, 250);
-
-    // Nothing new: a sweep is a harmless no-op.
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 250);
-
-    // The landlord spends 60 of their own. The baseline stays where it is.
-    let burn = spl_token_2022::instruction::burn(&program, &account, &mint, &owner.pubkey(), &[], 60).unwrap();
-    assert!(send(&mut env.svm, &[burn], &owner, &[&owner]));
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(env.landlord_state(&owner.pubkey()).baseline, 100);
-
-    // Drops refill the landlord's own balance first.
-    env.airdrop_dividend(&account, 70);
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &account), 100);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 260);
-    let landlord = env.landlord_state(&owner.pubkey());
-    assert_eq!((landlord.baseline, landlord.total_contributed), (100, 260));
-}
-
-#[test]
-fn a_landlord_can_lower_its_own_baseline_with_resync() {
-    let mut env = Env::new();
-    env.create_active();
-    let (owner, account) = env.registered_landlord(100);
-    let program = env.inst.dividend_program;
-    let mint = env.inst.dividend_mint;
-    let burn = spl_token_2022::instruction::burn(&program, &account, &mint, &owner.pubkey(), &[], 60).unwrap();
-    assert!(send(&mut env.svm, &[burn], &owner, &[&owner]));
-
-    // Only the owner can resync.
-    let stranger = env.funded();
-    let mut forged = env.resync_ix(&owner.pubkey());
-    forged.accounts[0] = AccountMeta::new_readonly(stranger.pubkey(), true);
-    assert!(!send(&mut env.svm, &[forged], &stranger, &[&stranger]));
-    assert_eq!(env.landlord_state(&owner.pubkey()).baseline, 100);
-
-    let resync = env.resync_ix(&owner.pubkey());
-    assert!(send(&mut env.svm, &[resync], &owner, &[&owner]));
-    assert_eq!(env.landlord_state(&owner.pubkey()).baseline, 40);
-    env.airdrop_dividend(&account, 10);
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 10);
 }
 
 #[test]
@@ -2965,50 +2918,6 @@ fn regression_m03_a_same_transaction_front_run_cant_move_the_price_floor() {
 }
 
 #[test]
-fn regression_m04_a_third_party_sweep_cant_lower_the_baseline() {
-    let mut env = Env::new();
-    env.create_active();
-    let (owner, account) = env.registered_landlord(1_000 * UNIT);
-    let (cold, _) = env.new_landlord(0);
-
-    // The landlord moves 900 of their own to another wallet for a while.
-    let out = env.dividend_transfer_ix(&owner.pubkey(), &cold.pubkey(), 900 * UNIT);
-    assert!(send(&mut env.svm, &[out], &owner, &[&owner]));
-    // Anyone sweeps during the dip: nothing moves, and the baseline stays.
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(env.landlord_state(&owner.pubkey()).baseline, 1_000 * UNIT);
-    // The landlord moves it back; the next sweep takes nothing.
-    let back = env.dividend_transfer_ix(&cold.pubkey(), &owner.pubkey(), 900 * UNIT);
-    assert!(send(&mut env.svm, &[back], &cold, &[&cold]));
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
-}
-
-#[test]
-fn regression_m05_opting_back_in_keeps_what_arrived_while_opted_out() {
-    let mut env = Env::new();
-    env.create_active();
-    let (owner, account) = env.registered_landlord(0);
-    env.revoke(&owner);
-    // Dividends arrive while opted out.
-    env.airdrop_dividend(&account, 500 * UNIT);
-    assert_err!(env.sweep(&owner.pubkey(), &account), NotDelegated);
-
-    // The website re-opts-in with approve + resync in one transaction.
-    let ixs = [env.approve_ix(&owner.pubkey(), &account), env.resync_ix(&owner.pubkey())];
-    assert!(send(&mut env.svm, &ixs, &owner, &[&owner]));
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
-    assert_eq!(token_balance(&env.svm, &account), 500 * UNIT);
-
-    // Only new drops are swept.
-    env.airdrop_dividend(&account, 20 * UNIT);
-    assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 20 * UNIT);
-}
-
-#[test]
 fn regression_m06_sweeps_and_buybacks_fail_closed_if_the_dividend_hook_is_switched_on() {
     use spl_token_2022::extension::{transfer_hook::TransferHook, BaseStateWithExtensionsMut, StateWithExtensionsMut};
     use spl_token_2022::state::Mint as MintState;
@@ -3924,8 +3833,8 @@ fn regression_r3mint01_a_sweep_never_fills_the_vault_beyond_three_days_of_buys()
     let cap = 3 * MAX_BUY_PER_DAY;
     assert_eq!(token_balance(&env.svm, &env.dividend_vault()), cap);
     assert_eq!(token_balance(&env.svm, &account), big - cap, "the rest stays with the landlord");
-    // A full vault: a sweep is a no-op, not an error.
-    assert!(env.sweep(&owner.pubkey(), &account));
+    // Explicit reports must be positive and fit within treasury capacity.
+    assert_err!(env.sweep(&owner.pubkey(), &account), CollectionLimit);
     assert_eq!(token_balance(&env.svm, &account), big - cap);
     // A buy makes room again.
     assert!(env.buy());
@@ -4144,3 +4053,9 @@ mod refresher_changes;
 
 #[path = "regressions/completion.rs"]
 mod completion;
+
+#[path = "regressions/reported_rewards.rs"]
+mod reported_rewards;
+
+#[path = "regressions/reporter_recovery.rs"]
+mod reporter_recovery;

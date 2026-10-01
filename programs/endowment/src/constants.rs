@@ -16,8 +16,8 @@ pub const AUTHORITY_SEED: &[u8] = b"authority";
 pub const LANDLORD_SEED: &[u8] = b"landlord";
 
 /// Account layout versions, for future migrations.
-pub const CONFIG_VERSION: u8 = 3;
-pub const LANDLORD_VERSION: u8 = 3;
+pub const CONFIG_VERSION: u8 = 4;
+pub const LANDLORD_VERSION: u8 = 4;
 
 /// A guardian pause lifts on its own after this long, and a new pause can only
 /// start this long after the last one ended. The guardian can therefore stop an
@@ -195,3 +195,7 @@ pub fn flagship_config() -> Pubkey {
     )
     .0
 }
+
+/// Reporter policy is separate from the commitment refresher.
+pub const REPORTER_SEED: &[u8] = b"reporter";
+pub const MAX_REPORT_LIFETIME_SECS: i64 = 120;

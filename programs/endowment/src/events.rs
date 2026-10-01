@@ -199,3 +199,34 @@ pub struct AdminAccepted {
 pub struct AdminRenounced {
     pub config: Pubkey,
 }
+
+#[event]
+pub struct CollectionConsent {
+    pub config: Pubkey,
+    pub owner: Pubkey,
+    pub consent_id: u64,
+}
+
+#[event]
+pub struct RewardCollected {
+    pub config: Pubkey,
+    pub owner: Pubkey,
+    pub consent_id: u64,
+    pub nonce: u64,
+    pub collection_epoch: u64,
+    pub reporter_epoch: u64,
+    pub amount: u64,
+    pub received: u64,
+    /// Reporter audit-log commitment; it is not on-chain proof of provenance.
+    pub evidence_hash: [u8; 32],
+}
+
+#[event]
+pub struct ReporterChanged {
+    pub config: Pubkey,
+    pub reporter: Pubkey,
+    pub pending: Pubkey,
+    pub effective_at: i64,
+    pub epoch: u64,
+    pub disabled: bool,
+}

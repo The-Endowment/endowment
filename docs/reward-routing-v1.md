@@ -2,13 +2,13 @@
 
 The owner accepts a trusted reporting service for V1, with the daily StonkFun comparison as operational oversight. Custom distributor-funded routing is no longer a prerequisite for implementing collection. The pledge remains all verified StonkFun rewards paid in PUMP while enrolled and active, including rewards from other coins; purchases, existing balances, ordinary transfers and inactive-period receipts are excluded by the reporting policy.
 
-This document specifies the replacement, not implemented functionality. The contract still has its legacy balance-above-baseline sweep. The website currently blocks enrollment and automated sweeps pending the replacement. The existing three PRs do not implement reported-reward collection.
+This local implementation replaces balance-based collection with `collect_reward`. Legacy sweep, registration and baseline-resync instructions reject. Version 4 requires fresh owner consent and an initialized reporter policy; there is no migration instruction for live version 3 configurations. The website release hold remains until independent review and an authorized rollout. The original review snapshots remain preserved. This replacement is included in the final PR 2 package, with the service/client in PR 3.
 
 ## Accepted trust model
 
 The reporting service determines which receipts qualify and how much eligible PUMP remains. It uses StonkFun's public distribution records and finalized Solana transactions, not a wallet's balance increase alone. The contract authenticates the reporter and enforces bounded withdrawal conditions; it cannot independently prove that an off-chain classification is correct.
 
-A reporter error, compromised signing key or a race between its observation and execution can cause an incorrect collection. A matching daily aggregate does not prove that every wallet was charged correctly. Owner-approved limits reduce exposure but do not turn this into a trustless reward filter. Retained program upgrade authority is a separate power to change contract protections.
+A reporter error, compromised signing key or a race between its observation and execution can cause an incorrect collection. A matching daily aggregate does not prove that every wallet was charged correctly. The owner explicitly chose no per-wallet daily cap so high-volume rewards can all contribute. Remaining token delegation and treasury capacity constrain transfers, but there is no daily wallet loss limit. Retained program upgrade authority is a separate power to change contract protections.
 
 The authorized destination is always the derived endowment PUMP vault. The reporter cannot select another recipient, withdraw PENIS or spend treasury assets through the collection instruction. It must not receive a holder's private key. Keep its collection authorization separate from the refresher and ordinary fee-paying keeper roles.
 
@@ -56,19 +56,19 @@ The instruction must check:
 - The exact configured reporter signer, with no permissionless legacy fallback.
 - Owner consent, current SPL delegation, correct source owner/mint/token program and the fixed derived treasury destination.
 - A positive explicit amount, fresh authorization and unused nonce. The reporter does not get a “sweep the balance” option.
-- An owner-approved finite maximum per UTC day and remaining token delegation, alongside the existing treasury capacity. The UI must explain the UTC reset boundary and that a cap can leave some pledged rewards uncollected. Numeric defaults and the owner consent interface are implementation decisions still to finalize.
+- Remaining token delegation and existing treasury capacity. There is no per-wallet daily cap. Reports are rejected, never silently clipped, if the explicit amount cannot be transferred.
 - Current activation/count freshness, guardian pause, retirement, tradeability and actual direct-vault completion. Reports from a previous consent, reporter or collection generation must remain unusable after a restart.
 - Account state has not changed from any conservative precondition included in the report. A balance equality check is useful but is not proof against spending followed by a purchase that restores the same balance; this remains a limitation of asynchronous reported collection.
 - Atomic consumption of the nonce, actual net vault receipt and accounting changes only on a successful transfer. A failed transfer must not count as a contribution. Never silently increase the reported amount to fill the treasury or make a daily estimate match.
 
-Reporter rotation should use the existing governance/timelock pattern and invalidate outstanding reports. Emergency disabling can only stop collections; resumption must not revive old reports. Owners must be able to revoke their delegation or exit without the reporter, website, guardian or admin. Choosing and publishing the reporter key/custody, limit defaults, expiry and upgrade authority policy are required before deployment, not reasons to depend on a custom StonkFun interface.
+Reporter rotation should use the existing governance/timelock pattern and invalidate outstanding reports. Emergency disabling can only stop collections; resumption must not revive old reports. Owners must be able to revoke their delegation or exit without the reporter, website, guardian or admin. Choosing and publishing the reporter key/custody, expiry and upgrade authority policy are required before deployment, not reasons to depend on a custom StonkFun interface.
 
 ## Implementation sequence
 
 1. Add the bounded reporter-authorized instruction, persistent consent/replay state and owner exit. Remove or disable the old sweep on-chain. Keep completion, tradeability and treasury capacity checks shared with the existing protections.
 2. Implement the forward-only receipt ledger and reporter signing service. Separate observation/classification from signing; persist decisions before submission and reconcile finalized execution afterward. A daily report discrepancy is an investigation signal, never a debit authorization.
-3. Replace enrollment with clear trusted-service consent and finite limits. Update count/refresher/pruning assumptions and all affected layouts/IDL/client decoders together. Previously granted broad approvals must not be treated as consent to the changed policy.
-4. Add end-to-end adversarial tests, independent review and an explicitly authorized small pilot. Only then remove the website's collection hold. Keep this behavior change in its own future review; the first three prepared PRs remain the current submission batch.
+3. Replace enrollment with clear trusted-service consent without a daily wallet cap. Update count/refresher/pruning assumptions and all affected layouts/IDL/client decoders together. Previously granted broad approvals must not be treated as consent to the changed policy.
+4. Add end-to-end adversarial tests, independent review and an explicitly authorized small pilot. Only then remove the website's collection hold. Include this behavior change in the contract PR 2 and the paired client/service PR 3; preserve PR 1 as the independent count fix.
 
 No live keys, deployment or pilot are authorized by the trust-model decision. Changes remain local for review.
 
@@ -83,7 +83,7 @@ No live keys, deployment or pilot are authorized by the trust-model decision. Ch
 | Wrong reporter, destination, mint, owner, instance or source account | Reject before moving funds |
 | Repeat a report, change its amount or reuse it after exit/rejoin | Reject replay or consent mismatch |
 | Old report after pause/resume or reporter rotation | Reject the previous generation even if its wall-clock expiry has not passed |
-| Amount exceeds the owner's allowance or treasury capacity | Reject or clip only under the reviewed policy; never create a later debt |
+| Amount exceeds the owner's allowance or treasury capacity | Reject oversized reports; the service may prepare a smaller explicit amount and retain verified remainder |
 | Goal reached by donation before collection | No holder PUMP moves; completion remains permanent |
 | Token transfer fails | No contribution or consumed report is recorded |
 | Reporter supplies a false but otherwise valid amount | Contract bounds still apply; document that provenance correctness is trusted, not independently proved |
@@ -91,6 +91,12 @@ No live keys, deployment or pilot are authorized by the trust-model decision. Ch
 
 ## Disclosure before enrollment
 
-Explain that a project-operated service identifies eligible StonkFun PUMP rewards and authorizes collection. The intended policy excludes existing/purchased PUMP, ordinary transfers and inactive-period rewards, but the contract trusts that service's classification. An error or compromise can cause incorrect collection within the approved limits. Explain caps, the possibility of missed contributions, the fixed treasury destination, exit, upgrade authority and the permanent 200M direct-vault goal in plain language.
+Explain that a project-operated service identifies eligible StonkFun PUMP rewards and authorizes collection. The intended policy excludes existing/purchased PUMP, ordinary transfers and inactive-period rewards, but the contract trusts that service's classification. An error or compromise can cause incorrect collection subject to token allowance and treasury capacity. Explain the absence of a daily wallet cap, the possibility of missed contributions, the fixed treasury destination, exit, upgrade authority and the permanent 200M direct-vault goal in plain language.
 
 Do not publish unconditional claims that purchased PUMP “cannot” be taken under this model. Direct distributor-funded routing can remain a later way to reduce trust; it is not required to implement the now-accepted V1 architecture. Program-owned treasury reward eligibility remains a separate fact to verify before launch.
+
+## Implemented account and consent details
+
+Config and Landlord keep their allocation sizes and existing field offsets, consuming reserved bytes for version 4 fields. A config-wide monotonic consent ID prevents replay after deregistration or pruning closes an enrollment. `renew_reward_consent` replaces the consent ID and observation time without silently opting an old version 3 record into the policy. Report nonces remain monotonic within an enrollment. `baseline` is historical data and never controls the collected amount. Reports expire within 120 seconds and bind the observed source balance; spending and rebuying to the same balance remains a trusted-reporter race.
+
+Every finalized commitment count, parameter application, guardian pause and refresher invalidation advances the collection epoch. Previously pending eligibility is discarded at these boundaries. A direct-vault completion latches before any collection and can return successfully without consuming the report or transferring tokens. Reporter replacement requires 72 hours, has a one-day admin grace and seven-day expiry, and advances the reporter epoch. Admin or the current reporter can disable immediately; the guardian retains its bounded pause only. The first disable clears pending replacement; repeated disables are harmless and cannot veto a new recovery proposal. Restarting requires a new timelock. Renouncing the admin freezes reporter replacement even if a proposal remains recorded, while the reporter can still disable itself permanently.

@@ -38,6 +38,7 @@ pub fn handle_pause(ctx: Context<Pause>) -> Result<()> {
         config.paused_until == 0 || now >= config.paused_until.saturating_add(PAUSE_COOLDOWN_SECONDS),
         EndowmentError::PauseCooldown
     );
+    config.invalidate_reports()?;
     config.paused_until = now + MAX_PAUSE_SECONDS;
     emit!(PauseChanged { config: config_key, paused_until: config.paused_until });
     Ok(())
