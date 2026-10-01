@@ -49,8 +49,8 @@ pub struct Params {
 }
 
 impl Params {
-    /// Every hard-coded bound. `donation_bps` is locked at creation and checked with it.
-    pub fn validate(&self, donation_bps: u16) -> Result<()> {
+    /// Every hard-coded bound.
+    pub fn validate(&self) -> Result<()> {
         let (lo, hi) = MIN_BUY_INTERVAL_BOUNDS;
         require!(
             self.max_buy_per_tx > 0
@@ -63,8 +63,7 @@ impl Params {
             self.min_buy_amount <= self.max_buy_per_tx
                 && (lo..=hi).contains(&self.min_buy_interval_secs)
                 && self.tip_bps <= MAX_TIP_BPS
-                && self.buy_bps <= 10_000
-                && self.tip_bps + donation_bps <= MAX_TIP_PLUS_DONATION_BPS,
+                && self.buy_bps <= 10_000,
             EndowmentError::InvalidBuyParams
         );
         require!(
@@ -137,8 +136,6 @@ pub struct Config {
 
     pub params: Params,
     pub pending: PendingParams,
-    /// Locked at creation: share of each buyback donated to the flagship endowment.
-    pub donation_bps: u16,
     /// In coin base units: the goal. Once the coin vault holds this much, bought
     /// or sent to it directly, landlord contributions stop for good and
     /// buybacks of what's left switch to the buy/liquidity split.
@@ -187,7 +184,6 @@ pub struct Config {
     pub total_liquidity_coin: u64,
     pub total_lp_tokens: u64,
     pub total_tips: u64,
-    pub total_donated: u64,
 
     /// Bumped whenever the refresher changes (resigns, or a new one is applied).
     /// Reads made under an earlier epoch don't count (FC-R3-03).
@@ -216,8 +212,6 @@ pub struct CreateParams {
     pub params: Params,
     /// In coin base units. See `Config::contribution_cap`.
     pub contribution_cap: u64,
-    /// One of ALLOWED_DONATION_BPS. Locked forever.
-    pub donation_bps: u16,
 }
 
 impl Config {
@@ -343,17 +337,6 @@ impl Config {
     }
 }
 
-pub fn validate_donation(donation_bps: u16, dividend_mint: &Pubkey, config: &Pubkey) -> Result<()> {
-    require!(ALLOWED_DONATION_BPS.contains(&donation_bps), EndowmentError::InvalidDonation);
-    if donation_bps > 0 {
-        // Only once the flagship's address is fixed, only in the flagship's
-        // dividend asset, and the flagship never donates to itself.
-        require!(flagship_is_set(), EndowmentError::InvalidDonation);
-        require_keys_eq!(*dividend_mint, FLAGSHIP_DIVIDEND_MINT, EndowmentError::InvalidDonation);
-        require_keys_neq!(*config, flagship_config(), EndowmentError::InvalidDonation);
-    }
-    Ok(())
-}
 
 /// A landlord of one endowment. Seeds: [LANDLORD_SEED, config, owner].
 #[account]
@@ -529,51 +512,50 @@ mod tests {
 
     #[test]
     fn params_bounds() {
-        assert!(valid_params().validate(0).is_ok());
+        assert!(valid_params().validate().is_ok());
         let with = |f: &dyn Fn(&mut Params)| {
             let mut p = valid_params();
             f(&mut p);
             p
         };
-        assert!(with(&|p| p.max_buy_per_tx = 0).validate(0).is_err());
-        assert!(with(&|p| p.max_buy_per_tx = 1_001).validate(0).is_err());
-        assert!(with(&|p| p.max_price_impact_bps = 301).validate(0).is_err());
-        assert!(with(&|p| p.min_buy_amount = 101).validate(0).is_err());
-        assert!(with(&|p| p.min_buy_interval_secs = 59).validate(0).is_err());
-        assert!(with(&|p| p.tip_bps = 51).validate(0).is_err());
-        assert!(with(&|p| p.tip_bps = 51).validate(0).is_err());
-        assert!(with(&|p| p.tip_bps = 50).validate(30).is_ok());
-        assert!(with(&|p| p.tip_bps = 50).validate(40).is_err());
-        assert!(with(&|p| p.buy_bps = 10_001).validate(0).is_err());
-        assert!(with(&|p| p.activate_bps = 5_001).validate(0).is_err());
-        assert!(with(&|p| p.deactivate_bps = 3_001).validate(0).is_err());
-        assert!(with(&|p| p.min_stake_bps = 501).validate(0).is_err());
-        assert!(with(&|p| p.max_twap_deviation_bps = 99).validate(0).is_err());
-        assert!(with(&|p| p.max_twap_deviation_bps = 100).validate(0).is_ok());
-        assert!(with(&|p| p.max_twap_deviation_bps = 1_000).validate(0).is_ok());
-        assert!(with(&|p| p.max_twap_deviation_bps = 1_001).validate(0).is_err());
+        assert!(with(&|p| p.max_buy_per_tx = 0).validate().is_err());
+        assert!(with(&|p| p.max_buy_per_tx = 1_001).validate().is_err());
+        assert!(with(&|p| p.max_price_impact_bps = 301).validate().is_err());
+        assert!(with(&|p| p.min_buy_amount = 101).validate().is_err());
+        assert!(with(&|p| p.min_buy_interval_secs = 59).validate().is_err());
+        assert!(with(&|p| p.tip_bps = 51).validate().is_err());
+        assert!(with(&|p| p.tip_bps = 51).validate().is_err());
+        assert!(with(&|p| p.tip_bps = 50).validate().is_ok());
+        assert!(with(&|p| p.buy_bps = 10_001).validate().is_err());
+        assert!(with(&|p| p.activate_bps = 5_001).validate().is_err());
+        assert!(with(&|p| p.deactivate_bps = 3_001).validate().is_err());
+        assert!(with(&|p| p.min_stake_bps = 501).validate().is_err());
+        assert!(with(&|p| p.max_twap_deviation_bps = 99).validate().is_err());
+        assert!(with(&|p| p.max_twap_deviation_bps = 100).validate().is_ok());
+        assert!(with(&|p| p.max_twap_deviation_bps = 1_000).validate().is_ok());
+        assert!(with(&|p| p.max_twap_deviation_bps = 1_001).validate().is_err());
         // R3-RF-04: with an activation line, a count that finds nothing always switches off.
-        assert!(with(&|p| p.deactivate_bps = 0).validate(0).is_err());
-        assert!(with(&|p| p.deactivate_bps = 1).validate(0).is_ok());
+        assert!(with(&|p| p.deactivate_bps = 0).validate().is_err());
+        assert!(with(&|p| p.deactivate_bps = 1).validate().is_ok());
         assert!(with(&|p| {
             p.activate_bps = 0;
             p.deactivate_bps = 0
         })
-        .validate(0)
+        .validate()
         .is_ok());
         // The allowance: off, or 1x-3x with a daily ceiling.
-        assert!(with(&|p| p.allowance_margin_bps = 0).validate(0).is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 0).validate().is_ok());
         assert!(with(&|p| {
             p.allowance_margin_bps = 0;
             p.max_rewards_per_day = 0
         })
-        .validate(0)
+        .validate()
         .is_ok());
-        assert!(with(&|p| p.allowance_margin_bps = 9_999).validate(0).is_err());
-        assert!(with(&|p| p.allowance_margin_bps = 10_000).validate(0).is_ok());
-        assert!(with(&|p| p.allowance_margin_bps = 30_000).validate(0).is_ok());
-        assert!(with(&|p| p.allowance_margin_bps = 30_001).validate(0).is_err());
-        assert!(with(&|p| p.max_rewards_per_day = 0).validate(0).is_err());
+        assert!(with(&|p| p.allowance_margin_bps = 9_999).validate().is_err());
+        assert!(with(&|p| p.allowance_margin_bps = 10_000).validate().is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 30_000).validate().is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 30_001).validate().is_err());
+        assert!(with(&|p| p.max_rewards_per_day = 0).validate().is_err());
     }
 
     #[test]
@@ -674,30 +656,8 @@ mod tests {
 
     #[cfg(not(feature = "test-flagship"))]
     #[test]
-    fn no_donation_while_the_flagship_creator_is_a_placeholder() {
+    fn nobody_can_create_while_the_creator_is_a_placeholder() {
         assert!(!flagship_is_set());
-        let instance = Pubkey::new_unique();
-        assert!(validate_donation(0, &FLAGSHIP_DIVIDEND_MINT, &instance).is_ok());
-        for bps in [10, 20, 30] {
-            assert!(validate_donation(bps, &FLAGSHIP_DIVIDEND_MINT, &instance).is_err());
-        }
-    }
-
-    #[cfg(feature = "test-flagship")]
-    #[test]
-    fn donation_is_one_of_the_fixed_rates_and_only_in_the_flagship_asset() {
-        let other = Pubkey::new_unique();
-        let instance = Pubkey::new_unique();
-        for bps in ALLOWED_DONATION_BPS {
-            assert!(validate_donation(bps, &FLAGSHIP_DIVIDEND_MINT, &instance).is_ok());
-        }
-        assert!(validate_donation(15, &FLAGSHIP_DIVIDEND_MINT, &instance).is_err());
-        assert!(validate_donation(40, &FLAGSHIP_DIVIDEND_MINT, &instance).is_err());
-        assert!(validate_donation(0, &other, &instance).is_ok());
-        assert!(validate_donation(10, &other, &instance).is_err());
-        // The flagship never donates to itself.
-        assert!(validate_donation(10, &FLAGSHIP_DIVIDEND_MINT, &flagship_config()).is_err());
-        assert!(validate_donation(0, &FLAGSHIP_DIVIDEND_MINT, &flagship_config()).is_ok());
     }
 
     #[test]

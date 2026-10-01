@@ -70,7 +70,7 @@ pub fn handle_propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    params.validate(config.donation_bps)?;
+    params.validate()?;
     let effective_at = now + PARAM_TIMELOCK_SECONDS;
     config.pending = PendingParams { params, effective_at };
     emit!(ParamsProposed { config: config_key, params, effective_at });

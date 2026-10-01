@@ -2,8 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::state::Params;
 
-// Every event names the endowment instance (`config`) it belongs to, so one
-// indexer can follow every endowment on the shared contract.
+// Every event names the endowment (`config`) it belongs to.
 
 #[event]
 pub struct EndowmentCreated {
@@ -12,7 +11,6 @@ pub struct EndowmentCreated {
     pub coin_mint: Pubkey,
     pub dividend_mint: Pubkey,
     pub pool: Pubkey,
-    pub donation_bps: u16,
 }
 
 #[event]
@@ -69,13 +67,11 @@ pub struct Bought {
     pub min_acceptable: u64,
     /// Coin-per-dividend TWAP the floor was measured against (Q32.32).
     pub twap_price_x32: u128,
-    /// Dividend and coin deposited as permanent liquidity (after the milestone).
+    /// Dividend and coin deposited as permanent liquidity (after the goal).
     pub liquidity_dividend: u64,
     pub liquidity_coin: u64,
     pub lp_tokens: u64,
     pub tip: u64,
-    /// Sent to the flagship endowment's dividend vault.
-    pub donation: u64,
     pub total_dividend_spent: u64,
     pub total_coin_bought: u64,
 }

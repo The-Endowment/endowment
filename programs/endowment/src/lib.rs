@@ -4,7 +4,6 @@ pub mod events;
 pub mod health;
 pub mod instructions;
 pub mod math;
-pub mod mint_policy;
 pub mod raydium;
 pub mod state;
 pub mod transfer;
@@ -17,23 +16,24 @@ pub use state::*;
 
 declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
 
-/// Endowments for dividend-paying meme coins.
+/// The $PENIS Endowment.
 ///
-/// One shared contract hosts any number of endowments, one per (coin, creator).
-/// Each endowment collects the dividend its landlords delegate and spends it
-/// buying its coin, which it holds forever.
+/// The endowment collects the dividend (PUMP) its landlords delegate and spends
+/// it buying its coin ($PENIS), which it holds forever. Only FLAGSHIP_CREATOR
+/// can create it; the code is open source for any other project to deploy as
+/// its own copy.
 ///
-/// There is deliberately no instruction that transfers tokens out of any
+/// There is deliberately no instruction that transfers tokens out of the
 /// endowment's coin vault or liquidity (LP) vault. Landlords can always leave
 /// by revoking their token delegation directly with the token program, and by
-/// deregistering, neither of which a pause can block.
-/// Endowments are isolated from each other: every account an instruction
-/// touches is derived from, or checked against, that endowment's config.
+/// deregistering, neither of which a pause can block. Every account an
+/// instruction touches is derived from, or checked against, the endowment's
+/// config.
 #[program]
 pub mod endowment {
     use super::*;
 
-    /// Permissionless: creates an endowment for a coin and its dividend asset.
+    /// Creates the endowment. Only FLAGSHIP_CREATOR can call it.
     pub fn create_endowment(ctx: Context<CreateEndowment>, params: CreateParams) -> Result<()> {
         instructions::create_endowment::handle_create_endowment(ctx, params)
     }

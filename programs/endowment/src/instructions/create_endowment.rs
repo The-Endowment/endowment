@@ -8,25 +8,23 @@ use crate::{
     constants::*,
     error::EndowmentError,
     events::EndowmentCreated,
-    mint_policy::{check_coin_mint, check_dividend_mint},
     raydium::{PoolView, CPMM_PROGRAM_ID},
-    state::{validate_donation, Config, CountRound, CreateParams, PendingParams},
+    state::{Config, CountRound, CreateParams, PendingParams},
     transfer::capped_transfer_fee_bps,
 };
 
-/// Permissionless: anyone can create an endowment for any coin that trades
-/// against its dividend asset in a Raydium CPMM pool, if both mints pass the
-/// mint policy (`mint_policy`): in short, nobody may be able to mint, freeze,
-/// pause or take back the coin.
+/// Creates the endowment for a coin that trades against its dividend asset in a
+/// Raydium CPMM pool. Only FLAGSHIP_CREATOR can call it: this program runs the
+/// $PENIS endowment only (other projects deploy their own copy).
 ///
-/// The instance's address includes the creator, so nobody can occupy or
-/// front-run another creator's endowment: a squatter only ever creates a
-/// separate instance of their own. The vaults are created with
-/// `init_if_needed`, so someone pre-creating the (predictable) vault token
-/// accounts can't block creation either.
+/// The vaults are created with `init_if_needed`, so someone pre-creating the
+/// (predictable) vault token accounts can't block creation.
 #[derive(Accounts)]
 pub struct CreateEndowment<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = flagship_is_set() && creator.key() == FLAGSHIP_CREATOR @ EndowmentError::NotFlagshipCreator,
+    )]
     pub creator: Signer<'info>,
     #[account(
         init,
@@ -79,9 +77,7 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     let coin_mint = ctx.accounts.coin_mint.key();
     let dividend_mint = ctx.accounts.dividend_mint.key();
     require_keys_neq!(coin_mint, dividend_mint, EndowmentError::SameMint);
-    check_coin_mint(&ctx.accounts.coin_mint.to_account_info())?;
-    check_dividend_mint(&ctx.accounts.dividend_mint.to_account_info())?;
-    // A fee already above the cap would give an instance that can never trade.
+    // A fee already above the cap would give an endowment that can never trade.
     capped_transfer_fee_bps(&ctx.accounts.coin_mint.to_account_info(), clock.epoch)?;
     capped_transfer_fee_bps(&ctx.accounts.dividend_mint.to_account_info(), clock.epoch)?;
 
@@ -97,8 +93,7 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     if params.refresher == Pubkey::default() {
         params.refresher = ctx.accounts.creator.key();
     }
-    params.validate(create.donation_bps)?;
-    validate_donation(create.donation_bps, &dividend_mint, &ctx.accounts.config.key())?;
+    params.validate()?;
     require!(create.contribution_cap > 0, EndowmentError::InvalidContributionCap);
 
     let creator = ctx.accounts.creator.key();
@@ -118,7 +113,6 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         authority_bump: ctx.bumps.authority,
         params,
         pending: PendingParams::default(),
-        donation_bps: create.donation_bps,
         contribution_cap: create.contribution_cap,
         paused_until: 0,
         retired: false,
@@ -143,7 +137,6 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         total_liquidity_coin: 0,
         total_lp_tokens: 0,
         total_tips: 0,
-        total_donated: 0,
         refresher_epoch: 0,
         reward_index: 0,
         last_reward_total: 0,
@@ -161,7 +154,6 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
         coin_mint,
         dividend_mint,
         pool: config.pool,
-        donation_bps: config.donation_bps,
     });
     Ok(())
 }
