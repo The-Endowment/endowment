@@ -146,6 +146,18 @@ pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 /// threshold is 0 (a founders-only test window).
 pub const ACTIVE_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
 
+/// Reward allowance (`post_reward_total`): a landlord can be swept at most what
+/// its counted coin earned, times `allowance_margin_bps`. The margin is 0 (off:
+/// sweeps take everything above the baseline) or between these bounds.
+pub const MIN_ALLOWANCE_MARGIN_BPS: u16 = 10_000;
+pub const MAX_ALLOWANCE_MARGIN_BPS: u16 = 30_000;
+
+/// `Config::reward_index` is dividend earned per coin base unit, scaled by this.
+pub const REWARD_INDEX_SCALE: u128 = 1_000_000_000_000;
+
+/// The refresher can post the coin's reward total at most this often.
+pub const MIN_REWARD_POST_SPACING_SECS: i64 = 60 * 60;
+
 /// Minimum time between buybacks, bounds.
 pub const MIN_BUY_INTERVAL_BOUNDS: (i64, i64) = (60, 24 * 60 * 60);
 

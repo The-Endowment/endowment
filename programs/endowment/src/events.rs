@@ -56,6 +56,8 @@ pub struct Swept {
     pub received: u64,
     pub baseline: u64,
     pub total_contributed: u64,
+    /// What this landlord can still be swept (when the allowance is on).
+    pub allowance: u64,
 }
 
 #[event]
@@ -82,6 +84,23 @@ pub struct Bought {
 pub struct MilestoneReached {
     pub config: Pubkey,
     pub total_coin_bought: u64,
+    /// Coin held directly in the coin vault when the goal was recorded,
+    /// including any sent to it directly.
+    pub coin_vault_balance: u64,
+}
+
+/// The refresher posted the coin's public reward total (`post_reward_total`).
+#[event]
+pub struct RewardTotalPosted {
+    pub config: Pubkey,
+    /// The cumulative total posted.
+    pub total: u64,
+    /// The part of the increase since the last post that landlords' allowances
+    /// were credited for: 0 while contributions aren't running, and never more
+    /// than `max_rewards_per_day` for the time since the last post.
+    pub credited: u64,
+    pub reward_index: u128,
+    pub at: i64,
 }
 
 #[event]

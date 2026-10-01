@@ -15,7 +15,7 @@ use anchor_spl::{
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{Bought, MilestoneReached},
+    events::Bought,
     health::{ensure_tradeable, is_frozen, TradeAccounts},
     math::{
         floor_slippage_bps, impact_cap, lp_tokens_for, min_acceptable_out, quote_out, refill, spendable, split_buy,
@@ -33,9 +33,10 @@ use crate::{
 ///
 /// The dividend can only leave the dividend vault through the endowment's own
 /// Raydium pool, as the capped tip, or as the donation locked in at creation;
-/// the coin can only land in the endowment's coin vault. After the milestone,
-/// part of each buyback becomes liquidity whose LP tokens land in an
-/// authority-owned account that nothing can withdraw from.
+/// the coin can only land in the endowment's coin vault. After the goal (the
+/// coin vault holding `contribution_cap`, however it got there), `buy_bps` of
+/// each buyback buys the coin and the rest becomes liquidity whose LP tokens
+/// land in an authority-owned account that nothing can withdraw from.
 ///
 /// Buybacks refuse to run while either mint has a transfer hook set (see
 /// `health::ensure_tradeable`), so the tip and donation are plain transfers.
@@ -154,6 +155,10 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
+    // Coin sent to the vault directly counts toward the goal before the buy/
+    // liquidity split is chosen.
+    let coin_held = ctx.accounts.coin_vault.amount;
+    ctx.accounts.config.record_completion(config_key, coin_held);
     let plan = plan_buy(&ctx.accounts, clock.epoch, now)?;
 
     let a = &ctx.accounts;
@@ -298,10 +303,7 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     config.total_lp_tokens = config.total_lp_tokens.checked_add(lp_tokens).ok_or(EndowmentError::Overflow)?;
     config.total_tips = config.total_tips.checked_add(tip).ok_or(EndowmentError::Overflow)?;
     config.total_donated = config.total_donated.checked_add(donation).ok_or(EndowmentError::Overflow)?;
-    if !config.milestone_reached && config.total_coin_bought >= config.contribution_cap {
-        config.milestone_reached = true;
-        emit!(MilestoneReached { config: config_key, total_coin_bought: config.total_coin_bought });
-    }
+    config.record_completion(config_key, coin_after);
 
     emit!(Bought {
         config: config_key,

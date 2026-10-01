@@ -16,14 +16,18 @@ use crate::{
 /// Permissionless: anyone may crank a sweep. Funds can only move from the
 /// landlord's delegated dividend account into this endowment's dividend vault,
 /// and only the part above the landlord's baseline. A sweep never changes the
-/// baseline: a dip below it sweeps nothing and leaves it where it is.
+/// baseline: a dip below it sweeps nothing and leaves it where it is. With the
+/// reward allowance on, a sweep also never takes more than the landlord's
+/// allowance: what its counted coin earned (see `post_reward_total`).
 ///
-/// Sweeps keep running after the milestone; they stop for good only if the admin
-/// retires the endowment. They run only while the endowment is active and a count
-/// has finished recently (`Config::sweeps_on`), and they fail closed whenever a
-/// buyback couldn't run (`health::ensure_tradeable`): a transfer hook switched
-/// on, either mint's transfer fee above the cap, the pool's swaps disabled or
-/// its fee above the cap, or a vault frozen. Dividends then stay with landlords.
+/// Sweeps stop for good once the coin vault holds the goal (`contribution_cap`,
+/// bought or sent directly; recorded here as well as by buybacks) or the admin
+/// retires the endowment. They run only while the endowment is active and a
+/// count has finished recently (`Config::sweeps_on`), and they fail closed
+/// whenever a buyback couldn't run (`health::ensure_tradeable`): a transfer hook
+/// switched on, either mint's transfer fee above the cap, the pool's swaps
+/// disabled or its fee above the cap, or a vault frozen. Dividends then stay
+/// with landlords.
 #[derive(Accounts)]
 pub struct Sweep<'info> {
     #[account(
@@ -62,16 +66,18 @@ pub struct Sweep<'info> {
     /// What a buyback would trade through; read only, to check it can.
     #[account(address = config.coin_mint)]
     pub coin_mint: Box<InterfaceAccount<'info, Mint>>,
-    /// CHECK: the endowment's coin vault, at its derived address; only its
-    /// frozen state is read.
+    /// The endowment's coin vault, at its derived address: its balance decides
+    /// whether the goal has been reached, and its frozen state is checked.
     #[account(
         address = get_associated_token_address_with_program_id(
             &authority.key(),
             &config.coin_mint,
             coin_mint.to_account_info().owner,
         ) @ EndowmentError::WrongPool,
+        constraint = coin_vault.mint == config.coin_mint && coin_vault.owner == authority.key()
+            @ EndowmentError::WrongPool,
     )]
-    pub coin_vault: UncheckedAccount<'info>,
+    pub coin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: the endowment's pool; parsed by `ensure_tradeable`.
     #[account(address = config.pool @ EndowmentError::WrongPool, owner = CPMM_PROGRAM_ID)]
     pub pool_state: UncheckedAccount<'info>,
@@ -90,6 +96,12 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
+    // The goal ends contributions for good. Record it (even while paused) and
+    // stop without failing, so the record is kept and nothing moves.
+    let coin_held = ctx.accounts.coin_vault.amount;
+    if ctx.accounts.config.record_completion(config_key, coin_held) {
+        return Ok(());
+    }
     let config = &ctx.accounts.config;
     require!(!config.is_paused(now), EndowmentError::Paused);
     require!(!config.retired, EndowmentError::Retired);
@@ -119,16 +131,21 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     // rest stays with the landlord for a later sweep (R3-MINT-01, FC-R3-04).
     let vault_before = ctx.accounts.dividend_vault.amount;
     let vault_cap = config.vault_cap();
-    let amount = ctx
-        .accounts
-        .landlord
-        .sweepable(dividend_account.amount, dividend_account.delegated_amount)
-        .min(vault_cap.saturating_sub(vault_before));
+    let (balance, delegated) = (dividend_account.amount, dividend_account.delegated_amount);
+    let (reward_index, capped, authority_bump) =
+        (config.reward_index, config.params.allowance_margin_bps > 0, config.authority_bump);
+    let landlord = &mut ctx.accounts.landlord;
+    // And, with the allowance on, never more than what its coin earned.
+    landlord.settle(reward_index);
+    let mut amount = landlord.sweepable(balance, delegated).min(vault_cap.saturating_sub(vault_before));
+    if capped {
+        amount = amount.min(landlord.allowance);
+    }
     if amount == 0 {
         return Ok(());
     }
 
-    let bump = [config.authority_bump];
+    let bump = [authority_bump];
     let seeds = Config::authority_seeds(&config_key, &bump);
     token_interface::transfer_checked(
         CpiContext::new_with_signer(
@@ -151,6 +168,9 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     let landlord = &mut ctx.accounts.landlord;
     landlord.total_contributed = landlord.total_contributed.checked_add(amount).ok_or(EndowmentError::Overflow)?;
     landlord.last_sweep_at = now;
+    if capped {
+        landlord.allowance -= amount;
+    }
     let config = &mut ctx.accounts.config;
     config.total_swept = config.total_swept.checked_add(received).ok_or(EndowmentError::Overflow)?;
     config.last_sweep_at = now;
@@ -162,6 +182,7 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         received,
         baseline: landlord.baseline,
         total_contributed: landlord.total_contributed,
+        allowance: landlord.allowance,
     });
     Ok(())
 }

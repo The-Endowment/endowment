@@ -21,8 +21,9 @@ use {
     endowment::{
         constants::{
             ACTIVE_MAX_AGE_SECS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
-            FLAGSHIP_COIN_MINT, LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, PARAM_APPLY_GRACE_SECONDS,
-            PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS, REQUIRED_ATTESTATIONS,
+            FLAGSHIP_COIN_MINT, LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
+            PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
+            REQUIRED_ATTESTATIONS, REWARD_INDEX_SCALE,
         },
         error::EndowmentError,
         state::{Config, CreateParams, Landlord, Params},
@@ -328,6 +329,10 @@ fn base_params() -> Params {
         deactivate_bps: 2_500,
         min_stake_bps: 10,
         refresher: refresher().pubkey(),
+        // Off here, so the sweep tests below cover the uncapped sweep; the
+        // allowance has its own tests (regressions/allowance.rs).
+        allowance_margin_bps: 0,
+        max_rewards_per_day: 0,
     }
 }
 
@@ -2154,7 +2159,7 @@ fn regression_r2roles05_the_liquidity_share_buys_while_the_pool_has_deposits_dis
 }
 
 #[test]
-fn sweeps_keep_flowing_after_the_milestone() {
+fn sweeps_stop_for_good_at_the_goal() {
     let mut env = pool_env_with(10_000 * UNIT, |p| {
         p.contribution_cap = 1;
         p.params.activate_bps = 0;
@@ -2165,12 +2170,14 @@ fn sweeps_keep_flowing_after_the_milestone() {
     assert!(env.buy());
     assert!(env.config_state().milestone_reached);
 
+    // A sweep after the goal succeeds but moves nothing.
     env.set_balance(&account, 700 * UNIT);
     let vault_before = token_balance(&env.svm, &env.dividend_vault());
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert!(token_balance(&env.svm, &env.dividend_vault()) > vault_before);
-    assert_eq!(token_balance(&env.svm, &account), 0);
-    assert!(env.config_state().total_swept > 0);
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), vault_before);
+    assert_eq!(token_balance(&env.svm, &account), 700 * UNIT);
+    assert_eq!(env.config_state().total_swept, 0);
+    assert!(!env.config_state().active);
 }
 
 #[test]
@@ -3067,15 +3074,18 @@ fn regression_i09_dust_is_skipped_without_using_up_the_interval() {
 }
 
 #[test]
-fn regression_l13_coin_sent_to_the_vault_doesnt_reach_the_milestone() {
+fn coin_sent_to_the_vault_counts_toward_the_goal() {
+    // Reverses L-13 by decision: 200M is 200M, bought or sent directly.
     let mut env = pool_env_with(50_000 * UNIT, |p| p.params.buy_bps = 5_000);
     let coin_vault = env.coin_vault();
     env.set_balance(&coin_vault, CONTRIBUTION_CAP + 1);
     assert!(env.buy());
     let config = env.config_state();
-    // Still all buying: the milestone counts only coin the endowment bought.
-    assert!(!config.milestone_reached);
-    assert_eq!((config.total_lp_tokens, config.total_dividend_spent), (0, MAX_BUY_PER_TX));
+    // Recorded before the buy chose its split, so this buy already splits.
+    assert!(config.milestone_reached);
+    assert!(config.total_lp_tokens > 0);
+    assert!(config.total_dividend_spent > 0 && config.total_dividend_spent <= MAX_BUY_PER_TX);
+    assert!(token_balance(&env.svm, &coin_vault) >= CONTRIBUTION_CAP + 1);
 }
 
 #[test]
@@ -4135,3 +4145,12 @@ fn regression_band_an_attacker_who_pushes_the_price_down_first_only_loses() {
     println!("attacker: dumped {dump}, got back {back}");
     assert!(back < dump);
 }
+
+#[path = "regressions/refresher_changes.rs"]
+mod refresher_changes;
+
+#[path = "regressions/completion.rs"]
+mod completion;
+
+#[path = "regressions/allowance.rs"]
+mod allowance;

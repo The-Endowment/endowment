@@ -77,6 +77,12 @@ pub mod endowment {
         instructions::count::handle_finish_count(ctx)
     }
 
+    /// The refresher posts the coin's public cumulative reward total; landlords'
+    /// sweep allowances grow by what their counted coin earned (see `rewards`).
+    pub fn post_reward_total(ctx: Context<PostRewardTotal>, total: u64) -> Result<()> {
+        instructions::rewards::handle_post_reward_total(ctx, total)
+    }
+
     /// Decrease-only re-read of landlords' balances between counts. When the
     /// endowment's refresher signs, it also attests them (see `count`).
     pub fn refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'info>>) -> Result<()> {

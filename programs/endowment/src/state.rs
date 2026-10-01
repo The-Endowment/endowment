@@ -38,6 +38,14 @@ pub struct Params {
     /// public (`LandlordsAttested` lists the landlords). `Pubkey::default()` =
     /// none, so nobody counts and sweeps stay off.
     pub refresher: Pubkey,
+    /// Reward allowance, in bps: each landlord can be swept at most what its
+    /// counted coin earned (from the reward totals the refresher posts), times
+    /// this. 0 = off: sweeps take everything above the baseline.
+    pub allowance_margin_bps: u16,
+    /// The most the coin's holders can plausibly earn per day, in dividend base
+    /// units. Each posted total is clamped to this rate for the time since the
+    /// last post, so a wrong or hostile post can only release so much.
+    pub max_rewards_per_day: u64,
 }
 
 impl Params {
@@ -66,6 +74,12 @@ impl Params {
             EndowmentError::InvalidActivation
         );
         require!(self.min_stake_bps <= MAX_MIN_STAKE_BPS, EndowmentError::InvalidParams);
+        require!(
+            self.allowance_margin_bps == 0
+                || ((MIN_ALLOWANCE_MARGIN_BPS..=MAX_ALLOWANCE_MARGIN_BPS).contains(&self.allowance_margin_bps)
+                    && self.max_rewards_per_day > 0),
+            EndowmentError::InvalidAllowance
+        );
         Ok(())
     }
 }
@@ -125,8 +139,9 @@ pub struct Config {
     pub pending: PendingParams,
     /// Locked at creation: share of each buyback donated to the flagship endowment.
     pub donation_bps: u16,
-    /// In coin base units. Once the endowment has bought this much, buybacks
-    /// switch to the buy/liquidity split. Contributions keep flowing.
+    /// In coin base units: the goal. Once the coin vault holds this much, bought
+    /// or sent to it directly, landlord contributions stop for good and
+    /// buybacks of what's left switch to the buy/liquidity split.
     pub contribution_cap: u64,
 
     /// Unix timestamp; everything but leaving is blocked while `now < paused_until`.
@@ -136,7 +151,8 @@ pub struct Config {
     pub retired: bool,
     /// When a proposed retirement can take effect; 0 = none proposed.
     pub retire_at: i64,
-    /// One-way: set when `total_coin_bought` reaches `contribution_cap`.
+    /// One-way: set once the coin vault holds `contribution_cap` (see
+    /// `record_completion`). No more sweeps or registrations after it.
     pub milestone_reached: bool,
 
     /// Landlord sweeps run only while `active`. See the daily count
@@ -177,8 +193,16 @@ pub struct Config {
     /// Reads made under an earlier epoch don't count (FC-R3-03).
     pub refresher_epoch: u32,
 
+    /// Reward allowance: dividend earned per coin base unit since creation,
+    /// times the margin, scaled by REWARD_INDEX_SCALE. Grows only when the
+    /// refresher posts a higher reward total while contributions are running.
+    pub reward_index: u128,
+    /// The last reward total the refresher posted, and when (0 = never).
+    pub last_reward_total: u64,
+    pub last_reward_post_at: i64,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 124],
+    pub reserved: [u8; 92],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -201,12 +225,36 @@ impl Config {
         now < self.paused_until
     }
 
-    /// Sweeps run only while active, and (outside a 0-threshold test window)
-    /// only while a count has finished recently: a count nobody runs can't keep
-    /// an endowment switched on.
+    /// Sweeps run only while active, only until the goal is reached, and
+    /// (outside a 0-threshold test window) only while a count has finished
+    /// recently: a count nobody runs can't keep an endowment switched on.
     pub fn sweeps_on(&self, now: i64) -> bool {
-        self.active
+        !self.milestone_reached
+            && self.active
             && (self.params.activate_bps == 0 || now.saturating_sub(self.last_count_at) <= ACTIVE_MAX_AGE_SECS)
+    }
+
+    /// Whether landlord contributions are running right now: what reward
+    /// allowances accrue during (`post_reward_total`).
+    pub fn collecting(&self, now: i64) -> bool {
+        !self.is_paused(now) && !self.retired && self.sweeps_on(now)
+    }
+
+    /// Records the goal once the coin vault holds `contribution_cap`, however
+    /// the coin got there (bought or sent directly). One-way. Returns whether
+    /// the goal has been reached, so a caller can stop without failing (and so
+    /// keep the record).
+    pub fn record_completion(&mut self, config: Pubkey, coin_vault_balance: u64) -> bool {
+        if !self.milestone_reached && coin_vault_balance >= self.contribution_cap {
+            self.milestone_reached = true;
+            self.active = false;
+            emit!(crate::events::MilestoneReached {
+                config,
+                total_coin_bought: self.total_coin_bought,
+                coin_vault_balance,
+            });
+        }
+        self.milestone_reached
     }
 
     /// When the open round's timeout clock started: its start, or the end of a
@@ -221,8 +269,11 @@ impl Config {
 
     /// Hysteresis: on at or above `activate_bps`, off below `deactivate_bps`,
     /// unchanged in between.
+    /// Once the goal is reached, nothing switches sweeps back on.
     pub fn apply_committed_bps(&mut self, committed_bps: u16) {
-        if committed_bps >= self.params.activate_bps {
+        if self.milestone_reached {
+            self.active = false;
+        } else if committed_bps >= self.params.activate_bps {
             self.active = true;
         } else if committed_bps < self.params.deactivate_bps {
             self.active = false;
@@ -254,14 +305,18 @@ impl Config {
         }
     }
 
-    /// The refresher resigns: reads made under it stop counting, an open round
-    /// (whose tally rests on those reads) closes without a result, and sweeps
-    /// switch off until a count under a new refresher switches them back on
-    /// (FC-R3-03).
+    /// The refresher resigns or changes: reads made under it stop counting, an
+    /// open round (whose tally rests on those reads) closes without a result,
+    /// and sweeps switch off until a count under a new refresher switches them
+    /// back on (FC-R3-03). The last count's result is cleared too, so a later
+    /// parameter change can't switch sweeps back on from it (PR #1).
     pub fn retire_refresher_reads(&mut self) {
         self.refresher_epoch = self.refresher_epoch.wrapping_add(1);
         self.count.open = false;
         self.active = false;
+        self.last_count_bps = 0;
+        self.last_count_at = 0;
+        self.last_committed = 0;
     }
 
     /// The minimum coin a landlord must hold, given the coin's current supply.
@@ -346,11 +401,32 @@ pub struct Landlord {
     /// an earlier epoch (a refresher since resigned or replaced) don't count.
     pub attestation_epoch: u32,
 
+    /// Reward allowance: the endowment's `reward_index` when this landlord was
+    /// last settled, and what it can still be swept (see `settle`).
+    pub index_at: u128,
+    pub allowance: u64,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 52],
+    pub reserved: [u8; 28],
 }
 
 impl Landlord {
+    /// Adds what this landlord's counted coin earned since it was last settled
+    /// to its allowance. Called before anything reads the allowance or changes
+    /// `counted_amount`, so each stretch of time is credited at the amount that
+    /// was counted during it. Saturates rather than fails: the worst case is an
+    /// allowance stuck at its cap, never a blocked sweep or count.
+    pub fn settle(&mut self, reward_index: u128) {
+        let grown = reward_index.saturating_sub(self.index_at);
+        if grown > 0 && self.counted_amount > 0 {
+            let earned = (self.counted_amount as u128)
+                .checked_mul(grown)
+                .map_or(u128::MAX, |v| v / REWARD_INDEX_SCALE);
+            self.allowance = self.allowance.saturating_add(earned.min(u64::MAX as u128) as u64);
+        }
+        self.index_at = reward_index;
+    }
+
     /// How much of `balance` is sweepable: only what sits above the baseline,
     /// capped by the remaining delegation. The baseline never moves here.
     pub fn sweepable(&self, balance: u64, delegated: u64) -> u64 {
@@ -394,7 +470,9 @@ mod tests {
             attestations: 0,
             last_attested_at: 0,
             attestation_epoch: 0,
-            reserved: [0; 52],
+            index_at: 0,
+            allowance: 0,
+            reserved: [0; 28],
         }
     }
 
@@ -412,6 +490,8 @@ mod tests {
             deactivate_bps: 2_500,
             min_stake_bps: 10,
             refresher: Pubkey::new_unique(),
+            allowance_margin_bps: 15_000,
+            max_rewards_per_day: 1_000_000,
         }
     }
 
@@ -481,6 +561,60 @@ mod tests {
         })
         .validate(0)
         .is_ok());
+        // The allowance: off, or 1x-3x with a daily ceiling.
+        assert!(with(&|p| p.allowance_margin_bps = 0).validate(0).is_ok());
+        assert!(with(&|p| {
+            p.allowance_margin_bps = 0;
+            p.max_rewards_per_day = 0
+        })
+        .validate(0)
+        .is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 9_999).validate(0).is_err());
+        assert!(with(&|p| p.allowance_margin_bps = 10_000).validate(0).is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 30_000).validate(0).is_ok());
+        assert!(with(&|p| p.allowance_margin_bps = 30_001).validate(0).is_err());
+        assert!(with(&|p| p.max_rewards_per_day = 0).validate(0).is_err());
+    }
+
+    #[test]
+    fn settling_credits_each_stretch_at_the_amount_counted_during_it() {
+        let mut l = landlord(0);
+        l.counted_amount = 1_000_000;
+        // Index 0 -> 2 PUMP-units per coin unit, scaled.
+        l.settle(2 * REWARD_INDEX_SCALE);
+        assert_eq!((l.allowance, l.index_at), (2_000_000, 2 * REWARD_INDEX_SCALE));
+        // Settling twice at the same index adds nothing.
+        l.settle(2 * REWARD_INDEX_SCALE);
+        assert_eq!(l.allowance, 2_000_000);
+        // A landlord counted at zero earns nothing, but its index still moves.
+        l.counted_amount = 0;
+        l.settle(5 * REWARD_INDEX_SCALE);
+        assert_eq!((l.allowance, l.index_at), (2_000_000, 5 * REWARD_INDEX_SCALE));
+    }
+
+    #[test]
+    fn settling_saturates_instead_of_failing() {
+        let mut l = landlord(0);
+        l.counted_amount = u64::MAX;
+        l.settle(u128::MAX);
+        assert_eq!(l.allowance, u64::MAX);
+        l.settle(u128::MAX);
+        assert_eq!(l.allowance, u64::MAX);
+    }
+
+    #[test]
+    fn the_goal_is_one_way_and_stops_sweeps() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.contribution_cap = 100;
+        config.active = true;
+        assert!(!config.record_completion(Pubkey::default(), 99));
+        assert!(config.sweeps_on(0));
+        assert!(config.record_completion(Pubkey::default(), 100));
+        assert!(!config.sweeps_on(0) && !config.active);
+        // A lower balance later doesn't undo it, and no count switches sweeps back on.
+        assert!(config.record_completion(Pubkey::default(), 0));
+        config.apply_committed_bps(10_000);
+        assert!(!config.active);
     }
 
     #[test]

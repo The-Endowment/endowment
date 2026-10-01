@@ -108,4 +108,10 @@ pub enum EndowmentError {
     NoRefresher,
     #[msg("Only the refresher can do this")]
     NotRefresher,
+    #[msg("The endowment has reached its goal and takes no more contributions")]
+    Completed,
+    #[msg("The reward total was posted too recently")]
+    RewardPostTooSoon,
+    #[msg("The allowance margin must be 0 or within bounds, with a daily rewards ceiling")]
+    InvalidAllowance,
 }
