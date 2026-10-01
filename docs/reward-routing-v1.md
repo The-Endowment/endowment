@@ -25,6 +25,14 @@ Use the confirmed order of on-chain consent, activation, payout and exit transac
 
 For this draft, “after activation” means payment execution time, consistent with the owner's request about when rewards are airdropped. A reward that accrued earlier but is first paid after activation is eligible. A reward that already landed in the holder's account before activation is excluded forever. Confirm that the distributor can distinguish first payment, retry and previously paid reward records.
 
+## Forward only operation
+
+Pre-launch payout history is not required for V1. Start with an explicit on-chain boundary and apply each holder's enrollment and the campaign's active state to subsequent payouts. Keep a durable record of payout IDs processed from that point to prevent duplicates; this does not require reconstructing earlier distributions.
+
+For a polling-based observer, the recommended simple recovery rule is to skip missed or uncertain payouts permanently, report the observation gap, and resume from a fresh verified boundary. Never estimate a missed reward from the holder's current balance or take it from a later deposit. A bounded recent feed can lose records during outages or between polls in a busy cycle. Accepting missed contributions removes historical recovery from the required scope, but means a 100% pledge does not guarantee every eligible reward is collected.
+
+This observer recovery rule does not authorize wallet debits. The proposed direct routing instruction still checks current consent and eligibility when the distributor pays; its enforcement does not depend on an observer having complete history. Historical API access can remain optional for reporting and reconciliation.
+
 ## Preferred implementation
 
 Have StonkFun call a routing instruction as part of its payout transaction. The instruction transfers PUMP from an authenticated distributor-owned source directly to the selected destination. It never uses the holder's PUMP account as a transfer source.
@@ -71,7 +79,7 @@ StonkFun remains trusted to identify and calculate its own reward payments, as i
 
 StonkFun must confirm that it can call this routing instruction or provide an equivalent authenticated on-chain payout mechanism. Obtain its supported signer/program identifiers, unique payout IDs, batching/retry behavior, costs and program-owned treasury eligibility. A public JSON endpoint or wallet label is not an on-chain authorization proof.
 
-Public API inspection confirms that `/api/public/v1/rewards` connects generating-coin mints and reward mints to recent batch transaction signatures and amounts. These records can be joined to finalized transaction data for individual transfer amounts. The PENIS-specific `/tokens/{mint}/rewards` response provides aggregate totals. This is useful reconciliation evidence; it does not give this program a historical receipt proof or debit authorization. The documented recent-record limit is 100 with no published history cursor, so complete payout history requires additional support. A sampled API batch was reconciled to 17 on-chain STONK transfers with an exact amount match; that test does not establish coverage of all PENIS/PUMP payouts.
+Public API inspection confirms that `/api/public/v1/rewards` connects generating-coin mints and reward mints to recent batch transaction signatures and amounts. These records can be joined to finalized transaction data for individual transfer amounts. The PENIS-specific `/tokens/{mint}/rewards` response provides aggregate totals. This is useful reconciliation evidence; it does not give this program a receipt proof or debit authorization. The documented recent-record limit is 100 with no published history cursor. Complete history is optional under the forward-only scope above, provided missed contributions are accepted and never recovered from wallet balances. A sampled API batch was reconciled to 17 on-chain STONK transfers with an exact amount match; that test does not establish coverage of all PENIS/PUMP payouts.
 
 The exact capacity behavior remains a review decision. Recommended default: route only the amount allowed by the existing capacity bound and pay the remainder to the holder immediately, with no later recovery. This preserves the treasury cap and the rule against later wallet debits, but disclosures must explain that a 100% pledge can produce a smaller accepted contribution when safeguards limit collection. Do not silently remove the cap to satisfy a literal 100% collection claim.
 
@@ -92,6 +100,7 @@ These scenarios are requirements for future transaction tests; they are not impl
 | Rewards paid before first activation, during a pause, or during a stale count | Paid to holder and permanently excluded from later collection |
 | Holder opts out before payout, or payout executes before opt-out | Destination follows confirmed on-chain ordering, with no later debt |
 | Rejoin after opting out or recreate the consent record | Only subsequent eligible payouts count; old payout IDs remain consumed |
+| Observer restarts or the recent API window omits payouts | Under the proposed recovery rule, report the gap, skip uncertain payouts and resume at a fresh boundary; never charge a current balance to compensate |
 | Repeat a payout ID, change its recipient, mint, instance or amount | Reject replay or mismatch; no double credit or duplicate transfer |
 | Substitute an attacker signer, holder source account or foreign treasury | Reject before movement |
 | Direct donation reaches the goal immediately before payout | Pay holder; persist completion; no contribution or future restart |
