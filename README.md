@@ -4,7 +4,9 @@ Permanent capital. The only holder that can never pull out.
 
 Website: [thepenisendowment.com](https://thepenisendowment.com) ([source](https://github.com/The-Endowment/website))
 
-This is a Solana program for **endowments**: vaults that hold a dividend-paying meme coin and reinvest the rewards they receive. Participating holders ("landlords") opt in by delegating their reward-token account. The current collection mechanism treats all reward-token balance above the recorded baseline as eligible, including transfers from unrelated sources. Authenticated collection of PENIS-derived PUMP alone remains a release blocker.
+This is a Solana program for **endowments**: vaults that hold a dividend-paying meme coin and reinvest the rewards they receive. The accepted V1 contribution policy now covers all verified StonkFun rewards paid in PUMP to an enrolled holder while collection is active, including rewards from other coins. Purchased PUMP, existing balances, ordinary transfers and rewards already paid while inactive must be excluded. See the [reward routing policy and proposed design](docs/reward-routing-v1.md).
+
+**Collection is not ready for this policy.** The current implementation enrolls holders by delegating their reward-token account and collects balance above a baseline. That can include purchased PUMP and rewards received before activation. Replacing that path with authenticated reward routing remains a release blocker. The behavior described below is the current implementation, not a claim that the new routing policy is implemented.
 
 **One shared contract, many endowments.** The program supports separate endowments for different coins. $PENIS (paid in PUMP) is the flagship. This review branch contains proposed changes and local test results; it is not a production deployment or independent audit certification.
 
