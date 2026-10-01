@@ -2,7 +2,7 @@
 
 The owner accepts a trusted reporting service for V1, with the daily StonkFun comparison as operational oversight. Custom distributor-funded routing is no longer a prerequisite for implementing collection. The pledge remains all verified StonkFun rewards paid in PUMP while enrolled and active, including rewards from other coins; purchases, existing balances, ordinary transfers and inactive-period receipts are excluded by the reporting policy.
 
-This local implementation replaces balance-based collection with `collect_reward`. Legacy sweep, registration and baseline-resync instructions reject. Version 4 requires fresh owner consent and an initialized reporter policy; there is no migration instruction for live version 3 configurations. The website release hold remains until independent review and an authorized rollout. The original review snapshots remain preserved. This replacement is included in the final PR 2 package, with the service/client in PR 3.
+This implementation replaces balance-based collection with `collect_reward`. Legacy sweep, registration and baseline-resync instructions reject. Version 4 requires fresh owner consent and an initialized reporter policy; there is no migration instruction for live version 3 configurations. The website release hold remains until independent review and an authorized rollout. This replacement is included in PR 2, with the service/client in PR 3.
 
 ## Accepted trust model
 
@@ -70,7 +70,7 @@ Reporter rotation should use the existing governance/timelock pattern and invali
 3. Replace enrollment with clear trusted-service consent without a daily wallet cap. Update count/refresher/pruning assumptions and all affected layouts/IDL/client decoders together. Previously granted broad approvals must not be treated as consent to the changed policy.
 4. Add end-to-end adversarial tests, independent review and an explicitly authorized small pilot. Only then remove the website's collection hold. Include this behavior change in the contract PR 2 and the paired client/service PR 3; preserve PR 1 as the independent count fix.
 
-No live keys, deployment or pilot are authorized by the trust-model decision. Changes remain local for review.
+No live keys, deployment or pilot are authorized by the trust-model decision. These changes are submitted for developer review; merging does not authorize a production rollout.
 
 ## Acceptance scenarios
 

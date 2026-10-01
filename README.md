@@ -90,13 +90,13 @@ A Token-2022 mint may carry a transfer-hook extension (PUMP's is currently unset
 
 ## Status
 
-Pre-launch, in local review. Public enrollment and collection remain on hold.
+Pre-launch, submitted for developer review. Public enrollment and collection remain on hold.
 
 | Scope | State |
 |---|---|
-| Version 4 consent, reporter-authorized collection, replay protection, reporter recovery | Implemented locally; regression and adversarial review in progress |
+| Version 4 consent, reporter-authorized collection, replay protection, reporter recovery | Implemented; 166 contract tests pass and scoped AI adversarial findings were fixed and rechecked; independent review remains outstanding |
 | Legacy balance-based registration, sweep and resync | Disabled on-chain |
-| Reporter service and client consent flow | Companion local implementation; review with this program |
+| Reporter service and client consent flow | Companion website PR; review with this program |
 | Pause, owner exit, permanent vaults | Built and tested locally |
 | Buybacks: contract-sized, TWAP-priced, paced, tipped | ✅ Built and tested against mainnet pool state |
 | Daily commitment count (unlimited landlords), milestone, post-milestone locked liquidity | ✅ Built and tested against mainnet pool state |
