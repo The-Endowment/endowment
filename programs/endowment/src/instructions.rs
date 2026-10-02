@@ -6,6 +6,7 @@ pub mod pause;
 pub mod prune_landlord;
 pub mod register_landlord;
 pub mod resync_baseline;
+pub mod rewards;
 pub mod roles;
 pub mod sweep;
 
@@ -17,5 +18,6 @@ pub use pause::*;
 pub use prune_landlord::*;
 pub use register_landlord::*;
 pub use resync_baseline::*;
+pub use rewards::*;
 pub use roles::*;
 pub use sweep::*;

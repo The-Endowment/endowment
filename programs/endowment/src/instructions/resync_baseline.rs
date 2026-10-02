@@ -8,8 +8,10 @@ use crate::{
 };
 
 /// Owner-signed: sets the landlord's baseline to its dividend account's current
-/// balance, so everything it holds now stays its own. The website sends this
-/// with the approval whenever a landlord opts back in. Nothing else can lower a
+/// balance, so everything it holds now stays its own, and starts its reward
+/// allowance afresh, so nothing earned before (say, while it was away) can be
+/// swept from what it holds or adds from now on. The website sends this with
+/// the approval whenever a landlord opts back in. Nothing else can lower a
 /// baseline.
 #[derive(Accounts)]
 pub struct ResyncBaseline<'info> {
@@ -36,9 +38,12 @@ pub struct ResyncBaseline<'info> {
 
 pub fn handle_resync_baseline(ctx: Context<ResyncBaseline>) -> Result<()> {
     let new_baseline = ctx.accounts.dividend_account.amount;
+    let reward_index = ctx.accounts.config.reward_index;
     let landlord = &mut ctx.accounts.landlord;
     let old_baseline = landlord.baseline;
     landlord.baseline = new_baseline;
+    landlord.index_at = reward_index;
+    landlord.allowance = 0;
     emit!(BaselineChanged {
         config: ctx.accounts.config.key(),
         owner: landlord.owner,

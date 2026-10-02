@@ -83,8 +83,8 @@ pub fn impact_cap(reserve_in: u64, max_price_impact_bps: u16) -> u64 {
     (reserve_in as u128 * max_price_impact_bps as u128 / (2 * BPS)) as u64
 }
 
-/// What a buyback may spend from `vault_balance`, leaving room for the tip and
-/// donation (charged on top as `extra_bps` of the amount spent).
+/// What a buyback may spend from `vault_balance`, leaving room for the tip
+/// (charged on top as `extra_bps` of the amount spent).
 pub fn spendable(vault_balance: u64, extra_bps: u16) -> u64 {
     (vault_balance as u128 * BPS / (BPS + extra_bps as u128)) as u64
 }
@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn spendable_leaves_room_for_the_tip_and_donation() {
+    fn spendable_leaves_room_for_the_tip() {
         assert_eq!(spendable(10_025, 25), 10_000);
         assert_eq!(spendable(10_055, 55), 10_000);
         assert_eq!(spendable(0, 25), 0);

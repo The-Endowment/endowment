@@ -20,9 +20,10 @@ use {
     },
     endowment::{
         constants::{
-            ACTIVE_MAX_AGE_SECS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
-            FLAGSHIP_COIN_MINT, LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, PARAM_APPLY_GRACE_SECONDS,
-            PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS, REQUIRED_ATTESTATIONS,
+            ACTIVE_MAX_AGE_SECS, ALLOWANCE_MARGIN_BPS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
+            LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
+            PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
+            REQUIRED_ATTESTATIONS, REWARD_INDEX_SCALE,
         },
         error::EndowmentError,
         state::{Config, CreateParams, Landlord, Params},
@@ -328,6 +329,10 @@ fn base_params() -> Params {
         deactivate_bps: 2_500,
         min_stake_bps: 10,
         refresher: refresher().pubkey(),
+        // Off here, so the sweep tests below cover the uncapped sweep; the
+        // allowance has its own tests (regressions/allowance.rs).
+        allowance_margin_bps: 0,
+        max_rewards_per_day: 0,
     }
 }
 
@@ -347,17 +352,12 @@ fn test_flagship_creator() -> Keypair {
     Keypair::try_from(&SECRET[..]).unwrap()
 }
 
-fn flagship_config() -> Pubkey {
-    config_pda(&FLAGSHIP_COIN_MINT, &test_flagship_creator().pubkey())
-}
-
-fn params(guardian: Pubkey, donation_bps: u16) -> CreateParams {
+fn params(guardian: Pubkey) -> CreateParams {
     CreateParams {
         admin: Pubkey::default(),
         guardian,
         params: base_params(),
         contribution_cap: CONTRIBUTION_CAP,
-        donation_bps,
     }
 }
 
@@ -420,7 +420,8 @@ impl Env {
         // Built by scripts/test.sh with `--features test-flagship`.
         let bytes = include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy-test/endowment.so"));
         svm.add_program(endowment::id(), bytes).unwrap();
-        let creator = Keypair::new();
+        // Only the flagship creator can create an endowment.
+        let creator = test_flagship_creator();
         let guardian = Keypair::new();
         let mint_authority = Keypair::new();
         for kp in [&creator, &guardian, &mint_authority, &refresher()] {
@@ -572,7 +573,7 @@ impl Env {
 
     /// Create with the defaults, adjusted by `f`.
     fn create_custom(&mut self, f: impl FnOnce(&mut CreateParams)) {
-        let mut p = params(self.guardian.pubkey(), 0);
+        let mut p = params(self.guardian.pubkey());
         f(&mut p);
         assert!(self.create_with(p));
     }
@@ -617,20 +618,6 @@ impl Env {
         u64::from_le_bytes(data[333..341].try_into().unwrap())
     }
 
-    fn flagship_vault(&self) -> Pubkey {
-        ata(&authority_pda(&flagship_config()), &self.inst.dividend_mint, &self.inst.dividend_program)
-    }
-
-    /// Creates the flagship endowment (the test build's flagship creator, on
-    /// this pool, with the defaults), which creates its dividend vault.
-    fn create_flagship_vault(&mut self) {
-        let mut flagship = self.inst.clone();
-        flagship.creator = test_flagship_creator();
-        self.svm.airdrop(&flagship.creator.pubkey(), 10_000_000_000).unwrap();
-        let guardian = self.guardian.pubkey();
-        assert!(self.create_inst(&flagship, params(guardian, 0)));
-    }
-
     fn buyback_accounts_for(&self, inst: &Inst, caller: &Pubkey) -> endowment::accounts::Buyback {
         let cpmm = fixtures::cpmm_program();
         let authority = inst.authority();
@@ -652,7 +639,6 @@ impl Env {
             observation_state: fixtures::key(fixtures::OBSERVATION),
             lp_mint: fixtures::key(fixtures::LP_MINT),
             lp_vault: Self::lp_vault_for(&authority),
-            flagship_dividend_vault: ata(&authority_pda(&flagship_config()), &inst.dividend_mint, &inst.dividend_program),
             dividend_token_program: inst.dividend_program,
             coin_token_program: inst.coin_program,
             lp_token_program: TOKEN,
@@ -668,21 +654,12 @@ impl Env {
         self.buyback_ix_with(self.buyback_accounts(caller), min_out)
     }
 
-    /// As the website builds it: the flagship's vault is passed writable, and
-    /// the flagship's coin mint and config as the remaining accounts, only when
-    /// this endowment donates.
     fn buyback_ix_with(&self, accounts: endowment::accounts::Buyback, min_out: u64) -> Instruction {
-        let donates = Env::config_at(&self.svm, &accounts.config).donation_bps > 0;
-        let vault = accounts.flagship_dividend_vault;
-        let mut metas = accounts.to_account_metas(None);
-        if donates {
-            for meta in metas.iter_mut().filter(|m| m.pubkey == vault) {
-                meta.is_writable = true;
-            }
-            metas.push(AccountMeta::new_readonly(FLAGSHIP_COIN_MINT, false));
-            metas.push(AccountMeta::new_readonly(flagship_config(), false));
-        }
-        Instruction::new_with_bytes(endowment::id(), &endowment::instruction::Buyback { min_out }.data(), metas)
+        Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::Buyback { min_out }.data(),
+            accounts.to_account_metas(None),
+        )
     }
 
     /// Creates the (off-curve) LP account an instance's authority holds liquidity in.
@@ -1282,9 +1259,11 @@ impl Env {
         self.svm.set_sysvar(&clock);
     }
 
-    /// A second instance: same dividend asset, a new coin and creator, its own stand-in pool.
+    /// A second instance: same creator and dividend asset, a new coin, its own
+    /// stand-in pool. Only the creator can make one, but each endowment's
+    /// accounts must still be isolated from any other's.
     fn second_instance(&mut self) -> Inst {
-        let creator = self.funded();
+        let creator = test_flagship_creator();
         let coin_program = self.inst.coin_program;
         let coin_mint = create_coin_mint(&mut self.svm, &coin_program);
         let pool = fake_pool(&mut self.svm, [self.inst.dividend_mint, coin_mint], fixtures::cpmm_program());
@@ -1304,7 +1283,7 @@ impl Env {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
+fn the_creator_creates_the_endowment_and_is_admin_by_default() {
     let mut env = Env::new();
     env.create();
     let config = env.config_state();
@@ -1316,7 +1295,7 @@ fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
     assert_eq!(config.params, base_params());
     assert_eq!(config.pending.effective_at, 0);
     assert_eq!((config.active, config.retired, config.milestone_reached), (false, false, false));
-    assert_eq!((config.contribution_cap, config.donation_bps), (CONTRIBUTION_CAP, 0));
+    assert_eq!(config.contribution_cap, CONTRIBUTION_CAP);
     assert_eq!(config.buy_allowance, MAX_BUY_PER_TX);
     assert_eq!((config.landlord_count, config.count.round, config.count.open), (0, 0, false));
     assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
@@ -1324,7 +1303,7 @@ fn anyone_can_create_an_endowment_and_the_creator_is_admin_by_default() {
 }
 
 #[test]
-fn creation_is_per_creator_and_cant_be_squatted_or_repeated() {
+fn only_the_creator_can_create_and_creation_cant_be_blocked_or_repeated() {
     let mut env = Env::new();
     // Someone pre-creates the (predictable) vault accounts; creation still works.
     let griefer = env.funded();
@@ -1341,17 +1320,17 @@ fn creation_is_per_creator_and_cant_be_squatted_or_repeated() {
     assert!(send(&mut env.svm, &pre, &griefer, &[&griefer]));
     env.create();
 
-    // The same creator can't create a second endowment for the same coin.
+    // It can't be created twice.
     let guardian = env.guardian.pubkey();
-    assert!(!env.create_with(params(guardian, 0)));
+    assert!(!env.create_with(params(guardian)));
 
-    // Another creator for the same coin gets a separate instance, with its own vaults.
+    // Nobody but the creator can create an endowment, for this coin or any other.
     let mut other = env.inst.clone();
     other.creator = env.funded();
-    assert!(env.create_inst(&other, params(guardian, 0)));
-    assert_ne!(other.config(), env.config());
-    assert_ne!(other.coin_vault(), env.coin_vault());
-    assert_eq!(Env::config_at(&env.svm, &other.config()).admin, other.creator.pubkey());
+    assert_err!(env.create_inst(&other, params(guardian)), NotFlagshipCreator);
+    let mut another_coin = env.second_instance();
+    another_coin.creator = env.funded();
+    assert_err!(env.create_inst(&another_coin, params(guardian)), NotFlagshipCreator);
     assert_eq!(env.config_state().admin, env.inst.creator.pubkey());
 }
 
@@ -1364,31 +1343,31 @@ fn creation_rejects_a_pool_that_doesnt_trade_exactly_the_coin_and_dividend() {
     // A pool for a different pair.
     let mut wrong = env.inst.clone();
     wrong.pool = fake_pool(&mut env.svm, [env.inst.coin_mint, stranger_mint], fixtures::cpmm_program());
-    assert_err!(env.create_inst(&wrong, params(guardian, 0)), WrongPool);
+    assert_err!(env.create_inst(&wrong, params(guardian)), WrongPool);
 
     // A look-alike pool not owned by Raydium CPMM.
     let mut not_raydium = env.inst.clone();
     not_raydium.pool = fake_pool(&mut env.svm, [env.inst.coin_mint, env.inst.dividend_mint], Pubkey::new_unique());
-    assert_err!(env.create_inst(&not_raydium, params(guardian, 0)), InvalidPoolData);
+    assert_err!(env.create_inst(&not_raydium, params(guardian)), InvalidPoolData);
 
     // The coin can't be its own dividend.
     let mut same = env.inst.clone();
     same.dividend_mint = same.coin_mint;
     same.pool = fake_pool(&mut env.svm, [same.coin_mint, same.coin_mint], fixtures::cpmm_program());
-    assert!(!env.create_inst(&same, params(guardian, 0)));
+    assert!(!env.create_inst(&same, params(guardian)));
 
     // Either orientation of the real pair works.
     let mut flipped = env.inst.clone();
     flipped.pool = fake_pool(&mut env.svm, [env.inst.dividend_mint, env.inst.coin_mint], fixtures::cpmm_program());
-    assert!(env.create_inst(&flipped, params(guardian, 0)));
+    assert!(env.create_inst(&flipped, params(guardian)));
 }
 
 #[test]
-fn creation_rejects_out_of_bounds_parameters_and_donations() {
+fn creation_rejects_out_of_bounds_parameters() {
     let mut env = Env::new();
     let guardian = env.guardian.pubkey();
     let with = |f: &dyn Fn(&mut CreateParams)| {
-        let mut p = params(guardian, 0);
+        let mut p = params(guardian);
         f(&mut p);
         p
     };
@@ -1403,27 +1382,9 @@ fn creation_rejects_out_of_bounds_parameters_and_donations() {
     assert_err!(env.create_with(with(&|p| p.params.activate_bps = 5_001)), InvalidActivation);
     assert_err!(env.create_with(with(&|p| p.params.deactivate_bps = 3_001)), InvalidActivation);
     assert_err!(env.create_with(with(&|p| p.params.min_stake_bps = 501)), InvalidParams);
-    // Donations are only possible in the flagship's dividend asset (PUMP); this
-    // coin pays a different one.
-    assert_err!(env.create_with(with(&|p| p.donation_bps = 10)), InvalidDonation);
-    assert_err!(env.create_with(with(&|p| p.donation_bps = 15)), InvalidDonation);
-    assert!(env.create_with(with(&|p| p.donation_bps = 0)));
-}
-
-#[test]
-fn only_fixed_donation_rates_are_accepted_for_pump_paying_coins() {
-    let mut env = Env::with_pool();
-    let guardian = env.guardian.pubkey();
-    let mut p = params(guardian, 15);
-    assert_err!(env.create_with(p.clone()), InvalidDonation);
-    p.donation_bps = 40;
-    assert_err!(env.create_with(p.clone()), InvalidDonation);
-    // A 50 bps tip plus a 30 bps donation is the most allowed.
-    p.donation_bps = 30;
-    p.params.tip_bps = 50;
-    assert!(env.create_with(p));
-    let config = env.config_state();
-    assert_eq!((config.donation_bps, config.params.tip_bps), (30, 50));
+    assert_err!(env.create_with(with(&|p| p.params.allowance_margin_bps = 9_999)), InvalidAllowance);
+    assert_err!(env.create_with(with(&|p| p.params.allowance_margin_bps = 15_000)), InvalidAllowance);
+    assert!(env.create_with(params(guardian)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,7 +1838,7 @@ fn buyback_sizes_itself_and_pays_the_caller_a_tip() {
     assert_eq!(config.total_dividend_spent, MAX_BUY_PER_TX);
     assert_eq!(config.total_coin_bought, received);
     assert_eq!(config.total_coin_retained, received);
-    assert_eq!((config.total_tips, config.total_donated), (tip, 0));
+    assert_eq!(config.total_tips, tip);
     assert_eq!((config.buy_allowance, config.last_buy_at), (0, env.now()));
     assert_eq!((config.total_lp_tokens, config.milestone_reached), (0, false));
 }
@@ -2033,43 +1994,6 @@ fn the_buy_allowance_refills_smoothly_and_caps_any_24_hours() {
 
 // Donations to the flagship endowment.
 
-#[test]
-fn a_donating_endowment_sends_its_share_to_the_flagship_vault() {
-    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 20);
-    env.create_flagship_vault();
-
-    // The donation can only go to the flagship's vault.
-    let caller = env.cranker();
-    let mut elsewhere = env.buyback_accounts(&caller.pubkey());
-    elsewhere.flagship_dividend_vault = env.inst.dividend_account(&caller.pubkey());
-    assert_err!(env.buyback_with(&caller, elsewhere, 1), WrongFlagshipVault);
-
-    let accounts = env.buyback_accounts(&caller.pubkey());
-    assert!(env.buyback_with(&caller, accounts, 1));
-
-    let donation = MAX_BUY_PER_TX * 20 / 10_000;
-    let tip = tip_on(MAX_BUY_PER_TX);
-    assert_eq!(token_balance(&env.svm, &env.flagship_vault()), donation);
-    assert_eq!(token_balance(&env.svm, &env.inst.dividend_account(&caller.pubkey())), tip);
-    assert_eq!(
-        token_balance(&env.svm, &env.dividend_vault()),
-        50_000 * UNIT - MAX_BUY_PER_TX - tip - donation
-    );
-    let config = env.config_state();
-    assert_eq!((config.total_donated, config.total_tips, config.total_dividend_spent), (donation, tip, MAX_BUY_PER_TX));
-}
-
-#[test]
-fn a_donating_endowment_leaves_room_for_the_donation_when_sizing() {
-    // 1,000 + 25 bps tip + 30 bps donation.
-    let mut env = pool_env_with(1_005_500_000, |p| p.donation_bps = 30);
-    env.create_flagship_vault();
-    assert!(env.buy());
-    assert_eq!(env.config_state().total_dividend_spent, 1_000 * UNIT);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
-    assert_eq!(token_balance(&env.svm, &env.flagship_vault()), 3 * UNIT);
-}
-
 // ---------------------------------------------------------------------------
 // The milestone: after the endowment has bought `contribution_cap` of its coin,
 // part of each buyback becomes locked liquidity. Contributions keep flowing.
@@ -2154,7 +2078,7 @@ fn regression_r2roles05_the_liquidity_share_buys_while_the_pool_has_deposits_dis
 }
 
 #[test]
-fn sweeps_keep_flowing_after_the_milestone() {
+fn sweeps_stop_for_good_at_the_goal() {
     let mut env = pool_env_with(10_000 * UNIT, |p| {
         p.contribution_cap = 1;
         p.params.activate_bps = 0;
@@ -2165,12 +2089,14 @@ fn sweeps_keep_flowing_after_the_milestone() {
     assert!(env.buy());
     assert!(env.config_state().milestone_reached);
 
+    // A sweep after the goal succeeds but moves nothing.
     env.set_balance(&account, 700 * UNIT);
     let vault_before = token_balance(&env.svm, &env.dividend_vault());
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert!(token_balance(&env.svm, &env.dividend_vault()) > vault_before);
-    assert_eq!(token_balance(&env.svm, &account), 0);
-    assert!(env.config_state().total_swept > 0);
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), vault_before);
+    assert_eq!(token_balance(&env.svm, &account), 700 * UNIT);
+    assert_eq!(env.config_state().total_swept, 0);
+    assert!(!env.config_state().active);
 }
 
 #[test]
@@ -2224,7 +2150,7 @@ fn landlords_of_one_endowment_cant_be_registered_swept_counted_or_removed_throug
     let a = env.inst.clone();
     let b = env.second_instance();
     let guardian = env.guardian.pubkey();
-    let mut p = params(guardian, 0);
+    let mut p = params(guardian);
     p.params.activate_bps = 0;
     p.params.deactivate_bps = 0;
     assert!(env.create_inst(&b, p));
@@ -2292,50 +2218,6 @@ fn landlords_of_one_endowment_cant_be_registered_swept_counted_or_removed_throug
     assert!(env.deregister(&owner));
     assert_eq!(Env::config_at(&env.svm, &a.config()).landlord_count, 0);
     assert_eq!(Env::config_at(&env.svm, &b.config()).landlord_count, 1);
-}
-
-#[test]
-fn two_endowments_on_one_pool_keep_separate_vaults() {
-    let mut env = Env::with_pool();
-    env.create();
-    let a = env.inst.clone();
-    let mut b = env.inst.clone();
-    b.creator = env.funded();
-    let guardian = env.guardian.pubkey();
-    assert!(env.create_inst(&b, params(guardian, 0)));
-    for inst in [&a, &b] {
-        let vault = inst.dividend_vault();
-        env.set_balance(&vault, 10_000 * UNIT);
-        env.create_lp_vault(&inst.authority());
-    }
-
-    let caller = env.cranker();
-    // A's buyback can't send its coin to B's vault or spend B's dividend.
-    let mut to_b = env.buyback_accounts_for(&a, &caller.pubkey());
-    to_b.coin_vault = b.coin_vault();
-    assert!(!env.buyback_with(&caller, to_b, 1));
-    let mut from_b = env.buyback_accounts_for(&a, &caller.pubkey());
-    from_b.dividend_vault = b.dividend_vault();
-    assert!(!env.buyback_with(&caller, from_b, 1));
-    // Nor sign with B's authority against A's config.
-    let mut b_authority = env.buyback_accounts_for(&a, &caller.pubkey());
-    b_authority.authority = b.authority();
-    assert!(!env.buyback_with(&caller, b_authority, 1));
-    // Nor deposit A's liquidity into B's LP account.
-    let mut b_lp = env.buyback_accounts_for(&a, &caller.pubkey());
-    b_lp.lp_vault = Env::lp_vault_for(&b.authority());
-    assert_err!(env.buyback_with(&caller, b_lp, 1), WrongPool);
-    assert_eq!(token_balance(&env.svm, &b.dividend_vault()), 10_000 * UNIT);
-
-    // Each buys for itself.
-    let accounts = env.buyback_accounts_for(&a, &caller.pubkey());
-    assert!(env.buyback_with(&caller, accounts, 1));
-    let accounts = env.buyback_accounts_for(&b, &caller.pubkey());
-    assert!(env.buyback_with(&caller, accounts, 1));
-    assert!(token_balance(&env.svm, &a.coin_vault()) > 0);
-    assert!(token_balance(&env.svm, &b.coin_vault()) > 0);
-    assert_eq!(Env::config_at(&env.svm, &a.config()).total_dividend_spent, MAX_BUY_PER_TX);
-    assert_eq!(Env::config_at(&env.svm, &b.config()).total_dividend_spent, MAX_BUY_PER_TX);
 }
 
 // Original SPL Token mints (not Token-2022).
@@ -3067,15 +2949,18 @@ fn regression_i09_dust_is_skipped_without_using_up_the_interval() {
 }
 
 #[test]
-fn regression_l13_coin_sent_to_the_vault_doesnt_reach_the_milestone() {
+fn coin_sent_to_the_vault_counts_toward_the_goal() {
+    // Reverses L-13 by decision: 200M is 200M, bought or sent directly.
     let mut env = pool_env_with(50_000 * UNIT, |p| p.params.buy_bps = 5_000);
     let coin_vault = env.coin_vault();
     env.set_balance(&coin_vault, CONTRIBUTION_CAP + 1);
     assert!(env.buy());
     let config = env.config_state();
-    // Still all buying: the milestone counts only coin the endowment bought.
-    assert!(!config.milestone_reached);
-    assert_eq!((config.total_lp_tokens, config.total_dividend_spent), (0, MAX_BUY_PER_TX));
+    // Recorded before the buy chose its split, so this buy already splits.
+    assert!(config.milestone_reached);
+    assert!(config.total_lp_tokens > 0);
+    assert!(config.total_dividend_spent > 0 && config.total_dividend_spent <= MAX_BUY_PER_TX);
+    assert!(token_balance(&env.svm, &coin_vault) >= CONTRIBUTION_CAP + 1);
 }
 
 #[test]
@@ -3490,85 +3375,6 @@ fn regression_r2t08_a_reassigned_dividend_account_isnt_swept() {
 }
 
 #[test]
-fn regression_r2iso02_the_mint_policy_refuses_coins_someone_could_mint_freeze_or_take_back() {
-    let owner = Some(Pubkey::new_unique());
-    let cases = [
-        (MintSpec { authority: owner, ..Default::default() }, MintSpec::default(), false),
-        (MintSpec { freeze: owner, ..Default::default() }, MintSpec::default(), false),
-        (MintSpec { permanent_delegate: true, ..Default::default() }, MintSpec::default(), false),
-        (MintSpec::default(), MintSpec { permanent_delegate: true, ..Default::default() }, false),
-        // A dividend may have a freeze authority and a fee within the cap; a coin a fee.
-        (MintSpec { fee_bps: Some(300), ..Default::default() }, MintSpec { freeze: owner, fee_bps: Some(100), ..Default::default() }, true),
-        (MintSpec { hook: true, ..Default::default() }, MintSpec { hook: true, ..Default::default() }, true),
-    ];
-    for (coin, dividend, ok) in cases {
-        let mut env = Env::with_specs(coin, dividend);
-        let p = params(env.guardian.pubkey(), 0);
-        if ok {
-            assert!(env.create_with(p));
-        } else {
-            assert_err!(env.create_with(p), UnsafeMint);
-        }
-    }
-    // The flagship's real mints ($PENIS and PUMP) pass: every pool test creates with them.
-    let mut env = Env::with_pool();
-    env.create();
-}
-
-#[test]
-fn regression_r2iso01_the_flagship_is_derived_and_never_donates_to_itself() {
-    let mut env = Env::with_pool();
-    env.inst.creator = test_flagship_creator();
-    env.svm.airdrop(&env.inst.creator.pubkey(), 10_000_000_000).unwrap();
-    assert_eq!(env.config(), flagship_config());
-    let guardian = env.guardian.pubkey();
-    assert_err!(env.create_with(params(guardian, 10)), InvalidDonation);
-    assert!(env.create_with(params(guardian, 0)));
-    // A donating endowment's donation lands in exactly this flagship's vault.
-    let mut donor = env.inst.clone();
-    donor.creator = env.funded();
-    assert!(env.create_inst(&donor, params(guardian, 20)));
-    env.inst = donor;
-    let vault = env.dividend_vault();
-    env.set_balance(&vault, 50_000 * UNIT);
-    let authority = env.authority();
-    env.create_lp_vault(&authority);
-    assert_eq!(env.flagship_vault(), ata(&authority_pda(&flagship_config()), &env.inst.dividend_mint, &TOKEN_2022));
-    // The flagship's vault exists (created with the flagship): the donation arrives.
-    assert!(env.buy());
-    assert_eq!(token_balance(&env.svm, &env.flagship_vault()), MAX_BUY_PER_TX * 20 / 10_000);
-}
-
-#[test]
-fn regression_r2iso09_a_donation_is_skipped_until_the_flagship_vault_exists_and_needs_it_writable() {
-    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 20);
-    // No flagship vault yet: the buy runs and donates nothing.
-    assert!(env.buy());
-    assert_eq!(env.config_state().total_donated, 0);
-    env.create_flagship_vault();
-    env.warp(DAY);
-    // Passing the vault read-only can't skip the donation.
-    let caller = env.cranker();
-    let accounts = env.buyback_accounts(&caller.pubkey());
-    let ix = Instruction::new_with_bytes(
-        endowment::id(),
-        &endowment::instruction::Buyback { min_out: 1 }.data(),
-        accounts.to_account_metas(None),
-    );
-    assert_err!(send(&mut env.svm, &[ix], &caller, &[&caller]), WrongFlagshipVault);
-    let accounts = env.buyback_accounts(&caller.pubkey());
-    assert!(env.buyback_with(&caller, accounts, 1));
-    let donated = env.config_state().total_donated;
-    assert!(donated > 0);
-    // A frozen flagship vault doesn't stop the donor's buybacks either (R2-ISO-06).
-    let flagship_vault = env.flagship_vault();
-    env.poke(&flagship_vault, |d| d[108] = 2);
-    env.warp(DAY);
-    assert!(env.buy());
-    assert_eq!(env.config_state().total_donated, donated);
-}
-
-#[test]
 fn regression_r2t10_a_missing_lp_vault_routes_the_liquidity_share_to_buying() {
     let mut env = Env::with_pool();
     env.create_custom(|p| {
@@ -3797,7 +3603,7 @@ fn regression_r3rf04_deactivate_zero_is_refused_with_an_activation_line() {
     p.deactivate_bps = 0;
     assert_err!(env.propose(&admin, p), InvalidActivation);
     let guardian = env.guardian.pubkey();
-    let mut create = params(guardian, 0);
+    let mut create = params(guardian);
     create.params.deactivate_bps = 0;
     let mut other = Env::new();
     assert_err!(other.create_with(create), InvalidActivation);
@@ -3965,36 +3771,7 @@ fn regression_r3mint05_creation_refuses_a_fee_already_above_the_cap() {
         d[PENIS_NEWER_FEE_BPS..PENIS_NEWER_FEE_BPS + 2].copy_from_slice(&600u16.to_le_bytes());
     });
     let guardian = env.guardian.pubkey();
-    assert_err!(env.create_with(params(guardian, 0)), FeeTooHigh);
-}
-
-#[test]
-fn regression_r3mint03_a_donating_buy_must_name_the_flagship_coin() {
-    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 20);
-    env.create_flagship_vault();
-    let caller = env.cranker();
-    let accounts = env.buyback_accounts(&caller.pubkey());
-    let mut ix = env.buyback_ix_with(accounts, 1);
-    let config = ix.accounts.pop().unwrap();
-    assert_eq!(config.pubkey, flagship_config());
-    let mint = ix.accounts.pop().unwrap();
-    assert_eq!(mint.pubkey, FLAGSHIP_COIN_MINT);
-    // Without the flagship's coin mint, or with another mint in its place: refused.
-    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
-    ix.accounts.push(AccountMeta::new_readonly(env.inst.dividend_mint, false));
-    ix.accounts.push(config.clone());
-    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
-    ix.accounts.truncate(ix.accounts.len() - 2);
-    // The coin, but without the flagship's config (its vault cap), or another
-    // endowment's config in its place: refused.
-    ix.accounts.push(mint);
-    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
-    ix.accounts.push(AccountMeta::new_readonly(env.config(), false));
-    assert_err!(send(&mut env.svm, &[ix.clone()], &caller, &[&caller]), WrongFlagshipVault);
-    ix.accounts.pop();
-    ix.accounts.push(config);
-    assert!(send(&mut env.svm, &[ix], &caller, &[&caller]));
-    assert!(env.config_state().total_donated > 0);
+    assert_err!(env.create_with(params(guardian)), FeeTooHigh);
 }
 
 // ---------------------------------------------------------------------------
@@ -4062,27 +3839,6 @@ fn regression_fcr303_resigning_switches_sweeps_off_and_voids_its_reads() {
 }
 
 #[test]
-fn regression_fcmint01_a_donation_stops_at_the_flagship_vault_cap() {
-    let mut env = pool_env_with(50_000 * UNIT, |p| p.donation_bps = 30);
-    env.create_flagship_vault();
-    let flagship_vault = env.flagship_vault();
-    // The flagship runs the defaults: three days of MAX_BUY_PER_DAY.
-    let cap = 3 * MAX_BUY_PER_DAY;
-    // The probe: already ten times the cap. Nothing more arrives; the share
-    // stays in the donor's vault for its own buys.
-    env.set_balance(&flagship_vault, 10 * cap);
-    assert!(env.buy());
-    assert_eq!(token_balance(&env.svm, &flagship_vault), 10 * cap);
-    assert_eq!(env.config_state().total_donated, 0);
-    // Just under the cap: the donation tops it up exactly.
-    env.set_balance(&flagship_vault, cap - 100);
-    env.warp(DAY);
-    assert!(env.buy());
-    assert_eq!(token_balance(&env.svm, &flagship_vault), cap);
-    assert_eq!(env.config_state().total_donated, 100);
-}
-
-#[test]
 fn regression_fcr304_the_vault_cap_counts_what_the_buy_interval_lets_it_spend() {
     let mut env = funded_pool_env(0);
     env.change_params(|p| {
@@ -4135,3 +3891,12 @@ fn regression_band_an_attacker_who_pushes_the_price_down_first_only_loses() {
     println!("attacker: dumped {dump}, got back {back}");
     assert!(back < dump);
 }
+
+#[path = "regressions/refresher_changes.rs"]
+mod refresher_changes;
+
+#[path = "regressions/completion.rs"]
+mod completion;
+
+#[path = "regressions/allowance.rs"]
+mod allowance;

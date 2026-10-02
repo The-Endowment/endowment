@@ -13,8 +13,10 @@ use crate::{
 /// on the number of landlords.
 ///
 /// The wallet is the unit of commitment: all the coin in `coin_account` counts
-/// toward activation, and all new dividend arriving in `dividend_account` is
-/// swept. To commit only part of a holding, keep the rest in another wallet.
+/// toward activation, and new dividend arriving in `dividend_account` is swept,
+/// up to what that coin earned when the reward allowance is on. To commit only
+/// part of a holding, keep the rest in another wallet. Closed once the goal is
+/// reached.
 #[derive(Accounts)]
 pub struct RegisterLandlord<'info> {
     #[account(mut)]
@@ -69,6 +71,7 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     require!(!config.retired, EndowmentError::Retired);
+    require!(!config.milestone_reached, EndowmentError::Completed);
     require!(!config.is_paused(now), EndowmentError::Paused);
 
     let coin_held = ctx.accounts.coin_account.amount;
@@ -76,6 +79,7 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
     config.landlord_count = config.landlord_count.checked_add(1).ok_or(EndowmentError::Overflow)?;
     // Counted from the next round on: a round already open doesn't expect it.
     let joined_round = config.count.round;
+    let reward_index = config.reward_index;
 
     let owner = ctx.accounts.owner.key();
     let baseline = ctx.accounts.dividend_account.amount;
@@ -98,7 +102,10 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
         attestations: 0,
         last_attested_at: 0,
         attestation_epoch: 0,
-        reserved: [0; 52],
+        // Earns from now on: nothing posted before it joined.
+        index_at: reward_index,
+        allowance: 0,
+        reserved: [0; 28],
     });
 
     emit!(LandlordRegistered { config: config_key, owner, baseline, coin_held });

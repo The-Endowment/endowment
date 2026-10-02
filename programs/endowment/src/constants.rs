@@ -146,30 +146,42 @@ pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 /// threshold is 0 (a founders-only test window).
 pub const ACTIVE_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
 
+/// Reward allowance (`post_reward_total`): a landlord can be swept at most what
+/// its counted coin earned. `allowance_margin_bps` is 0 (off: sweeps take
+/// everything above the baseline) or exactly this: 1.0x, never more.
+pub const ALLOWANCE_MARGIN_BPS: u16 = 10_000;
+
+/// Allowance a landlord hasn't used carries over for about three days: a
+/// landlord's allowance never exceeds what its counted coin earned since the
+/// oldest of this many marks, and the endowment takes a mark of its reward
+/// index at a reward post once the last mark is this old (a little under a
+/// day, so daily posts each take one whatever their jitter).
+pub const ALLOWANCE_CARRY_MARKS: usize = 3;
+pub const ALLOWANCE_MARK_SPACING_SECS: i64 = 20 * 60 * 60;
+
+/// `Config::reward_index` is dividend earned per coin base unit, scaled by this.
+pub const REWARD_INDEX_SCALE: u128 = 1_000_000_000_000;
+
+/// The refresher can post the coin's reward total at most this often.
+pub const MIN_REWARD_POST_SPACING_SECS: i64 = 60 * 60;
+
 /// Minimum time between buybacks, bounds.
 pub const MIN_BUY_INTERVAL_BOUNDS: (i64, i64) = (60, 24 * 60 * 60);
 
 /// Tip paid to whoever cranks a buyback, in basis points of the amount spent.
 pub const MAX_TIP_BPS: u16 = 50;
 
-/// Optional donation to the flagship endowment, chosen at creation and locked.
-pub const ALLOWED_DONATION_BPS: [u16; 4] = [0, 10, 20, 30];
-
-/// The tip and the donation both come out of each buyback; together they are capped.
-pub const MAX_TIP_PLUS_DONATION_BPS: u16 = 80;
-
-/// The flagship endowment ($PENIS). Its config address is deterministic:
+/// The $PENIS endowment. Its config address is deterministic:
 /// PDA([CONFIG_SEED, FLAGSHIP_COIN_MINT, FLAGSHIP_CREATOR]) under this program,
-/// so it is fixed before the flagship exists. Donations go to its dividend
-/// vault: the associated token account of `authority(flagship_config())` for
-/// the dividend mint. See `flagship_config()`.
+/// so it is fixed before the endowment exists. See `flagship_config()`.
 pub const FLAGSHIP_COIN_MINT: Pubkey = pubkey!("JE3HT7SbCgXDQWV6xp3oiiAisDzq4HyZ8wyEVBDCs45Z");
 
-/// The wallet that will sign `create_endowment` for the flagship.
+/// The wallet that creates the $PENIS endowment, and the only one that can call
+/// `create_endowment`. This program runs the $PENIS endowment only; other
+/// projects are welcome to deploy their own copy of the open-source code.
 ///
-/// SET BEFORE DEPLOY: replace with the flagship creator's address. While this is
-/// the all-zero placeholder, no endowment can choose a donation (see
-/// `validate_donation`), so nothing can ever be sent to an unowned account.
+/// SET BEFORE DEPLOY: replace with the creator's address. While this is the
+/// all-zero placeholder, nobody can create an endowment.
 #[cfg(not(feature = "test-flagship"))]
 pub const FLAGSHIP_CREATOR: Pubkey = Pubkey::new_from_array([0; 32]);
 
@@ -177,10 +189,6 @@ pub const FLAGSHIP_CREATOR: Pubkey = Pubkey::new_from_array([0; 32]);
 /// (`--features test-flagship`). Never deploy such a build.
 #[cfg(feature = "test-flagship")]
 pub const FLAGSHIP_CREATOR: Pubkey = pubkey!("HPbBWhYdj1s4T9rbN7v6CLmwxZY7aoNbfEaZwgENaSJH");
-
-/// Donations are only possible for endowments whose dividend is the flagship's
-/// dividend asset (PUMP), so the donation can be spent by the flagship directly.
-pub const FLAGSHIP_DIVIDEND_MINT: Pubkey = pubkey!("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn");
 
 /// Whether the flagship creator has been set (see FLAGSHIP_CREATOR).
 pub fn flagship_is_set() -> bool {

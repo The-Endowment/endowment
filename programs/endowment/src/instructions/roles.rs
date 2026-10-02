@@ -70,7 +70,7 @@ pub fn handle_propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    params.validate(config.donation_bps)?;
+    params.validate()?;
     let effective_at = now + PARAM_TIMELOCK_SECONDS;
     config.pending = PendingParams { params, effective_at };
     emit!(ParamsProposed { config: config_key, params, effective_at });
@@ -108,8 +108,10 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
     config.params = pending.params;
     config.pending = PendingParams::default();
     if refresher_changes {
-        // Reads made under the previous refresher stop counting (FC-R3-03).
-        config.refresher_epoch = config.refresher_epoch.wrapping_add(1);
+        // Reads made under the previous refresher stop counting, and neither an
+        // open round nor the last count's result can switch sweeps back on
+        // (FC-R3-03, PR #1).
+        config.retire_refresher_reads();
     }
     // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
     config.buy_allowance = config.buy_allowance.min(config.params.max_buy_per_tx);

@@ -44,12 +44,8 @@ pub enum EndowmentError {
     InvalidCountAccount,
     #[msg("The coin vault would shrink")]
     VaultWouldShrink,
-    #[msg("Donation must be 0, 10, 20 or 30 bps, and only in the flagship's dividend asset")]
-    InvalidDonation,
     #[msg("The contribution cap must be greater than zero")]
     InvalidContributionCap,
-    #[msg("Not the flagship endowment's dividend vault")]
-    WrongFlagshipVault,
     #[msg("A pause is active or ended too recently")]
     PauseCooldown,
     #[msg("No parameter change is pending")]
@@ -96,8 +92,6 @@ pub enum EndowmentError {
     PendingChange,
     #[msg("The retirement timelock has not elapsed")]
     RetireNotReady,
-    #[msg("This mint has an authority or extension the endowment can't accept")]
-    UnsafeMint,
     #[msg("The coin's price is too far below its time-weighted average")]
     PriceBelowTwap,
     #[msg("The pool's quote for this buy is below the TWAP floor")]
@@ -108,4 +102,12 @@ pub enum EndowmentError {
     NoRefresher,
     #[msg("Only the refresher can do this")]
     NotRefresher,
+    #[msg("The endowment has reached its goal and takes no more contributions")]
+    Completed,
+    #[msg("The reward total was posted too recently")]
+    RewardPostTooSoon,
+    #[msg("The allowance margin must be 0 or within bounds, with a daily rewards ceiling")]
+    InvalidAllowance,
+    #[msg("Only the endowment's creator can create it")]
+    NotFlagshipCreator,
 }

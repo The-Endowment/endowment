@@ -2,8 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::state::Params;
 
-// Every event names the endowment instance (`config`) it belongs to, so one
-// indexer can follow every endowment on the shared contract.
+// Every event names the endowment (`config`) it belongs to.
 
 #[event]
 pub struct EndowmentCreated {
@@ -12,7 +11,6 @@ pub struct EndowmentCreated {
     pub coin_mint: Pubkey,
     pub dividend_mint: Pubkey,
     pub pool: Pubkey,
-    pub donation_bps: u16,
 }
 
 #[event]
@@ -56,6 +54,8 @@ pub struct Swept {
     pub received: u64,
     pub baseline: u64,
     pub total_contributed: u64,
+    /// What this landlord can still be swept (when the allowance is on).
+    pub allowance: u64,
 }
 
 #[event]
@@ -67,13 +67,11 @@ pub struct Bought {
     pub min_acceptable: u64,
     /// Coin-per-dividend TWAP the floor was measured against (Q32.32).
     pub twap_price_x32: u128,
-    /// Dividend and coin deposited as permanent liquidity (after the milestone).
+    /// Dividend and coin deposited as permanent liquidity (after the goal).
     pub liquidity_dividend: u64,
     pub liquidity_coin: u64,
     pub lp_tokens: u64,
     pub tip: u64,
-    /// Sent to the flagship endowment's dividend vault.
-    pub donation: u64,
     pub total_dividend_spent: u64,
     pub total_coin_bought: u64,
 }
@@ -82,6 +80,23 @@ pub struct Bought {
 pub struct MilestoneReached {
     pub config: Pubkey,
     pub total_coin_bought: u64,
+    /// Coin held directly in the coin vault when the goal was recorded,
+    /// including any sent to it directly.
+    pub coin_vault_balance: u64,
+}
+
+/// The refresher posted the coin's public reward total (`post_reward_total`).
+#[event]
+pub struct RewardTotalPosted {
+    pub config: Pubkey,
+    /// The cumulative total posted.
+    pub total: u64,
+    /// The part of the increase since the last post that landlords' allowances
+    /// were credited for: 0 while contributions aren't running, and never more
+    /// than `max_rewards_per_day` for the time since the last post.
+    pub credited: u64,
+    pub reward_index: u128,
+    pub at: i64,
 }
 
 #[event]

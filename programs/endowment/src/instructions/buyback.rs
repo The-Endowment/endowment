@@ -15,34 +15,31 @@ use anchor_spl::{
 use crate::{
     constants::*,
     error::EndowmentError,
-    events::{Bought, MilestoneReached},
-    health::{ensure_tradeable, is_frozen, TradeAccounts},
+    events::Bought,
+    health::{ensure_tradeable, TradeAccounts},
     math::{
         floor_slippage_bps, impact_cap, lp_tokens_for, min_acceptable_out, quote_out, refill, spendable, split_buy,
         spot_price_x32, zap_swap_amount,
     },
     raydium::{twap_price_x32, PoolView, CPMM_AUTH_SEED, CPMM_PROGRAM_ID, DEPOSIT_DISCRIMINATOR, SWAP_BASE_INPUT_DISCRIMINATOR},
     state::Config,
-    transfer::{capped_transfer_fee_bps, hook_enabled, read_token_account},
+    transfer::read_token_account,
 };
 
-/// Permissionless: anyone may crank a buyback for an endowment, and is paid a
-/// small tip in the dividend asset for it. The contract decides the size, and
-/// measures the price against the pool's time-weighted average, so nothing the
-/// caller does in the same transaction can worsen the fill.
+/// Permissionless: anyone may crank a buyback, and is paid a small tip in the
+/// dividend asset for it. The contract decides the size, and measures the price
+/// against the pool's time-weighted average, so nothing the caller does in the
+/// same transaction can worsen the fill.
 ///
 /// The dividend can only leave the dividend vault through the endowment's own
-/// Raydium pool, as the capped tip, or as the donation locked in at creation;
-/// the coin can only land in the endowment's coin vault. After the milestone,
-/// part of each buyback becomes liquidity whose LP tokens land in an
-/// authority-owned account that nothing can withdraw from.
+/// Raydium pool or as the capped tip; the coin can only land in the
+/// endowment's coin vault. After the goal (the
+/// coin vault holding `contribution_cap`, however it got there), `buy_bps` of
+/// each buyback buys the coin and the rest becomes liquidity whose LP tokens
+/// land in an authority-owned account that nothing can withdraw from.
 ///
 /// Buybacks refuse to run while either mint has a transfer hook set (see
-/// `health::ensure_tradeable`), so the tip and donation are plain transfers.
-///
-/// An endowment that donates passes the flagship's coin mint as the first
-/// remaining account: the donation is skipped (kept in this vault) while the
-/// flagship coin can't trade, so it doesn't pile up where it can't be spent.
+/// `health::ensure_tradeable`), so the tip is a plain transfer.
 #[derive(Accounts)]
 pub struct Buyback<'info> {
     #[account(
@@ -115,11 +112,6 @@ pub struct Buyback<'info> {
     /// out of it.
     #[account(mut)]
     pub lp_vault: UncheckedAccount<'info>,
-    /// CHECK: the flagship endowment's dividend vault. Only touched, and then
-    /// checked against its derived address (and required writable), when this
-    /// endowment donates; read-only otherwise, so buybacks of endowments that
-    /// don't donate don't contend for it.
-    pub flagship_dividend_vault: UncheckedAccount<'info>,
 
     pub dividend_token_program: Interface<'info, TokenInterface>,
     pub coin_token_program: Interface<'info, TokenInterface>,
@@ -154,6 +146,10 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
+    // Coin sent to the vault directly counts toward the goal before the buy/
+    // liquidity split is chosen.
+    let coin_held = ctx.accounts.coin_vault.amount;
+    ctx.accounts.config.record_completion(config_key, coin_held);
     let plan = plan_buy(&ctx.accounts, clock.epoch, now)?;
 
     let a = &ctx.accounts;
@@ -243,43 +239,7 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
         pay(a.caller_dividend_account.to_account_info(), tip)?;
     }
 
-    // 5. Send the donation, if this endowment chose one, to the flagship's
-    //    dividend vault, while it exists, isn't frozen, the flagship coin can
-    //    trade, and only up to the flagship's own vault cap: a donation never
-    //    takes the flagship vault above what it can spend in
-    //    MAX_VAULT_DAYS_OF_BUYS days, like a sweep (R3-MINT-01). The donor's
-    //    buybacks never depend on the flagship's state.
-    let mut donation = (spent as u128 * a.config.donation_bps as u128 / 10_000) as u64;
-    let mut flagship_cap = 0u64;
-    if donation > 0 {
-        match flagship_state(ctx.remaining_accounts, clock.epoch, ctx.program_id)? {
-            Some(cap) => flagship_cap = cap,
-            None => donation = 0,
-        }
-    }
-    if donation > 0 {
-        let (flagship_authority, _) =
-            Pubkey::find_program_address(&[AUTHORITY_SEED, flagship_config().as_ref()], ctx.program_id);
-        let expected = get_associated_token_address_with_program_id(
-            &flagship_authority,
-            &a.dividend_mint.key(),
-            &a.dividend_token_program.key(),
-        );
-        let vault = &a.flagship_dividend_vault;
-        require_keys_eq!(vault.key(), expected, EndowmentError::WrongFlagshipVault);
-        match read_token_account(vault)? {
-            Some(view) if !is_frozen(vault)? => {
-                require!(vault.is_writable, EndowmentError::WrongFlagshipVault);
-                donation = donation.min(flagship_cap.saturating_sub(view.amount));
-                if donation > 0 {
-                    pay(vault.to_account_info(), donation)?;
-                }
-            }
-            _ => donation = 0,
-        }
-    }
-
-    // 6. Accounting.
+    // 5. Accounting.
     let liquidity_dividend = spent.saturating_sub(plan.swap_amount);
     let liquidity_coin = (coin_before + received).saturating_sub(coin_after);
     let lp_tokens = lp_after - lp_before;
@@ -297,11 +257,7 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
         config.total_liquidity_coin.checked_add(liquidity_coin).ok_or(EndowmentError::Overflow)?;
     config.total_lp_tokens = config.total_lp_tokens.checked_add(lp_tokens).ok_or(EndowmentError::Overflow)?;
     config.total_tips = config.total_tips.checked_add(tip).ok_or(EndowmentError::Overflow)?;
-    config.total_donated = config.total_donated.checked_add(donation).ok_or(EndowmentError::Overflow)?;
-    if !config.milestone_reached && config.total_coin_bought >= config.contribution_cap {
-        config.milestone_reached = true;
-        emit!(MilestoneReached { config: config_key, total_coin_bought: config.total_coin_bought });
-    }
+    config.record_completion(config_key, coin_after);
 
     emit!(Bought {
         config: config_key,
@@ -313,7 +269,6 @@ pub fn handle_buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) 
         liquidity_coin,
         lp_tokens,
         tip,
-        donation,
         total_dividend_spent: config.total_dividend_spent,
         total_coin_bought: config.total_coin_bought,
     });
@@ -381,8 +336,7 @@ fn plan_buy(a: &Buyback, epoch: u64, now: i64) -> Result<Plan> {
         params.max_buy_per_day,
         params.max_buy_per_tx,
     );
-    let extra_bps = params.tip_bps + config.donation_bps;
-    let amount = spendable(a.dividend_vault.amount, extra_bps)
+    let amount = spendable(a.dividend_vault.amount, params.tip_bps)
         .min(params.max_buy_per_tx)
         .min(allowance)
         .min(impact_cap(reserve_dividend, params.max_price_impact_bps));
@@ -476,40 +430,6 @@ fn swap_base_input(ctx: &Context<Buyback>, config_key: &Pubkey, amount_in: u64, 
         &[&seeds],
     )?;
     Ok(())
-}
-
-/// Whether the flagship coin can trade, so a donation to it can be spent: the
-/// first remaining account must be its mint, and it must have no transfer hook
-/// and no fee above the cap.
-fn flagship_can_trade(remaining: &[AccountInfo], epoch: u64) -> Result<bool> {
-    let mint = remaining.first().ok_or(EndowmentError::WrongFlagshipVault)?;
-    require_keys_eq!(mint.key(), FLAGSHIP_COIN_MINT, EndowmentError::WrongFlagshipVault);
-    if mint.data_is_empty() || hook_enabled(mint)? {
-        return Ok(false);
-    }
-    Ok(capped_transfer_fee_bps(mint, epoch).is_ok())
-}
-
-/// The flagship's dividend-vault cap, if a donation can go to it now: its coin
-/// can trade (`flagship_can_trade`, first remaining account), and its config
-/// (second remaining account, at `flagship_config()`) exists, isn't retired and
-/// isn't paused. `None` skips the donation.
-fn flagship_state(remaining: &[AccountInfo], epoch: u64, program_id: &Pubkey) -> Result<Option<u64>> {
-    if !flagship_can_trade(remaining, epoch)? {
-        return Ok(None);
-    }
-    let info = remaining.get(1).ok_or(EndowmentError::WrongFlagshipVault)?;
-    require_keys_eq!(info.key(), flagship_config(), EndowmentError::WrongFlagshipVault);
-    if info.data_is_empty() || info.owner != program_id {
-        return Ok(None);
-    }
-    let data = info.try_borrow_data()?;
-    let config = Config::try_deserialize(&mut &data[..])?;
-    let now = Clock::get()?.unix_timestamp;
-    if config.retired || config.is_paused(now) {
-        return Ok(None);
-    }
-    Ok(Some(config.vault_cap()))
 }
 
 /// Deposits the liquidity share into the pool at its current ratio, with the LP
@@ -609,40 +529,3 @@ fn token_amount(info: &AccountInfo) -> Result<u64> {
     Ok(u64::from_le_bytes(data[64..72].try_into().unwrap()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::Engine;
-
-    /// The $PENIS mint as fetched from mainnet into the integration fixtures.
-    fn flagship_mint_data() -> Vec<u8> {
-        let path = format!("{}/tests/fixtures/token_1_mint.json", env!("CARGO_MANIFEST_DIR"));
-        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        base64::engine::general_purpose::STANDARD.decode(json["data"].as_str().unwrap()).unwrap()
-    }
-
-    /// $PENIS TransferFeeConfig: the newer fee's epoch and basis points.
-    const NEWER_FEE_EPOCH: usize = 328;
-    const NEWER_FEE_BPS: usize = 344;
-
-    fn can_trade(key: Pubkey, mut data: Vec<u8>, epoch: u64) -> Result<bool> {
-        let owner = anchor_spl::token_2022::ID;
-        let mut lamports = 1_000_000;
-        let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false);
-        flagship_can_trade(&[info], epoch)
-    }
-
-    #[test]
-    fn r3mint03_the_donation_is_skipped_while_the_flagship_coin_cant_trade() {
-        let data = flagship_mint_data();
-        assert!(can_trade(FLAGSHIP_COIN_MINT, data.clone(), 0).unwrap());
-        // A fee raised above the cap (scheduled for any epoch): skipped.
-        let mut raised = data.clone();
-        raised[NEWER_FEE_BPS..NEWER_FEE_BPS + 2].copy_from_slice(&501u16.to_le_bytes());
-        raised[NEWER_FEE_EPOCH..NEWER_FEE_EPOCH + 8].copy_from_slice(&1_000u64.to_le_bytes());
-        assert!(!can_trade(FLAGSHIP_COIN_MINT, raised, 0).unwrap());
-        // Only the flagship's own mint will do, and it must be passed.
-        assert!(can_trade(Pubkey::new_unique(), data, 0).is_err());
-        assert!(flagship_can_trade(&[], 0).is_err());
-    }
-}
