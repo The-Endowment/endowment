@@ -105,6 +105,7 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
         EndowmentError::ApplyGrace
     );
     let refresher_changes = pending.params.refresher != config.params.refresher;
+    let swept_before = config.sweeps_on(now);
     config.params = pending.params;
     config.pending = PendingParams::default();
     if refresher_changes {
@@ -123,6 +124,11 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
     } else {
         let last = config.last_count_bps;
         config.apply_committed_bps(last);
+    }
+    // New parameters switched sweeps on: rewards paid while they were off stay
+    // with landlords.
+    if !swept_before && config.sweeps_on(now) {
+        config.reward_credit_ok = false;
     }
     emit!(ParamsApplied { config: config_key, params: config.params, active: config.active });
     Ok(())
@@ -157,7 +163,8 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 /// One-way: gives up the admin role for good, freezing every parameter as it
 /// stands. It also clears the guardian and any pending change, so no key is left
 /// that can pause or reconfigure the endowment. It requires production
-/// activation thresholds, so sweeps can't be frozen on, no pending change
+/// activation thresholds, so sweeps can't be frozen on, the reward allowance
+/// on, so they can't be frozen uncapped, no pending change
 /// (cancel it first), so nothing half-decided is left behind, and (unless
 /// retired) a refresher, without which nobody could ever count again.
 ///
@@ -179,6 +186,14 @@ pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
             || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS
                 && config.params.deactivate_bps >= MIN_RENOUNCE_DEACTIVATE_BPS),
         EndowmentError::RenounceThresholds
+    );
+    // And the reward allowance on, so sweeps can never be frozen uncapped.
+    require!(
+        config.retired
+            || (config.params.allowance_margin_bps == ALLOWANCE_MARGIN_BPS
+                && config.params.max_rewards_per_day
+                    <= config.params.max_buy_per_day.saturating_mul(MAX_RENOUNCE_REWARDS_TO_BUYS)),
+        EndowmentError::InvalidAllowance
     );
     config.admin = Pubkey::default();
     config.pending_admin = Pubkey::default();

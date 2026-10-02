@@ -51,6 +51,7 @@
 //! tagged with the endowment's `refresher_epoch`).
 
 use anchor_lang::prelude::*;
+use crate::collection::{CollectionConsent, CONSENT_SEED};
 use anchor_spl::token_interface::Mint;
 
 use crate::{
@@ -107,9 +108,9 @@ pub fn handle_begin_count(ctx: Context<BeginCount>) -> Result<()> {
     Ok(())
 }
 
-/// Remaining accounts, three per landlord, any number of landlords, any order:
+/// Remaining accounts, four per landlord, any number of landlords, any order:
 /// the landlord record (writable), its registered coin account and its
-/// registered dividend account (either may be closed). A landlord record that
+/// registered dividend account (either may be closed), then durable collection consent. A landlord record that
 /// was closed since the batch was built is skipped.
 #[derive(Accounts)]
 pub struct CountLandlords<'info> {
@@ -128,9 +129,17 @@ fn read_landlord(
     landlord: &Landlord,
     coin_info: &AccountInfo,
     dividend_info: &AccountInfo,
+    consent_info: &AccountInfo,
     coin_mint: &Pubkey,
     authority: &Pubkey,
 ) -> Result<(u64, bool)> {
+    require_keys_eq!(*consent_info.owner, crate::ID, EndowmentError::InvalidCountAccount);
+    let consent = CollectionConsent::try_deserialize(&mut &consent_info.try_borrow_data()?[..])?;
+    let canonical = Pubkey::create_program_address(&[CONSENT_SEED, landlord.config.as_ref(),
+        landlord.owner.as_ref(), &[consent.bump]], &crate::ID)
+        .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
+    require!(consent_info.key() == canonical && consent.config == landlord.config && consent.owner == landlord.owner,
+        EndowmentError::InvalidCountAccount);
     let balance = match read_token_account(coin_info)? {
         Some(coin) => {
             require_keys_eq!(coin.mint, *coin_mint, EndowmentError::InvalidCountAccount);
@@ -145,7 +154,7 @@ fn read_landlord(
     let delegated = read_token_account(dividend_info)?
         .map(|d| d.owner == landlord.owner && d.delegates_to(authority))
         .unwrap_or(false);
-    Ok((balance, delegated))
+    Ok((balance, delegated && consent.enabled))
 }
 
 /// This endowment's landlord at `info`, at its canonical address, with its
@@ -182,7 +191,7 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
     let config = &mut ctx.accounts.config;
     require!(!config.is_paused(now), EndowmentError::Paused);
     require!(config.count.open, EndowmentError::NoOpenCount);
-    require!(!accounts.is_empty() && accounts.len() % 3 == 0, EndowmentError::InvalidCountAccount);
+    require!(!accounts.is_empty() && accounts.len() % 4 == 0, EndowmentError::InvalidCountAccount);
 
     let authority = Pubkey::create_program_address(
         &[AUTHORITY_SEED, config_key.as_ref(), &[config.authority_bump]],
@@ -191,8 +200,8 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
     .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
     let (round, coin_mint, min_stake) = (config.count.round, config.coin_mint, config.count.min_stake);
 
-    for triple in accounts.chunks(3) {
-        let (landlord_info, coin_info, dividend_info) = (&triple[0], &triple[1], &triple[2]);
+    for row in accounts.chunks(4) {
+        let (landlord_info, coin_info, dividend_info, consent_info) = (&row[0], &row[1], &row[2], &row[3]);
         let Some(mut landlord) = load_landlord(landlord_info, coin_info, dividend_info, &config_key, program_id)?
         else {
             continue;
@@ -200,7 +209,7 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
         // Part of this round, and not counted in it yet.
         require!(config.expects(&landlord), EndowmentError::NotInCount);
 
-        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
+        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, consent_info, &coin_mint, &authority)?;
         let held = landlord.held(balance);
         let eligible = delegated && held > 0 && held >= min_stake;
         if eligible && config.attestations_of(&landlord) < REQUIRED_ATTESTATIONS {
@@ -212,7 +221,7 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
         let counted = if eligible { held } else { 0 };
 
         // Credit the reward allowance at the old counted amount before it changes.
-        landlord.settle(config.reward_index, config.carry_floor());
+        landlord.settle(config.reward_index, config.carry_floor(now));
         // The next count credits at most this, and only after fresh reads.
         landlord.snapshot = if delegated { balance } else { 0 };
         landlord.snapshot_valid = delegated;
@@ -237,9 +246,10 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
     Ok(())
 }
 
-/// Remaining accounts, three per landlord, any number, any order: the landlord
+/// Remaining accounts, four per landlord, any number, any order: the landlord
 /// record (writable), its registered coin account and its registered dividend
-/// account (either may be closed). Closed landlord records are skipped.
+/// account (either may be closed), then durable collection consent. Closed
+/// landlord records are skipped.
 #[derive(Accounts)]
 pub struct RefreshLandlords<'info> {
     #[account(
@@ -268,7 +278,7 @@ pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'inf
     let coin_mint = config.coin_mint;
     let refresher = config.params.refresher;
     let attest = refresher != Pubkey::default() && ctx.accounts.caller.key() == refresher;
-    require!(!accounts.is_empty() && accounts.len() % 3 == 0, EndowmentError::InvalidCountAccount);
+    require!(!accounts.is_empty() && accounts.len() % 4 == 0, EndowmentError::InvalidCountAccount);
 
     let authority = Pubkey::create_program_address(
         &[AUTHORITY_SEED, config_key.as_ref(), &[config.authority_bump]],
@@ -277,13 +287,13 @@ pub fn handle_refresh_landlords<'info>(ctx: Context<'info, RefreshLandlords<'inf
     .map_err(|_| error!(EndowmentError::InvalidCountAccount))?;
 
     let mut attested: Vec<Pubkey> = Vec::new();
-    for triple in accounts.chunks(3) {
-        let (landlord_info, coin_info, dividend_info) = (&triple[0], &triple[1], &triple[2]);
+    for row in accounts.chunks(4) {
+        let (landlord_info, coin_info, dividend_info, consent_info) = (&row[0], &row[1], &row[2], &row[3]);
         let Some(mut landlord) = load_landlord(landlord_info, coin_info, dividend_info, &config_key, program_id)?
         else {
             continue;
         };
-        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, &coin_mint, &authority)?;
+        let (balance, delegated) = read_landlord(&landlord, coin_info, dividend_info, consent_info, &coin_mint, &authority)?;
         if delegated {
             landlord.snapshot = landlord.snapshot.min(balance);
             if attest && landlord.attestation_epoch != config.refresher_epoch {
@@ -339,6 +349,11 @@ pub fn handle_finish_count(ctx: Context<FinishCount>) -> Result<()> {
         ((count.committed as u128 * 10_000) / count.supply as u128).min(10_000) as u16
     };
     config.count.open = false;
+    // Sweeps were off until this count (a stale count, or inactive): rewards
+    // paid meanwhile stay with landlords (see `post_reward_total`).
+    if !config.sweeps_on(now) {
+        config.reward_credit_ok = false;
+    }
     config.apply_committed_bps(committed_bps);
     config.last_count_at = now;
     config.last_count_bps = committed_bps;

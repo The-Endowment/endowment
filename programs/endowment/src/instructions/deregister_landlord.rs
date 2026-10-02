@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::{
     constants::*,
+    collection::{CollectionConsent, CONSENT_SEED},
     events::LandlordDeregistered,
     state::{Config, Landlord},
 };
@@ -14,6 +15,9 @@ use crate::{
 pub struct DeregisterLandlord<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
+    #[account(mut, seeds = [CONSENT_SEED, config.key().as_ref(), owner.key().as_ref()],
+        bump = consent.bump, has_one = owner, has_one = config)]
+    pub consent: Box<Account<'info, CollectionConsent>>,
     #[account(
         mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
@@ -32,6 +36,7 @@ pub struct DeregisterLandlord<'info> {
 }
 
 pub fn handle_deregister_landlord(ctx: Context<DeregisterLandlord>) -> Result<()> {
+    ctx.accounts.consent.disable()?;
     let config = &mut ctx.accounts.config;
     let landlord = &ctx.accounts.landlord;
     config.remove_from_round(landlord);

@@ -205,11 +205,20 @@ pub struct Config {
     pub last_reward_post_at: i64,
     /// The reward index at recent reward posts, newest first, each taken before
     /// that post's own increase and at least ALLOWANCE_MARK_SPACING_SECS after
-    /// the one before. The oldest is the carry-over floor (`carry_floor`).
+    /// the one before. The oldest still within 72 elapsed hours is the carry-over floor.
     pub reward_marks: [RewardMark; ALLOWANCE_CARRY_MARKS],
 
+    /// Start of the most recent guardian pause; lifting it early changes only
+    /// paused_until. Receipts that had already expired cannot be reopened.
+    pub pause_started_at: i64,
+
+    /// Whether the next reward post may credit its increase: set by a post made
+    /// while contributions were running, cleared whenever sweeps switch on. A
+    /// post credits only a stretch that began and ended with them running.
+    pub reward_credit_ok: bool,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 20],
+    pub reserved: [u8; 11],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -254,10 +263,17 @@ impl Config {
         }
     }
 
-    /// The reward index about three days of posts ago: allowance earned before
-    /// it has expired (`Landlord::settle`). 0 until that many marks exist.
-    pub fn carry_floor(&self) -> u128 {
-        self.reward_marks[ALLOWANCE_CARRY_MARKS - 1].index
+    /// Old credit expires with elapsed time even if reward posting stops.
+    /// A mark is the index before its post: choose the oldest retained mark
+    /// strictly inside the window. This can discard some still-recent credit
+    /// between marks, but never restores credit from before the time boundary.
+    pub fn carry_floor(&self, now: i64) -> u128 {
+        let cutoff = now.saturating_sub(ALLOWANCE_CARRY_SECONDS);
+        self.reward_marks.iter()
+            .filter(|mark| mark.at != 0 && mark.at > cutoff && mark.at <= now)
+            .map(|mark| mark.index)
+            .min()
+            .unwrap_or(self.reward_index)
     }
 
     /// Records the goal once the coin vault holds `contribution_cap`, however
@@ -294,6 +310,10 @@ impl Config {
         if self.milestone_reached {
             self.active = false;
         } else if committed_bps >= self.params.activate_bps {
+            if !self.active {
+                // Rewards paid while sweeps were off stay with landlords.
+                self.reward_credit_ok = false;
+            }
             self.active = true;
         } else if committed_bps < self.params.deactivate_bps {
             self.active = false;
@@ -415,8 +435,12 @@ pub struct Landlord {
     pub index_at: u128,
     pub allowance: u64,
 
+    /// First possible collection nonce in this registration. Unlike timestamps,
+    /// this separates leaving/rejoining even within one slot or second.
+    pub first_collection_nonce: u64,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 20],
 }
 
 impl Landlord {
@@ -428,7 +452,7 @@ impl Landlord {
     ///
     /// Unused allowance carries over only so far: what is left never exceeds
     /// what the coin now counted earned since `carry_floor`
-    /// (`Config::carry_floor`, about three days of posts back). So a landlord
+    /// (`Config::carry_floor`, at most three elapsed days of posted credit). So a landlord
     /// that spends its rewards for weeks can't later be swept weeks of
     /// allowance out of dividend it bought, and one counted at zero keeps none.
     pub fn settle(&mut self, reward_index: u128, carry_floor: u128) {
@@ -436,12 +460,15 @@ impl Landlord {
             (counted as u128).checked_mul(grown).map_or(u128::MAX, |v| v / REWARD_INDEX_SCALE).min(u64::MAX as u128)
                 as u64
         };
+        // The coin that earns: what was counted, less anything a later read
+        // found gone (a refresh lowers `snapshot`, never `counted_amount`).
+        let earning = if self.snapshot_valid { self.counted_amount.min(self.snapshot) } else { 0 };
         let grown = reward_index.saturating_sub(self.index_at);
-        if grown > 0 && self.counted_amount > 0 {
-            self.allowance = self.allowance.saturating_add(earned(grown, self.counted_amount));
+        if grown > 0 && earning > 0 {
+            self.allowance = self.allowance.saturating_add(earned(grown, earning));
         }
         self.index_at = reward_index;
-        self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), self.counted_amount));
+        self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), earning));
     }
 
     /// How much of `balance` is sweepable: only what sits above the baseline,
@@ -489,7 +516,8 @@ mod tests {
             attestation_epoch: 0,
             index_at: 0,
             allowance: 0,
-            reserved: [0; 28],
+            first_collection_nonce: 0,
+            reserved: [0; 20],
         }
     }
 
@@ -596,6 +624,7 @@ mod tests {
     fn settling_credits_each_stretch_at_the_amount_counted_during_it() {
         let mut l = landlord(0);
         l.counted_amount = 1_000_000;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         // Index 0 -> 2 PUMP-units per coin unit, scaled.
         l.settle(2 * REWARD_INDEX_SCALE, 0);
         assert_eq!((l.allowance, l.index_at), (2_000_000, 2 * REWARD_INDEX_SCALE));
@@ -612,6 +641,7 @@ mod tests {
     fn unused_allowance_carries_over_only_from_the_carry_floor() {
         let mut l = landlord(0);
         l.counted_amount = 1_000_000;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         l.settle(5 * REWARD_INDEX_SCALE, 0);
         assert_eq!(l.allowance, 5_000_000);
         // The floor moves up to index 3: only what was earned since is kept.
@@ -631,19 +661,50 @@ mod tests {
             config.reward_index = index;
             config.mark_rewards(n * day);
         }
-        assert_eq!(config.carry_floor(), 10);
+        assert_eq!(config.carry_floor(3 * day), 10);
         // Too soon after the last mark: nothing moves.
         config.reward_index = 35;
         config.mark_rewards(3 * day + ALLOWANCE_MARK_SPACING_SECS - 1);
-        assert_eq!(config.carry_floor(), 10);
+        assert_eq!(config.carry_floor(3 * day + ALLOWANCE_MARK_SPACING_SECS - 1), 10);
         config.mark_rewards(4 * day);
-        assert_eq!((config.carry_floor(), config.reward_marks[0].index), (20, 35));
+        assert_eq!((config.carry_floor(4 * day), config.reward_marks[0].index), (20, 35));
+    }
+
+    #[test]
+    fn carry_floor_expires_at_72_hours_and_old_credit_never_reopens() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.mark_rewards(86_400);
+        config.reward_index = 100;
+        assert_eq!(config.carry_floor(86_400 + ALLOWANCE_CARRY_SECONDS - 1), 0);
+        assert_eq!(config.carry_floor(86_400 + ALLOWANCE_CARRY_SECONDS), 100);
+        // Resuming posts marks the index before the new credit, excluding all old credit.
+        config.mark_rewards(10 * 86_400);
+        config.reward_index = 120;
+        assert_eq!(config.carry_floor(10 * 86_400), 100);
+        // A flat post does not renew earlier credit either.
+        config.mark_rewards(13 * 86_400);
+        assert_eq!(config.carry_floor(13 * 86_400), 120);
+    }
+
+    #[test]
+    fn coin_a_later_read_found_gone_stops_earning() {
+        let mut l = landlord(0);
+        l.counted_amount = 1_000_000;
+        l.snapshot_valid = true;
+        l.snapshot = 400_000;
+        l.settle(REWARD_INDEX_SCALE, 0);
+        assert_eq!(l.allowance, 400_000);
+        // Found not delegated: nothing earns, and nothing is kept.
+        l.snapshot_valid = false;
+        l.settle(2 * REWARD_INDEX_SCALE, 0);
+        assert_eq!(l.allowance, 0);
     }
 
     #[test]
     fn settling_saturates_instead_of_failing() {
         let mut l = landlord(0);
         l.counted_amount = u64::MAX;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         l.settle(u128::MAX, 0);
         assert_eq!(l.allowance, u64::MAX);
         l.settle(u128::MAX, 0);

@@ -3,6 +3,7 @@ use anchor_spl::token_interface::TokenAccount;
 
 use crate::{
     constants::*,
+    collection::{CollectionConsent, CONSENT_SEED},
     events::BaselineChanged,
     state::{Config, Landlord},
 };
@@ -16,6 +17,9 @@ use crate::{
 #[derive(Accounts)]
 pub struct ResyncBaseline<'info> {
     pub owner: Signer<'info>,
+    #[account(mut, seeds = [CONSENT_SEED, config.key().as_ref(), owner.key().as_ref()],
+        bump = consent.bump, has_one = owner, has_one = config)]
+    pub consent: Box<Account<'info, CollectionConsent>>,
     #[account(
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
         bump = config.bump,
@@ -37,6 +41,7 @@ pub struct ResyncBaseline<'info> {
 }
 
 pub fn handle_resync_baseline(ctx: Context<ResyncBaseline>) -> Result<()> {
+    ctx.accounts.consent.disable()?;
     let new_baseline = ctx.accounts.dividend_account.amount;
     let reward_index = ctx.accounts.config.reward_index;
     let landlord = &mut ctx.accounts.landlord;

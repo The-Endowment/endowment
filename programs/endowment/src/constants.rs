@@ -158,6 +158,21 @@ pub const ALLOWANCE_MARGIN_BPS: u16 = 10_000;
 /// day, so daily posts each take one whatever their jitter).
 pub const ALLOWANCE_CARRY_MARKS: usize = 3;
 pub const ALLOWANCE_MARK_SPACING_SECS: i64 = 20 * 60 * 60;
+pub const ALLOWANCE_CARRY_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// One reward post credits at most this much time: a post after a longer gap
+/// credits only this share of the increase, so a posting outage can't release
+/// more than two days of allowance at once.
+pub const MAX_REWARD_CREDIT_SECS: i64 = 2 * 24 * 60 * 60;
+
+/// Renouncing requires the daily rewards ceiling to be at most this many times
+/// the daily buy limit, so the allowance can't be frozen at a ceiling that
+/// caps nothing.
+pub const MAX_RENOUNCE_REWARDS_TO_BUYS: u64 = 10;
+
+/// The SPL Memo program: a refund is preceded by a memo, so a landlord whose
+/// token account requires memos on incoming transfers can still be refunded.
+pub const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 /// `Config::reward_index` is dividend earned per coin base unit, scaled by this.
 pub const REWARD_INDEX_SCALE: u128 = 1_000_000_000_000;
