@@ -18,6 +18,9 @@ pub fn review(ctx: Context<ReviewCollection>, approved_amount: u64, evidence_has
     let now = Clock::get()?.unix_timestamp;
     let deadline = ctx.accounts.receipt.deadline(ctx.accounts.config.pause_started_at, ctx.accounts.config.paused_until);
     let receipt = &mut ctx.accounts.receipt;
+    // Nobody reviews what it collected itself, whatever role changes happened
+    // since (the receipt's rent payer is the collector that signed it).
+    require_keys_neq!(ctx.accounts.reviewer.key(), receipt.payer, EndowmentError::NotReviewer);
     require!(now >= receipt.release_at, EndowmentError::HoldNotElapsed);
     require!(now < deadline, EndowmentError::CollectionExpired);
     require!(

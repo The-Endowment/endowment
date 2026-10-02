@@ -105,6 +105,7 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
         EndowmentError::ApplyGrace
     );
     let refresher_changes = pending.params.refresher != config.params.refresher;
+    let swept_before = config.sweeps_on(now);
     config.params = pending.params;
     config.pending = PendingParams::default();
     if refresher_changes {
@@ -123,6 +124,11 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
     } else {
         let last = config.last_count_bps;
         config.apply_committed_bps(last);
+    }
+    // New parameters switched sweeps on: rewards paid while they were off stay
+    // with landlords.
+    if !swept_before && config.sweeps_on(now) {
+        config.reward_credit_ok = false;
     }
     emit!(ParamsApplied { config: config_key, params: config.params, active: config.active });
     Ok(())

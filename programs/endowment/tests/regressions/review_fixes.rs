@@ -198,3 +198,41 @@ fn a_role_change_cant_make_a_key_the_reviewer_of_what_it_collected() {
     assert_err!(env.change_roles(&admin, Some((fresh.pubkey(), collector().pubkey()))), InvalidCollectionPolicy);
     assert_err!(env.change_roles(&admin, Some((reviewer().pubkey(), fresh.pubkey()))), InvalidCollectionPolicy);
 }
+
+#[test]
+fn rewards_paid_while_the_count_was_stale_are_not_credited() {
+    let (mut env, owners) = allowance_env();
+    let owner = owners[0].pubkey();
+    let account = env.inst.dividend_account(&owner);
+    env.warp(ACTIVE_MAX_AGE_SECS - 2 * 3600);
+    post_total(&mut env, 0);
+    env.warp(DAY);
+    // The count has gone stale: sweeps are off.
+    env.airdrop_dividend(&account, 1_000 * UNIT);
+    assert_err!(env.sweep(&owner, &account), CountStale);
+    assert!(env.count());
+    let index = env.config_state().reward_index;
+    post_total(&mut env, 1_000 * UNIT);
+    assert_eq!(env.config_state().reward_index, index);
+    assert!(env.sweep(&owner, &account));
+    assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT);
+}
+
+#[test]
+fn a_collector_never_reviews_its_own_receipt_even_after_two_role_changes_and_a_pause() {
+    let (mut env, owner, _) = held(100);
+    let admin = env.admin();
+    let (x, y) = (env.funded(), env.funded());
+    assert!(env.change_roles(&admin, Some((x.pubkey(), reviewer().pubkey()))));
+    env.warp(3600);
+    let guardian = env.guardian.insecure_clone();
+    assert!(env.pause(&guardian));
+    env.warp(PARAM_TIMELOCK_SECONDS - 3600);
+    assert!(env.change_roles(&admin, None));
+    // The old collector is no longer the collector, so this proposal passes,
+    assert!(env.change_roles(&admin, Some((y.pubkey(), collector().pubkey()))));
+    env.warp(PARAM_TIMELOCK_SECONDS);
+    assert!(env.change_roles(&admin, None));
+    // but it still can't review the receipt it collected.
+    assert_err!(env.review_hold_as(&owner.pubkey(), 0, 100, &collector()), NotReviewer);
+}

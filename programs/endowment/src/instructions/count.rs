@@ -349,6 +349,11 @@ pub fn handle_finish_count(ctx: Context<FinishCount>) -> Result<()> {
         ((count.committed as u128 * 10_000) / count.supply as u128).min(10_000) as u16
     };
     config.count.open = false;
+    // Sweeps were off until this count (a stale count, or inactive): rewards
+    // paid meanwhile stay with landlords (see `post_reward_total`).
+    if !config.sweeps_on(now) {
+        config.reward_credit_ok = false;
+    }
     config.apply_committed_bps(committed_bps);
     config.last_count_at = now;
     config.last_count_bps = committed_bps;
