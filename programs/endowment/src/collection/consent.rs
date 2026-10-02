@@ -29,6 +29,9 @@ pub fn enable(ctx: Context<EnableCollection>) -> Result<()> {
     let config = &ctx.accounts.config;
     require!(!config.retired && !config.milestone_reached, EndowmentError::Completed);
     let consent = &mut ctx.accounts.consent;
+    // Already on: switch it off first. Otherwise a landlord could reset its
+    // baseline and void every pending collection without ever being seen off.
+    require!(!consent.enabled, EndowmentError::InvalidCollection);
     consent.disable()?;
     consent.enabled = true;
     consent.started_at = Clock::get()?.unix_timestamp;
@@ -38,6 +41,10 @@ pub fn enable(ctx: Context<EnableCollection>) -> Result<()> {
     landlord.baseline = ctx.accounts.dividend_account.amount;
     landlord.index_at = config.reward_index;
     landlord.allowance = 0;
+    // Like re-approving the delegation, switching back on costs a count round.
+    landlord.snapshot = 0;
+    landlord.snapshot_valid = false;
+    landlord.attestations = 0;
     Ok(())
 }
 

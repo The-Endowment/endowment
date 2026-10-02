@@ -758,7 +758,7 @@ impl Env {
     fn allowance_on(&mut self) {
         self.change_params(|p| {
             p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-            p.max_rewards_per_day = 1_000_000 * UNIT;
+            p.max_rewards_per_day = MAX_BUY_PER_DAY;
         });
     }
 
@@ -1717,7 +1717,7 @@ fn regression_r2roles04_a_matured_proposal_is_the_admins_to_apply_for_a_day_and_
         p.activate_bps = 3_000;
         p.deactivate_bps = 2_500;
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-        p.max_rewards_per_day = 1_000_000 * UNIT;
+        p.max_rewards_per_day = MAX_BUY_PER_DAY;
     });
     assert!(env.propose(&admin, next));
     assert_err!(env.renounce(&admin), PendingChange);
@@ -2811,7 +2811,7 @@ fn regression_l03_sweeps_cant_be_frozen_on_by_renouncing_with_zero_thresholds() 
     env.change_params(|p| {
         p.deactivate_bps = 500;
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-        p.max_rewards_per_day = 1_000_000 * UNIT;
+        p.max_rewards_per_day = MAX_BUY_PER_DAY;
     });
     assert!(env.renounce(&admin));
 }
@@ -3657,7 +3657,7 @@ fn regression_r3rf06_renounce_needs_a_refresher() {
     env.change_params(|p| {
         p.refresher = refresher().pubkey();
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-        p.max_rewards_per_day = 1_000_000 * UNIT;
+        p.max_rewards_per_day = MAX_BUY_PER_DAY;
     });
     assert!(env.renounce(&admin));
 }
@@ -3959,3 +3959,6 @@ mod collection_attacks;
 
 #[path = "regressions/hold_review.rs"]
 mod hold_review;
+
+#[path = "regressions/review_fixes.rs"]
+mod review_fixes;

@@ -183,7 +183,10 @@ pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     );
     // And the reward allowance on, so sweeps can never be frozen uncapped.
     require!(
-        config.retired || config.params.allowance_margin_bps == ALLOWANCE_MARGIN_BPS,
+        config.retired
+            || (config.params.allowance_margin_bps == ALLOWANCE_MARGIN_BPS
+                && config.params.max_rewards_per_day
+                    <= config.params.max_buy_per_day.saturating_mul(MAX_RENOUNCE_REWARDS_TO_BUYS)),
         EndowmentError::InvalidAllowance
     );
     config.admin = Pubkey::default();

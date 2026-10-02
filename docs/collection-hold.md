@@ -72,3 +72,23 @@ The `hold_review` regressions reproduce and prevent three defects: an expired re
 The three retained reward marks are pre-post index snapshots. Expired marks are ignored even if posting stops. This may discard some still-recent allowance between mark boundaries, conservatively under-collecting. It limits the age of posted credit, not the age or provenance of an actual wallet payout: the refresher's cumulative total remains trusted, and neither the bound nor the passage of time proves a wallet received PENIS rewards. The worker must apply its separate attribution checks.
 
 The pause logic relies on the seven-day pause cooldown exceeding the 48-hour review extension; another pause cannot overlap that prior extended window. If those constants change, revisit this invariant.
+
+## Corrections from the independent review
+
+Regressions are in `tests/regressions/review_fixes.rs`.
+
+- **Refunds carry a memo.** `release_collection` and `refund_collection` accept the SPL Memo program as their first remaining account and issue a memo before the refund transfer. Without it, a landlord could switch on "require memos" on its own token account, make its receipts impossible to settle, and so hold room under the vault cap. Always pass it.
+- **A reward post credits only a stretch when contributions were running**, from the last post to this one, with no pause or switch-on in between (`Config.reward_credit_ok`). After a gap it credits at most two days' share of the increase.
+- **`enable_collection` fails if collection is already on**, and switching on clears the landlord's recorded balance and reads, so it is counted again from its second count (as after re-approving the delegation).
+- **Coin a later read found gone stops earning at once:** allowance accrues on the smaller of the counted amount and the recorded balance.
+- **A landlord with no record (left or pruned) has nothing released:** its pending receipts can only be refunded, by anyone.
+- **Renouncing requires a daily rewards ceiling of at most ten times the daily buy limit.**
+- **A role change can't make the current collector the reviewer, or the reverse.**
+
+## Known limits
+
+- The report's balance must match exactly, so a transfer into the landlord's account between signing and landing voids that report. The collector signs again; the exact match is what protects a landlord who spends and re-buys in between.
+- Whoever settles a receipt pays the rent to re-create the landlord's token account if the landlord closed it.
+- A release does not re-run the sweep's market checks. What it moves was collected while they passed, and is bounded by the vault cap.
+- PUMP's transfer-hook authority could delay every transfer of PUMP, refunds included, by setting a hook. Sweeps stop while one is set.
+- Initialize the collection policy before renouncing the admin: afterwards neither it nor the roles can be set.

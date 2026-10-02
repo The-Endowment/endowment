@@ -61,7 +61,10 @@ pub fn propose_roles(ctx: Context<ChangeCollectionRoles>, collector: Pubkey, rev
     let policy = &mut ctx.accounts.policy;
     let cancel = collector == Pubkey::default() && reviewer == Pubkey::default();
     require!(
-        cancel || CollectionPolicy::valid_roles(&collector, &reviewer),
+        cancel
+            || (CollectionPolicy::valid_roles(&collector, &reviewer)
+                && reviewer != policy.collector
+                && collector != policy.reviewer),
         EndowmentError::InvalidCollectionPolicy
     );
     policy.pending_collector = collector;

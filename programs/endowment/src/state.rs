@@ -212,8 +212,13 @@ pub struct Config {
     /// paused_until. Receipts that had already expired cannot be reopened.
     pub pause_started_at: i64,
 
+    /// Whether the next reward post may credit its increase: set by a post made
+    /// while contributions were running, cleared whenever sweeps switch on. A
+    /// post credits only a stretch that began and ended with them running.
+    pub reward_credit_ok: bool,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 12],
+    pub reserved: [u8; 11],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -305,6 +310,10 @@ impl Config {
         if self.milestone_reached {
             self.active = false;
         } else if committed_bps >= self.params.activate_bps {
+            if !self.active {
+                // Rewards paid while sweeps were off stay with landlords.
+                self.reward_credit_ok = false;
+            }
             self.active = true;
         } else if committed_bps < self.params.deactivate_bps {
             self.active = false;
@@ -451,12 +460,15 @@ impl Landlord {
             (counted as u128).checked_mul(grown).map_or(u128::MAX, |v| v / REWARD_INDEX_SCALE).min(u64::MAX as u128)
                 as u64
         };
+        // The coin that earns: what was counted, less anything a later read
+        // found gone (a refresh lowers `snapshot`, never `counted_amount`).
+        let earning = if self.snapshot_valid { self.counted_amount.min(self.snapshot) } else { 0 };
         let grown = reward_index.saturating_sub(self.index_at);
-        if grown > 0 && self.counted_amount > 0 {
-            self.allowance = self.allowance.saturating_add(earned(grown, self.counted_amount));
+        if grown > 0 && earning > 0 {
+            self.allowance = self.allowance.saturating_add(earned(grown, earning));
         }
         self.index_at = reward_index;
-        self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), self.counted_amount));
+        self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), earning));
     }
 
     /// How much of `balance` is sweepable: only what sits above the baseline,
@@ -612,6 +624,7 @@ mod tests {
     fn settling_credits_each_stretch_at_the_amount_counted_during_it() {
         let mut l = landlord(0);
         l.counted_amount = 1_000_000;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         // Index 0 -> 2 PUMP-units per coin unit, scaled.
         l.settle(2 * REWARD_INDEX_SCALE, 0);
         assert_eq!((l.allowance, l.index_at), (2_000_000, 2 * REWARD_INDEX_SCALE));
@@ -628,6 +641,7 @@ mod tests {
     fn unused_allowance_carries_over_only_from_the_carry_floor() {
         let mut l = landlord(0);
         l.counted_amount = 1_000_000;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         l.settle(5 * REWARD_INDEX_SCALE, 0);
         assert_eq!(l.allowance, 5_000_000);
         // The floor moves up to index 3: only what was earned since is kept.
@@ -673,9 +687,24 @@ mod tests {
     }
 
     #[test]
+    fn coin_a_later_read_found_gone_stops_earning() {
+        let mut l = landlord(0);
+        l.counted_amount = 1_000_000;
+        l.snapshot_valid = true;
+        l.snapshot = 400_000;
+        l.settle(REWARD_INDEX_SCALE, 0);
+        assert_eq!(l.allowance, 400_000);
+        // Found not delegated: nothing earns, and nothing is kept.
+        l.snapshot_valid = false;
+        l.settle(2 * REWARD_INDEX_SCALE, 0);
+        assert_eq!(l.allowance, 0);
+    }
+
+    #[test]
     fn settling_saturates_instead_of_failing() {
         let mut l = landlord(0);
         l.counted_amount = u64::MAX;
+        (l.snapshot_valid, l.snapshot) = (true, u64::MAX);
         l.settle(u128::MAX, 0);
         assert_eq!(l.allowance, u64::MAX);
         l.settle(u128::MAX, 0);

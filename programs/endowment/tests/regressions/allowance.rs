@@ -96,8 +96,14 @@ fn the_baseline_still_protects_what_the_landlord_held_on_joining() {
     let resync = env.resync_ix(&owner);
     assert!(send(&mut env.svm, &[resync], &owners[0], &[&owners[0]]));
     assert!(env.enable_hold(&owners[0]));
+    // Switching back on costs a round: it earns again from its second count.
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
+    env.warp(COUNT_INTERVAL_SECS);
+    assert!(env.count());
     assert!(env.post(0));
     env.warp(DAY);
+    assert!(env.count());
     assert!(env.post(1_000 * UNIT));
     // Allowance is 100 PUMP, but nothing sits above the baseline.
     assert!(env.sweep(&owner, &account));

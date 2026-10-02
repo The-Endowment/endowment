@@ -95,6 +95,18 @@ impl Env {
         );
         send(&mut self.svm, &[ix], owner, &[owner])
     }
+    pub(super) fn disable_hold(&mut self, owner: &Keypair) -> bool {
+        let ix = Instruction::new_with_bytes(
+            endowment::id(),
+            &endowment::instruction::DisableCollection {}.data(),
+            endowment::accounts::DisableCollection {
+                owner: owner.pubkey(),
+                consent: consent_pda(&self.config(), &owner.pubkey()),
+            }
+            .to_account_metas(None),
+        );
+        send(&mut self.svm, &[ix], owner, &[owner])
+    }
     pub(super) fn review_hold_as(&mut self, owner: &Pubkey, nonce: u64, amount: u64, signer: &Keypair) -> bool {
         let ix = Instruction::new_with_bytes(
             endowment::id(),

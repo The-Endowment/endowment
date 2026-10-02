@@ -96,6 +96,7 @@ fn old_enrollment_refund_must_not_erase_new_enrollment_contributions() {
 #[test]
 fn renewed_consent_refund_still_adjusts_the_same_enrollment_total() {
     let (mut env, owner, account) = held(100);
+    assert!(env.disable_hold(&owner));
     assert!(env.enable_hold(&owner));
     env.airdrop_dividend(&account, 50);
     assert!(env.sweep(&owner.pubkey(), &account));

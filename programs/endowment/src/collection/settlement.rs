@@ -5,6 +5,7 @@ use crate::{
     state::{Config, Landlord},
 };
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{instruction::Instruction, program::invoke};
 use anchor_spl::{
     associated_token::AssociatedToken,
     token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
@@ -12,6 +13,11 @@ use anchor_spl::{
 
 /// The only exits from pending custody: its fixed treasury or the original
 /// holder's canonical ATA. Neither caller nor reviewer can nominate a recipient.
+///
+/// Remaining accounts: optionally the SPL Memo program, first. With it, a
+/// memo precedes the refund, so a holder whose account requires memos on
+/// incoming transfers can't make its receipts unsettleable. The endowment's
+/// own services always pass it.
 ///
 /// Only the holder's own reclaim of a current receipt switches its collection
 /// off. Every refund raises the holder's baseline by what came back, so the
@@ -70,8 +76,11 @@ pub struct SettleCollection<'info> {
 
 pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
+    let memo_program = ctx.remaining_accounts.first().cloned();
     let a = ctx.accounts;
     let config_key = a.config.key();
+    // A holder that left or was pruned has no record: nothing of its is released.
+    let enrolled = *a.landlord.owner == crate::ID && !a.landlord.data_is_empty();
     let goal = a.config.record_completion(config_key, a.coin_vault.amount);
     let current_consent = a.consent.enabled && a.consent.epoch == a.receipt.consent_epoch;
     // A pause doesn't run out the time to review (`PendingCollection::deadline`).
@@ -80,7 +89,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
     let released = if release {
         require!(!a.config.is_paused(now), EndowmentError::Paused);
         require!(!a.config.retired && !goal, EndowmentError::Completed);
-        require!(current_consent, EndowmentError::CollectionConsentRequired);
+        require!(current_consent && enrolled, EndowmentError::CollectionConsentRequired);
         require!(now >= a.receipt.release_at, EndowmentError::HoldNotElapsed);
         require!(now < deadline, EndowmentError::CollectionExpired);
         require!(a.receipt.reviewed, EndowmentError::CollectionNotReviewed);
@@ -91,6 +100,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
                 || a.caller.key() == a.policy.reviewer
                 || now >= deadline
                 || !current_consent
+                || !enrolled
                 || goal
                 || a.config.retired,
             EndowmentError::RefundNotAllowed
@@ -129,6 +139,9 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
     let treasury_before = a.dividend_vault.amount;
     let refund_before = a.refund_account.amount;
     transfer(released, a.dividend_vault.to_account_info())?;
+    if refunded > 0 {
+        refund_memo(memo_program)?;
+    }
     transfer(refunded, a.refund_account.to_account_info())?;
     a.dividend_vault.reload()?;
     a.refund_account.reload()?;
@@ -169,6 +182,22 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
         released,
         refunded
     });
+    Ok(())
+}
+
+/// Issues a memo, if the Memo program was passed: Token-2022 accepts a
+/// transfer into a memo-requiring account when a memo was the instruction
+/// just before it.
+#[inline(never)]
+fn refund_memo(memo_program: Option<AccountInfo>) -> Result<()> {
+    let Some(program) = memo_program else {
+        return Ok(());
+    };
+    require_keys_eq!(program.key(), MEMO_PROGRAM_ID, EndowmentError::InvalidCollection);
+    invoke(
+        &Instruction { program_id: MEMO_PROGRAM_ID, accounts: vec![], data: b"refund".to_vec() },
+        &[program],
+    )?;
     Ok(())
 }
 
