@@ -5,6 +5,7 @@ use anchor_spl::{
 };
 
 use crate::{
+    collection::*,
     constants::*,
     error::EndowmentError,
     events::Swept,
@@ -13,23 +14,26 @@ use crate::{
     state::{Config, Landlord},
 };
 
-/// Permissionless: anyone may crank a sweep. Funds can only move from the
-/// landlord's delegated dividend account into this endowment's dividend vault,
-/// and only the part above the landlord's baseline. A sweep never changes the
-/// baseline: a dip below it sweeps nothing and leaves it where it is. With the
-/// reward allowance on, a sweep also never takes more than the landlord's
-/// allowance: what its counted coin earned (see `post_reward_total`).
-///
-/// Sweeps stop for good once the coin vault holds the goal (`contribution_cap`,
-/// bought or sent directly; recorded here as well as by buybacks) or the admin
-/// retires the endowment. They run only while the endowment is active and a
-/// count has finished recently (`Config::sweeps_on`), and they fail closed
-/// whenever a buyback couldn't run (`health::ensure_tradeable`): a transfer hook
-/// switched on, either mint's transfer fee above the cap, the pool's swaps
-/// disabled or its fee above the cap, or a vault frozen. Dividends then stay
-/// with landlords.
+/// Collector-signed, exact-amount collection into separate refundable custody.
+/// Report evidence is an attestation, not an on-chain proof of reward origin.
+/// The legacy no-argument ABI fails closed. Buybacks cannot sign for this vault.
 #[derive(Accounts)]
+#[instruction(nonce: u64)]
 pub struct Sweep<'info> {
+    #[account(mut, address = policy.collector @ EndowmentError::NotCollector)]
+    pub collector: Signer<'info>,
+    #[account(mut, seeds = [POLICY_SEED, config.key().as_ref()], bump = policy.bump, has_one = config)]
+    pub policy: Box<Account<'info, CollectionPolicy>>,
+    #[account(mut, seeds = [CONSENT_SEED, config.key().as_ref(), landlord.owner.as_ref()],
+        bump = consent.bump, has_one = config,
+        constraint = consent.owner == landlord.owner @ EndowmentError::InvalidCollection)]
+    pub consent: Box<Account<'info, CollectionConsent>>,
+    #[account(init, payer = collector, space = 8 + PendingCollection::INIT_SPACE,
+        seeds = [RECEIPT_SEED, config.key().as_ref(), landlord.owner.as_ref(), &nonce.to_le_bytes()], bump)]
+    pub receipt: Box<Account<'info, PendingCollection>>,
+    #[account(mut)] // Identity validated by validate_pending_vault before any transfer.
+    pub pending_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub system_program: Program<'info, System>,
     #[account(
         mut,
         seeds = [CONFIG_SEED, config.coin_mint.as_ref(), config.creator.as_ref()],
@@ -92,7 +96,8 @@ pub struct Sweep<'info> {
     pub dividend_token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
+pub fn handle_sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -> Result<()> {
+    validate_pending_vault(&ctx.accounts)?;
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
     let config_key = ctx.accounts.config.key();
@@ -100,6 +105,7 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     // stop without failing, so the record is kept and nothing moves.
     let coin_held = ctx.accounts.coin_vault.amount;
     if ctx.accounts.config.record_completion(config_key, coin_held) {
+        ctx.accounts.receipt.close(ctx.accounts.collector.to_account_info())?;
         return Ok(());
     }
     let config = &ctx.accounts.config;
@@ -122,14 +128,39 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         clock.epoch,
     )?;
 
+    crate::transfer::ensure_refundable_dividend(&ctx.accounts.dividend_mint.to_account_info())?;
+    let consent = &ctx.accounts.consent;
+    require!(consent.enabled, EndowmentError::CollectionConsentRequired);
+    require!(
+        report.consent_epoch == consent.epoch
+            && nonce == consent.next_nonce
+            && report.valid_until >= now
+            && report.valid_until <= now.saturating_add(REPORT_SECONDS)
+            && report.evidence_hash != [0; 32],
+        EndowmentError::InvalidCollection
+    );
     let dividend_account = &ctx.accounts.dividend_account;
+    require!(
+        report.expected_balance == dividend_account.amount,
+        EndowmentError::InvalidCollection
+    );
     require!(
         dividend_account.delegate == Some(ctx.accounts.authority.key()).into(),
         EndowmentError::NotDelegated
     );
     // Never more than the vault can spend in MAX_VAULT_DAYS_OF_BUYS days: the
     // rest stays with the landlord for a later sweep (R3-MINT-01, FC-R3-04).
-    let vault_before = ctx.accounts.dividend_vault.amount;
+    let vault_before = ctx.accounts.pending_vault.amount;
+    require!(
+        vault_before >= ctx.accounts.policy.pending,
+        EndowmentError::InvalidCollection
+    );
+    let committed = ctx
+        .accounts
+        .dividend_vault
+        .amount
+        .checked_add(ctx.accounts.policy.pending)
+        .ok_or(EndowmentError::Overflow)?;
     let vault_cap = config.vault_cap();
     let (balance, delegated) = (dividend_account.amount, dividend_account.delegated_amount);
     let (reward_index, carry_floor, capped, authority_bump) =
@@ -137,11 +168,24 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     let landlord = &mut ctx.accounts.landlord;
     // And, with the allowance on, never more than what its coin earned.
     landlord.settle(reward_index, carry_floor);
-    let mut amount = landlord.sweepable(balance, delegated).min(vault_cap.saturating_sub(vault_before));
+    let mut amount = landlord
+        .sweepable(balance, delegated)
+        .min(vault_cap.saturating_sub(committed))
+        .min(report.amount);
     if capped {
         amount = amount.min(landlord.allowance);
     }
     if amount == 0 {
+        // An accepted report is consumed even if another collection filled the
+        // vault first. Durable workers can distinguish this finalized no-op
+        // from a still-pending send; replaying it cannot collect a later reward.
+        ctx.accounts.consent.next_nonce = ctx
+            .accounts
+            .consent
+            .next_nonce
+            .checked_add(1)
+            .ok_or(EndowmentError::Overflow)?;
+        ctx.accounts.receipt.close(ctx.accounts.collector.to_account_info())?;
         return Ok(());
     }
 
@@ -153,7 +197,7 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
             TransferChecked {
                 from: ctx.accounts.dividend_account.to_account_info(),
                 mint: ctx.accounts.dividend_mint.to_account_info(),
-                to: ctx.accounts.dividend_vault.to_account_info(),
+                to: ctx.accounts.pending_vault.to_account_info(),
                 authority: ctx.accounts.authority.to_account_info(),
             },
             &[&seeds],
@@ -162,17 +206,59 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         ctx.accounts.dividend_mint.decimals,
     )?;
     // What actually arrived, net of any transfer fee on the dividend.
-    ctx.accounts.dividend_vault.reload()?;
-    let received = ctx.accounts.dividend_vault.amount.saturating_sub(vault_before);
+    ctx.accounts.pending_vault.reload()?;
+    let received = ctx.accounts.pending_vault.amount.saturating_sub(vault_before);
+    require!(received == amount, EndowmentError::UnsupportedRefundMint);
+    let consent = &mut ctx.accounts.consent;
+    consent.next_nonce = consent.next_nonce.checked_add(1).ok_or(EndowmentError::Overflow)?;
+    let release_at = now.checked_add(HOLD_SECONDS).ok_or(EndowmentError::Overflow)?;
+    let refund_at = now.checked_add(REFUND_SECONDS).ok_or(EndowmentError::Overflow)?;
+    ctx.accounts.receipt.set_inner(PendingCollection {
+        config: config_key,
+        owner: ctx.accounts.landlord.owner,
+        payer: ctx.accounts.collector.key(),
+        nonce: nonce,
+        consent_epoch: consent.epoch,
+        amount: received,
+        collected_at: now,
+        release_at,
+        refund_at,
+        collection_evidence: report.evidence_hash,
+        reviewed: false,
+        approved_amount: 0,
+        review_evidence: [0; 32],
+        bump: ctx.bumps.receipt,
+    });
+    ctx.accounts.policy.pending = ctx
+        .accounts
+        .policy
+        .pending
+        .checked_add(received)
+        .ok_or(EndowmentError::Overflow)?;
+    emit!(CollectionHeld {
+        config: config_key,
+        owner: ctx.accounts.landlord.owner,
+        nonce: nonce,
+        amount: received,
+        release_at,
+        refund_at,
+        evidence_hash: report.evidence_hash
+    });
 
     let landlord = &mut ctx.accounts.landlord;
-    landlord.total_contributed = landlord.total_contributed.checked_add(amount).ok_or(EndowmentError::Overflow)?;
+    landlord.total_contributed = landlord
+        .total_contributed
+        .checked_add(amount)
+        .ok_or(EndowmentError::Overflow)?;
     landlord.last_sweep_at = now;
     if capped {
         landlord.allowance -= amount;
     }
     let config = &mut ctx.accounts.config;
-    config.total_swept = config.total_swept.checked_add(received).ok_or(EndowmentError::Overflow)?;
+    config.total_swept = config
+        .total_swept
+        .checked_add(received)
+        .ok_or(EndowmentError::Overflow)?;
     config.last_sweep_at = now;
 
     emit!(Swept {
@@ -184,5 +270,23 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
         total_contributed: landlord.total_contributed,
         allowance: landlord.allowance,
     });
+    Ok(())
+}
+
+#[inline(never)]
+fn validate_pending_vault(a: &Sweep) -> Result<()> {
+    require_keys_eq!(
+        a.pending_vault.key(),
+        get_associated_token_address_with_program_id(
+            &a.policy.key(),
+            &a.config.dividend_mint,
+            &a.dividend_token_program.key()
+        ),
+        EndowmentError::InvalidCollection
+    );
+    require!(
+        a.pending_vault.owner == a.policy.key() && a.pending_vault.mint == a.config.dividend_mint,
+        EndowmentError::InvalidCollection
+    );
     Ok(())
 }

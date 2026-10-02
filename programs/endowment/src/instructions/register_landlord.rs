@@ -3,6 +3,7 @@ use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 
 use crate::{
     constants::*,
+    collection::{CollectionConsent, CONSENT_SEED},
     error::EndowmentError,
     events::LandlordRegistered,
     state::{Config, Landlord},
@@ -13,10 +14,10 @@ use crate::{
 /// on the number of landlords.
 ///
 /// The wallet is the unit of commitment: all the coin in `coin_account` counts
-/// toward activation, and new dividend arriving in `dividend_account` is swept,
-/// up to what that coin earned when the reward allowance is on. To commit only
-/// part of a holding, keep the rest in another wallet. Closed once the goal is
-/// reached.
+/// toward activation after separate signed collection consent is enabled.
+/// Collector-attested dividend amounts enter refundable custody, bounded by
+/// the baseline and optional reward allowance. To commit only part of a holding,
+/// keep the rest in another wallet. Closed once the goal is reached.
 #[derive(Accounts)]
 pub struct RegisterLandlord<'info> {
     #[account(mut)]
@@ -38,6 +39,10 @@ pub struct RegisterLandlord<'info> {
         bump
     )]
     pub landlord: Box<Account<'info, Landlord>>,
+
+    #[account(init_if_needed, payer = owner, space = 8 + CollectionConsent::INIT_SPACE,
+        seeds = [CONSENT_SEED, config.key().as_ref(), owner.key().as_ref()], bump)]
+    pub consent: Box<Account<'info, CollectionConsent>>,
 
     #[account(address = config.dividend_mint)]
     pub dividend_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -82,6 +87,11 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
     let reward_index = config.reward_index;
 
     let owner = ctx.accounts.owner.key();
+    let consent = &mut ctx.accounts.consent;
+    consent.config = config_key;
+    consent.owner = owner;
+    consent.bump = ctx.bumps.consent;
+    consent.disable()?; // Preserve next_nonce across deregistration/re-enrollment.
     let baseline = ctx.accounts.dividend_account.amount;
     ctx.accounts.landlord.set_inner(Landlord {
         version: LANDLORD_VERSION,

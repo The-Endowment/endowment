@@ -42,7 +42,7 @@ pub struct CreateEndowment<'info> {
     #[account(mint::token_program = dividend_token_program)]
     pub dividend_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// Receives landlord sweeps.
+    /// Receives released collections, treasury rewards and direct donations.
     #[account(
         init_if_needed,
         payer = creator,

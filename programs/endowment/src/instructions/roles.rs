@@ -157,7 +157,8 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 /// One-way: gives up the admin role for good, freezing every parameter as it
 /// stands. It also clears the guardian and any pending change, so no key is left
 /// that can pause or reconfigure the endowment. It requires production
-/// activation thresholds, so sweeps can't be frozen on, no pending change
+/// activation thresholds, so sweeps can't be frozen on, the reward allowance
+/// on, so they can't be frozen uncapped, no pending change
 /// (cancel it first), so nothing half-decided is left behind, and (unless
 /// retired) a refresher, without which nobody could ever count again.
 ///
@@ -179,6 +180,11 @@ pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
             || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS
                 && config.params.deactivate_bps >= MIN_RENOUNCE_DEACTIVATE_BPS),
         EndowmentError::RenounceThresholds
+    );
+    // And the reward allowance on, so sweeps can never be frozen uncapped.
+    require!(
+        config.retired || config.params.allowance_margin_bps == ALLOWANCE_MARGIN_BPS,
+        EndowmentError::InvalidAllowance
     );
     config.admin = Pubkey::default();
     config.pending_admin = Pubkey::default();

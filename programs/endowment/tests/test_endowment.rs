@@ -19,6 +19,7 @@ use {
         token_2022::{spl_token_2022, ID as TOKEN_2022},
     },
     endowment::{
+        collection::*,
         constants::{
             ACTIVE_MAX_AGE_SECS, ALLOWANCE_MARGIN_BPS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
             LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
@@ -563,7 +564,9 @@ impl Env {
     fn create_inst(&mut self, inst: &Inst, params: CreateParams) -> bool {
         let ix = self.create_ix_for(inst, params);
         let creator = inst.creator.insecure_clone();
-        send(&mut self.svm, &[ix], &creator, &[&creator])
+        let ok = send(&mut self.svm, &[ix], &creator, &[&creator]);
+        if ok { self.initialize_hold(inst); }
+        ok
     }
 
     fn create_with(&mut self, params: CreateParams) -> bool {
@@ -751,6 +754,14 @@ impl Env {
         assert_eq!(self.config_state().params, p);
     }
 
+    /// Switches the reward allowance on (renouncing requires it).
+    fn allowance_on(&mut self) {
+        self.change_params(|p| {
+            p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
+            p.max_rewards_per_day = 1_000_000 * UNIT;
+        });
+    }
+
     fn retire(&mut self, signer: &Keypair) -> bool {
         self.admin_call(signer, endowment::instruction::Retire {}.data())
     }
@@ -809,6 +820,7 @@ impl Env {
             metas.push(AccountMeta::new(*landlord, false));
             metas.push(AccountMeta::new_readonly(state.coin_account, false));
             metas.push(AccountMeta::new_readonly(state.dividend_account, false));
+            metas.push(AccountMeta::new_readonly(consent_pda(&config, &state.owner), false));
         }
         Instruction::new_with_bytes(endowment::id(), &endowment::instruction::CountLandlords {}.data(), metas)
     }
@@ -821,6 +833,7 @@ impl Env {
             metas.push(AccountMeta::new(landlord, false));
             metas.push(AccountMeta::new_readonly(state.coin_account, false));
             metas.push(AccountMeta::new_readonly(state.dividend_account, false));
+            metas.push(AccountMeta::new_readonly(consent_pda(&config, &state.owner), false));
         }
         Instruction::new_with_bytes(endowment::id(), &endowment::instruction::RefreshLandlords {}.data(), metas)
     }
@@ -842,7 +855,7 @@ impl Env {
 
     /// One refresher pass over every landlord of `config`, 8 per transaction.
     fn attest_pass_of(&mut self, config: Pubkey) -> bool {
-        for batch in self.landlords_of(&config).chunks(8) {
+        for batch in self.landlords_of(&config).chunks(6) {
             if !self.attest_of(config, batch) {
                 return false;
             }
@@ -921,7 +934,7 @@ impl Env {
     }
 
     /// A whole daily count of `config` as the keeper runs it: the refresher's
-    /// pass over every landlord, then begin, every landlord in batches of 8, finish.
+    /// pass over every landlord, then begin, every landlord in batches of 6, finish.
     fn count_for(&mut self, config: Pubkey) -> bool {
         if !self.attest_all_of(config) {
             return false;
@@ -930,7 +943,7 @@ impl Env {
         if !self.crank(&[begin]) {
             return false;
         }
-        for batch in self.landlords_of(&config).chunks(8) {
+        for batch in self.landlords_of(&config).chunks(6) {
             let ix = self.count_landlords_ix(config, batch);
             if !self.crank(&[ix]) {
                 return false;
@@ -1059,6 +1072,7 @@ impl Env {
             config,
             authority: authority_pda(&config),
             landlord: landlord_pda(&config, owner),
+            consent: consent_pda(&config, owner),
             dividend_mint: self.inst.dividend_mint,
             dividend_account: *account,
             coin_mint: self.inst.coin_mint,
@@ -1088,6 +1102,7 @@ impl Env {
         let ok = send(&mut self.svm, &ixs, owner, &[owner]);
         if ok {
             self.known.push((self.config(), owner.pubkey()));
+            assert!(self.enable_hold(owner));
         }
         ok
     }
@@ -1113,6 +1128,7 @@ impl Env {
                 owner: *owner,
                 config,
                 landlord: landlord_pda(&config, owner),
+                consent: consent_pda(&config, owner),
                 dividend_account: self.inst.dividend_account(owner),
             }
             .to_account_metas(None),
@@ -1125,6 +1141,7 @@ impl Env {
             &endowment::instruction::DeregisterLandlord {}.data(),
             endowment::accounts::DeregisterLandlord {
                 owner: owner.pubkey(),
+                consent: consent_pda(&config, &owner.pubkey()),
                 config,
                 landlord,
             }
@@ -1164,7 +1181,14 @@ impl Env {
         let key = |at: usize| Pubkey::new_from_array(pool[at..at + 32].try_into().unwrap());
         let dividend_first = key(168) == self.inst.dividend_mint;
         let (pool_dividend_vault, pool_coin_vault) = if dividend_first { (key(72), key(104)) } else { (key(104), key(72)) };
+        let consent = self.consent_state(owner);
         endowment::accounts::Sweep {
+            collector: collector().pubkey(),
+            policy: policy_pda(&config),
+            consent: consent_pda(&config, owner),
+            receipt: receipt_pda(&config, owner, consent.next_nonce),
+            pending_vault: self.pending_vault(),
+            system_program: system_program::ID,
             config,
             authority: authority_pda(&config),
             landlord: landlord_pda(&config, owner),
@@ -1182,14 +1206,16 @@ impl Env {
     }
 
     fn sweep_with(&mut self, accounts: endowment::accounts::Sweep) -> bool {
-        let ix = Instruction::new_with_bytes(
-            endowment::id(),
-            &endowment::instruction::Sweep {}.data(),
-            accounts.to_account_metas(None),
-        );
-        // Anyone can crank a sweep.
-        let cranker = self.funded();
-        send(&mut self.svm, &[ix], &cranker, &[&cranker])
+        let consent = self.read_consent(&accounts.consent);
+        let report = CollectionReport {
+            consent_epoch: consent.epoch,
+            expected_balance: token_balance(&self.svm, &accounts.dividend_account),
+            amount: u64::MAX, valid_until: self.now() + REPORT_SECONDS, evidence_hash: [1; 32],
+        };
+        let ix = Instruction::new_with_bytes(endowment::id(),
+            &endowment::instruction::Sweep { nonce: consent.next_nonce, report }.data(), accounts.to_account_metas(None));
+        let signer = collector();
+        send(&mut self.svm, &[ix], &signer, &[&signer])
     }
 
     fn sweep(&mut self, owner: &Pubkey, account: &Pubkey) -> bool {
@@ -1440,13 +1466,13 @@ fn sweeps_only_what_sits_above_the_baseline() {
     env.airdrop_dividend(&account, 250);
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &account), 100);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 250);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 250);
     assert_eq!(env.landlord_state(&owner.pubkey()).total_contributed, 250);
     assert_eq!(env.config_state().total_swept, 250);
 
     // Nothing new: a sweep is a harmless no-op.
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 250);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 250);
 
     // The landlord spends 60 of their own. The baseline stays where it is.
     let burn = spl_token_2022::instruction::burn(&program, &account, &mint, &owner.pubkey(), &[], 60).unwrap();
@@ -1458,7 +1484,7 @@ fn sweeps_only_what_sits_above_the_baseline() {
     env.airdrop_dividend(&account, 70);
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &account), 100);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 260);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 260);
     let landlord = env.landlord_state(&owner.pubkey());
     assert_eq!((landlord.baseline, landlord.total_contributed), (100, 260));
 }
@@ -1483,9 +1509,10 @@ fn a_landlord_can_lower_its_own_baseline_with_resync() {
     let resync = env.resync_ix(&owner.pubkey());
     assert!(send(&mut env.svm, &[resync], &owner, &[&owner]));
     assert_eq!(env.landlord_state(&owner.pubkey()).baseline, 40);
+    assert!(env.enable_hold(&owner));
     env.airdrop_dividend(&account, 10);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 10);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 10);
 }
 
 #[test]
@@ -1539,7 +1566,7 @@ fn guardian_pause_blocks_sweeps_and_expires() {
 
     env.warp(MAX_PAUSE_SECONDS);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 50);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 50);
 }
 
 #[test]
@@ -1557,7 +1584,7 @@ fn guardian_pauses_but_only_admin_unpauses_early() {
 
     assert!(env.unpause(&admin));
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 5);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 5);
     // The cooldown runs from the early unpause.
     assert_err!(env.pause(&guardian), PauseCooldown);
     env.warp(PAUSE_COOLDOWN_SECONDS);
@@ -1689,6 +1716,8 @@ fn regression_r2roles04_a_matured_proposal_is_the_admins_to_apply_for_a_day_and_
     env.change_params(|p| {
         p.activate_bps = 3_000;
         p.deactivate_bps = 2_500;
+        p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
+        p.max_rewards_per_day = 1_000_000 * UNIT;
     });
     assert!(env.propose(&admin, next));
     assert_err!(env.renounce(&admin), PendingChange);
@@ -1774,6 +1803,7 @@ fn renounced_admin_freezes_every_parameter_and_removes_the_guardian() {
     let admin = env.admin();
     let stranger = env.funded();
     let guardian = env.guardian.insecure_clone();
+    env.allowance_on();
     assert_err!(env.renounce(&stranger), NotAdmin);
     assert!(env.propose_admin(&admin, stranger.pubkey()));
     assert!(env.propose(&admin, base_params()));
@@ -2199,7 +2229,7 @@ fn landlords_of_one_endowment_cant_be_registered_swept_counted_or_removed_throug
 
     // The legitimate sweep into A works.
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &a.dividend_vault()), 100);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 100);
 
     // B's count (or refresh) can't read or write A's landlord in place of its own.
     let landlord_a = landlord_pda(&a.config(), &owner.pubkey());
@@ -2229,7 +2259,7 @@ fn endowments_work_with_original_spl_token_mints() {
     let (owner, account) = env.registered_holder(10, 400);
     env.airdrop_dividend(&account, 90);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 90);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 90);
     assert_eq!(token_balance(&env.svm, &account), 10);
 
     let outsider = env.new_landlord(0).0;
@@ -2247,7 +2277,7 @@ fn a_token_2022_coin_can_pay_an_original_spl_token_dividend() {
     let (owner, account) = env.registered_landlord(0);
     env.airdrop_dividend(&account, 25);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 25);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 25);
 }
 
 // ---------------------------------------------------------------------------
@@ -2551,7 +2581,7 @@ fn there_is_no_limit_on_landlords() {
     assert!(env.begin());
     let owners = env.landlords();
     let mut max_cu = 0;
-    for batch in owners.chunks(8) {
+    for batch in owners.chunks(6) {
         assert!(env.count_batch(batch));
         max_cu = max_cu.max(last_cu());
     }
@@ -2759,6 +2789,9 @@ fn regression_h02_renouncing_removes_the_guardian() {
     env.create();
     let admin = env.admin();
     let guardian = env.guardian.insecure_clone();
+    // Sweeps can't be frozen uncapped: renouncing needs the reward allowance on.
+    assert_err!(env.renounce(&admin), InvalidAllowance);
+    env.allowance_on();
     assert!(env.renounce(&admin));
     assert_eq!(env.config_state().guardian, Pubkey::default());
     assert_err!(env.pause(&guardian), NotGuardian);
@@ -2775,7 +2808,11 @@ fn regression_l03_sweeps_cant_be_frozen_on_by_renouncing_with_zero_thresholds() 
         p.deactivate_bps = 499;
     });
     assert_err!(env.renounce(&admin), RenounceThresholds);
-    env.change_params(|p| p.deactivate_bps = 500);
+    env.change_params(|p| {
+        p.deactivate_bps = 500;
+        p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
+        p.max_rewards_per_day = 1_000_000 * UNIT;
+    });
     assert!(env.renounce(&admin));
 }
 
@@ -2863,7 +2900,7 @@ fn regression_m04_a_third_party_sweep_cant_lower_the_baseline() {
     assert!(send(&mut env.svm, &[back], &cold, &[&cold]));
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT);
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 0);
 }
 
 #[test]
@@ -2879,14 +2916,15 @@ fn regression_m05_opting_back_in_keeps_what_arrived_while_opted_out() {
     // The website re-opts-in with approve + resync in one transaction.
     let ixs = [env.approve_ix(&owner.pubkey(), &account), env.resync_ix(&owner.pubkey())];
     assert!(send(&mut env.svm, &ixs, &owner, &[&owner]));
+    assert!(env.enable_hold(&owner));
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 0);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 0);
     assert_eq!(token_balance(&env.svm, &account), 500 * UNIT);
 
     // Only new drops are swept.
     env.airdrop_dividend(&account, 20 * UNIT);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 20 * UNIT);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 20 * UNIT);
 }
 
 #[test]
@@ -3293,8 +3331,8 @@ fn regression_r2t01_sweeps_fail_closed_when_the_coins_hook_is_switched_on() {
 #[test]
 fn regression_r2t02_sweeps_fail_closed_on_a_dividend_fee_above_the_cap() {
     let (mut env, owner, account) = sweep_env(MintSpec::default(), MintSpec { fee_bps: Some(100), ..Default::default() });
-    // 1% is within the 5% cap.
-    assert!(env.sweep(&owner.pubkey(), &account));
+    // Even 1% prevents exact refunds; the stricter custody rule rejects it.
+    assert_err!(env.sweep(&owner.pubkey(), &account), UnsupportedRefundMint);
     env.airdrop_dividend(&account, 100);
     // A fee authority raises it (scheduled or current): the sweep refuses.
     let mint = env.inst.dividend_mint;
@@ -3305,7 +3343,7 @@ fn regression_r2t02_sweeps_fail_closed_on_a_dividend_fee_above_the_cap() {
             9_000u16.into();
     });
     assert_err!(env.sweep(&owner.pubkey(), &account), FeeTooHigh);
-    assert_eq!(token_balance(&env.svm, &account), 100);
+    assert_eq!(token_balance(&env.svm, &account), 200);
 }
 
 #[test]
@@ -3500,6 +3538,7 @@ fn resign_refresher(env: &mut Env, signer: &Keypair) -> bool {
 #[test]
 fn regression_r3rf01_the_refresher_can_resign_after_renounce_and_then_sweeps_stop() {
     let (mut env, owners) = counted_env();
+    env.allowance_on();
     assert!(env.count());
     env.warp(COUNT_INTERVAL_SECS);
     assert!(env.count());
@@ -3615,7 +3654,11 @@ fn regression_r3rf06_renounce_needs_a_refresher() {
     env.change_params(|p| p.refresher = Pubkey::default());
     let admin = env.admin();
     assert_err!(env.renounce(&admin), NoRefresher);
-    env.change_params(|p| p.refresher = refresher().pubkey());
+    env.change_params(|p| {
+        p.refresher = refresher().pubkey();
+        p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
+        p.max_rewards_per_day = 1_000_000 * UNIT;
+    });
     assert!(env.renounce(&admin));
 }
 
@@ -3725,15 +3768,21 @@ fn regression_r3mint01_a_sweep_never_fills_the_vault_beyond_three_days_of_buys()
     env.set_balance(&account, big);
     assert!(env.sweep(&owner.pubkey(), &account));
     let cap = 3 * MAX_BUY_PER_DAY;
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), cap);
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()) + env.hold_state().pending, cap);
     assert_eq!(token_balance(&env.svm, &account), big - cap, "the rest stays with the landlord");
     // A full vault: a sweep is a no-op, not an error.
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &account), big - cap);
+    // Pending funds cannot fund a buy. Approval and release first require 24h.
+    assert_err!(env.buy(), NothingToBuy);
+    env.warp(HOLD_SECONDS);
+    steady_history(&mut env);
+    assert!(env.review_hold(&owner.pubkey(), 0, cap));
+    assert!(env.settle_hold(&owner.pubkey(), 0, &collector(), true));
     // A buy makes room again.
     assert!(env.buy());
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), cap);
+    assert_eq!(token_balance(&env.svm, &env.dividend_vault()) + env.hold_state().pending, cap);
     // If PUMP's hook authority now switched a hook on, at most `cap` is stranded.
     let pump = fixtures::key(fixtures::PUMP_MINT);
     env.poke(&pump, |d| d[202..234].copy_from_slice(Pubkey::new_unique().as_ref()));
@@ -3853,7 +3902,7 @@ fn regression_fcr304_the_vault_cap_counts_what_the_buy_interval_lets_it_spend() 
     let (owner, account) = env.registered_landlord(0);
     env.set_balance(&account, 50 * MAX_BUY_PER_DAY);
     assert!(env.sweep(&owner.pubkey(), &account));
-    assert_eq!(token_balance(&env.svm, &env.dividend_vault()), 3 * MAX_BUY_PER_TX);
+    assert_eq!(token_balance(&env.svm, &env.pending_vault()), 3 * MAX_BUY_PER_TX);
 }
 
 /// The attacker's own Raydium swap the other way: the coin for the dividend.
@@ -3900,3 +3949,10 @@ mod completion;
 
 #[path = "regressions/allowance.rs"]
 mod allowance;
+
+#[path = "regressions/collection_hold.rs"]
+mod collection_hold;
+use collection_hold::{policy_pda, consent_pda, receipt_pda, collector};
+
+#[path = "regressions/collection_attacks.rs"]
+mod collection_attacks;

@@ -95,6 +95,7 @@ fn the_baseline_still_protects_what_the_landlord_held_on_joining() {
     env.airdrop_dividend(&account, 500 * UNIT);
     let resync = env.resync_ix(&owner);
     assert!(send(&mut env.svm, &[resync], &owners[0], &[&owners[0]]));
+    assert!(env.enable_hold(&owners[0]));
     assert!(env.post(0));
     env.warp(DAY);
     assert!(env.post(1_000 * UNIT));
@@ -121,6 +122,7 @@ fn opting_back_in_starts_the_allowance_afresh() {
     // afterwards can't be taken against it.
     let resync = env.resync_ix(&owner);
     assert!(send(&mut env.svm, &[resync], &owners[0], &[&owners[0]]));
+    assert!(env.enable_hold(&owners[0]));
     let landlord = env.landlord_state(&owner);
     assert_eq!((landlord.allowance, landlord.index_at), (0, env.config_state().reward_index));
     env.airdrop_dividend(&account, 500 * UNIT);

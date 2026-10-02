@@ -1,3 +1,4 @@
+pub mod collection;
 pub mod constants;
 pub mod error;
 pub mod events;
@@ -10,6 +11,7 @@ pub mod transfer;
 
 use anchor_lang::prelude::*;
 
+pub use collection::*;
 pub use constants::*;
 pub use instructions::*;
 pub use state::*;
@@ -18,8 +20,8 @@ declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
 
 /// The $PENIS Endowment.
 ///
-/// The endowment collects the dividend (PUMP) its landlords delegate and spends
-/// it buying its coin ($PENIS), which it holds forever. Only FLAGSHIP_CREATOR
+/// Holder collections enter refundable custody before approved amounts can
+/// buy its coin ($PENIS), which it holds forever. Only FLAGSHIP_CREATOR
 /// can create it; the code is open source for any other project to deploy as
 /// its own copy.
 ///
@@ -56,8 +58,37 @@ pub mod endowment {
         instructions::prune_landlord::handle_prune_landlord(ctx)
     }
 
-    pub fn sweep(ctx: Context<Sweep>) -> Result<()> {
-        instructions::sweep::handle_sweep(ctx)
+    /// Collector-signed collection into refundable custody. The legacy
+    /// no-argument sweep ABI is deliberately invalid; it cannot bypass a hold.
+    pub fn sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -> Result<()> {
+        instructions::sweep::handle_sweep(ctx, nonce, report)
+    }
+
+    pub fn initialize_collection(ctx: Context<InitializeCollection>, collector: Pubkey, reviewer: Pubkey) -> Result<()> {
+        collection::policy::initialize(ctx, collector, reviewer)
+    }
+    /// The admin proposes a new collector and reviewer; `apply_collection_roles`
+    /// puts them in place once the 72-hour timelock has passed.
+    pub fn propose_collection_roles(ctx: Context<ChangeCollectionRoles>, collector: Pubkey, reviewer: Pubkey) -> Result<()> {
+        collection::policy::propose_roles(ctx, collector, reviewer)
+    }
+    pub fn apply_collection_roles(ctx: Context<ChangeCollectionRoles>) -> Result<()> {
+        collection::policy::apply_roles(ctx)
+    }
+    pub fn enable_collection(ctx: Context<EnableCollection>) -> Result<()> {
+        collection::consent::enable(ctx)
+    }
+    pub fn disable_collection(ctx: Context<DisableCollection>) -> Result<()> {
+        collection::consent::disable(ctx)
+    }
+    pub fn review_collection(ctx: Context<ReviewCollection>, approved_amount: u64, evidence_hash: [u8; 32]) -> Result<()> {
+        collection::review::review(ctx, approved_amount, evidence_hash)
+    }
+    pub fn release_collection(ctx: Context<SettleCollection>) -> Result<()> {
+        collection::settlement::settle(ctx, true)
+    }
+    pub fn refund_collection(ctx: Context<SettleCollection>) -> Result<()> {
+        collection::settlement::settle(ctx, false)
     }
 
     pub fn buyback<'info>(ctx: Context<'info, Buyback<'info>>, min_out: u64) -> Result<()> {
