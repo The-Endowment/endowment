@@ -8,7 +8,7 @@
 //! earned; it accumulates in `Config::reward_index`, and each landlord's
 //! allowance grows by its counted coin times the index's growth
 //! (`Landlord::settle`). Sweeps take at most that allowance, and allowance a
-//! landlord doesn't use carries over for about three days, no longer
+//! landlord doesn't use carries over for at most three elapsed days of posted credit
 //! (`Config::reward_marks`).
 //!
 //! Dividing by the whole supply understates what each eligible unit earned

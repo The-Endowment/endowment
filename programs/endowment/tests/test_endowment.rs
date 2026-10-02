@@ -3956,3 +3956,6 @@ use collection_hold::{policy_pda, consent_pda, receipt_pda, collector};
 
 #[path = "regressions/collection_attacks.rs"]
 mod collection_attacks;
+
+#[path = "regressions/hold_review.rs"]
+mod hold_review;

@@ -75,7 +75,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
     let goal = a.config.record_completion(config_key, a.coin_vault.amount);
     let current_consent = a.consent.enabled && a.consent.epoch == a.receipt.consent_epoch;
     // A pause doesn't run out the time to review (`PendingCollection::deadline`).
-    let deadline = a.receipt.deadline(a.config.paused_until);
+    let deadline = a.receipt.deadline(a.config.pause_started_at, a.config.paused_until);
     let reclaimed = !release && a.caller.key() == a.receipt.owner;
     let released = if release {
         require!(!a.config.is_paused(now), EndowmentError::Paused);
@@ -98,7 +98,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
         0
     };
     let refunded = a.receipt.amount.checked_sub(released).ok_or(EndowmentError::Overflow)?;
-    protect_refund(&a.landlord, &config_key, &a.receipt.owner, refunded)?;
+    protect_refund(&a.landlord, &config_key, &a.receipt.owner, a.receipt.nonce, refunded)?;
     // All receipts remain backed, even if someone transfers unsolicited tokens
     // into the pending vault. Unattributed donations create no withdrawal right.
     require!(
@@ -176,7 +176,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
 /// and takes it out of their contribution total. A holder that has left has no
 /// record (and nothing can be collected from it); rejoining sets a new baseline.
 #[inline(never)]
-fn protect_refund(info: &UncheckedAccount, config: &Pubkey, owner: &Pubkey, refunded: u64) -> Result<()> {
+fn protect_refund(info: &UncheckedAccount, config: &Pubkey, owner: &Pubkey, nonce: u64, refunded: u64) -> Result<()> {
     let (expected, _) = Pubkey::find_program_address(&[LANDLORD_SEED, config.as_ref(), owner.as_ref()], &crate::ID);
     require_keys_eq!(info.key(), expected, EndowmentError::InvalidCollection);
     if refunded == 0 || *info.owner != crate::ID || info.data_is_empty() {
@@ -184,7 +184,10 @@ fn protect_refund(info: &UncheckedAccount, config: &Pubkey, owner: &Pubkey, refu
     }
     let mut landlord = Landlord::try_deserialize(&mut &info.try_borrow_data()?[..])?;
     landlord.baseline = landlord.baseline.saturating_add(refunded);
-    landlord.total_contributed = landlord.total_contributed.saturating_sub(refunded);
+    // Protect every refund, but only undo totals charged to this registration.
+    if nonce >= landlord.first_collection_nonce {
+        landlord.total_contributed = landlord.total_contributed.saturating_sub(refunded);
+    }
     landlord.try_serialize(&mut &mut info.try_borrow_mut_data()?[..])?;
     Ok(())
 }

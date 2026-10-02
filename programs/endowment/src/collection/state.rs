@@ -79,8 +79,9 @@ impl PendingCollection {
     /// When this receipt becomes refund-only. A pause that began after it was
     /// collected doesn't run the clock out: the review window (the time between
     /// `release_at` and `refund_at`) starts again when the pause ends.
-    pub fn deadline(&self, paused_until: i64) -> i64 {
-        if paused_until > self.collected_at {
+    pub fn deadline(&self, pause_started_at: i64, paused_until: i64) -> i64 {
+        if pause_started_at >= self.collected_at && pause_started_at < self.refund_at
+            && paused_until > self.collected_at {
             self.refund_at.max(paused_until.saturating_add(REFUND_SECONDS - HOLD_SECONDS))
         } else {
             self.refund_at
@@ -161,12 +162,15 @@ mod tests {
             bump: 0,
         };
         // No pause, or one that ended before the collection: the plain 72 hours.
-        assert_eq!(receipt.deadline(0), 1_000 + REFUND_SECONDS);
-        assert_eq!(receipt.deadline(1_000), 1_000 + REFUND_SECONDS);
+        assert_eq!(receipt.deadline(0, 0), 1_000 + REFUND_SECONDS);
+        assert_eq!(receipt.deadline(0, 1_000), 1_000 + REFUND_SECONDS);
         // A short pause inside the hold changes nothing.
-        assert_eq!(receipt.deadline(2_000), 1_000 + REFUND_SECONDS);
+        assert_eq!(receipt.deadline(1_000, 2_000), 1_000 + REFUND_SECONDS);
         // A long one leaves 48 hours to review after it ends.
         let ends = 1_000 + 5 * HOLD_SECONDS;
-        assert_eq!(receipt.deadline(ends), ends + 2 * HOLD_SECONDS);
+        assert_eq!(receipt.deadline(1_000, ends), ends + 2 * HOLD_SECONDS);
+        // Exactly at expiry or later, a pause cannot revive this receipt.
+        assert_eq!(receipt.deadline(receipt.refund_at, ends), receipt.refund_at);
+        assert_eq!(receipt.deadline(receipt.refund_at + 1, ends), receipt.refund_at);
     }
 }
