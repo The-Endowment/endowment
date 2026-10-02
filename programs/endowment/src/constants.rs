@@ -158,6 +158,7 @@ pub const ALLOWANCE_MARGIN_BPS: u16 = 10_000;
 /// day, so daily posts each take one whatever their jitter).
 pub const ALLOWANCE_CARRY_MARKS: usize = 3;
 pub const ALLOWANCE_MARK_SPACING_SECS: i64 = 20 * 60 * 60;
+pub const ALLOWANCE_CARRY_SECONDS: i64 = 3 * 24 * 60 * 60;
 
 /// `Config::reward_index` is dividend earned per coin base unit, scaled by this.
 pub const REWARD_INDEX_SCALE: u128 = 1_000_000_000_000;

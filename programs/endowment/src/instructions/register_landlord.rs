@@ -115,7 +115,8 @@ pub fn handle_register_landlord(ctx: Context<RegisterLandlord>) -> Result<()> {
         // Earns from now on: nothing posted before it joined.
         index_at: reward_index,
         allowance: 0,
-        reserved: [0; 28],
+        first_collection_nonce: consent.next_nonce,
+        reserved: [0; 20],
     });
 
     emit!(LandlordRegistered { config: config_key, owner, baseline, coin_held });

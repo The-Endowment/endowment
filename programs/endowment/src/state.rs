@@ -205,11 +205,15 @@ pub struct Config {
     pub last_reward_post_at: i64,
     /// The reward index at recent reward posts, newest first, each taken before
     /// that post's own increase and at least ALLOWANCE_MARK_SPACING_SECS after
-    /// the one before. The oldest is the carry-over floor (`carry_floor`).
+    /// the one before. The oldest still within 72 elapsed hours is the carry-over floor.
     pub reward_marks: [RewardMark; ALLOWANCE_CARRY_MARKS],
 
+    /// Start of the most recent guardian pause; lifting it early changes only
+    /// paused_until. Receipts that had already expired cannot be reopened.
+    pub pause_started_at: i64,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 20],
+    pub reserved: [u8; 12],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -254,10 +258,17 @@ impl Config {
         }
     }
 
-    /// The reward index about three days of posts ago: allowance earned before
-    /// it has expired (`Landlord::settle`). 0 until that many marks exist.
-    pub fn carry_floor(&self) -> u128 {
-        self.reward_marks[ALLOWANCE_CARRY_MARKS - 1].index
+    /// Old credit expires with elapsed time even if reward posting stops.
+    /// A mark is the index before its post: choose the oldest retained mark
+    /// strictly inside the window. This can discard some still-recent credit
+    /// between marks, but never restores credit from before the time boundary.
+    pub fn carry_floor(&self, now: i64) -> u128 {
+        let cutoff = now.saturating_sub(ALLOWANCE_CARRY_SECONDS);
+        self.reward_marks.iter()
+            .filter(|mark| mark.at != 0 && mark.at > cutoff && mark.at <= now)
+            .map(|mark| mark.index)
+            .min()
+            .unwrap_or(self.reward_index)
     }
 
     /// Records the goal once the coin vault holds `contribution_cap`, however
@@ -415,8 +426,12 @@ pub struct Landlord {
     pub index_at: u128,
     pub allowance: u64,
 
+    /// First possible collection nonce in this registration. Unlike timestamps,
+    /// this separates leaving/rejoining even within one slot or second.
+    pub first_collection_nonce: u64,
+
     /// Room for future fields without a migration.
-    pub reserved: [u8; 28],
+    pub reserved: [u8; 20],
 }
 
 impl Landlord {
@@ -428,7 +443,7 @@ impl Landlord {
     ///
     /// Unused allowance carries over only so far: what is left never exceeds
     /// what the coin now counted earned since `carry_floor`
-    /// (`Config::carry_floor`, about three days of posts back). So a landlord
+    /// (`Config::carry_floor`, at most three elapsed days of posted credit). So a landlord
     /// that spends its rewards for weeks can't later be swept weeks of
     /// allowance out of dividend it bought, and one counted at zero keeps none.
     pub fn settle(&mut self, reward_index: u128, carry_floor: u128) {
@@ -489,7 +504,8 @@ mod tests {
             attestation_epoch: 0,
             index_at: 0,
             allowance: 0,
-            reserved: [0; 28],
+            first_collection_nonce: 0,
+            reserved: [0; 20],
         }
     }
 
@@ -631,13 +647,29 @@ mod tests {
             config.reward_index = index;
             config.mark_rewards(n * day);
         }
-        assert_eq!(config.carry_floor(), 10);
+        assert_eq!(config.carry_floor(3 * day), 10);
         // Too soon after the last mark: nothing moves.
         config.reward_index = 35;
         config.mark_rewards(3 * day + ALLOWANCE_MARK_SPACING_SECS - 1);
-        assert_eq!(config.carry_floor(), 10);
+        assert_eq!(config.carry_floor(3 * day + ALLOWANCE_MARK_SPACING_SECS - 1), 10);
         config.mark_rewards(4 * day);
-        assert_eq!((config.carry_floor(), config.reward_marks[0].index), (20, 35));
+        assert_eq!((config.carry_floor(4 * day), config.reward_marks[0].index), (20, 35));
+    }
+
+    #[test]
+    fn carry_floor_expires_at_72_hours_and_old_credit_never_reopens() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.mark_rewards(86_400);
+        config.reward_index = 100;
+        assert_eq!(config.carry_floor(86_400 + ALLOWANCE_CARRY_SECONDS - 1), 0);
+        assert_eq!(config.carry_floor(86_400 + ALLOWANCE_CARRY_SECONDS), 100);
+        // Resuming posts marks the index before the new credit, excluding all old credit.
+        config.mark_rewards(10 * 86_400);
+        config.reward_index = 120;
+        assert_eq!(config.carry_floor(10 * 86_400), 100);
+        // A flat post does not renew earlier credit either.
+        config.mark_rewards(13 * 86_400);
+        assert_eq!(config.carry_floor(13 * 86_400), 120);
     }
 
     #[test]

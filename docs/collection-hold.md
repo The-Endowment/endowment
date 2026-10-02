@@ -7,7 +7,7 @@ How dividend (PUMP) gets from a landlord's account to the endowment's buyback va
 1. **Collect.** The collector signs `sweep(nonce, report)`. The report names the exact amount, the account's exact balance, the landlord's consent epoch, and an expiry at most 60 seconds away. The contract then takes the smallest of:
    - the report's amount;
    - what sits above the landlord's baseline;
-   - the landlord's reward allowance (what its counted coin earned, 1.0×, carried over about three days);
+   - the landlord's reward allowance (what its counted coin earned, 1.0×, carried over at most 72 elapsed hours from its reward post);
    - the room left under the vault cap (holding and vault together).
 2. **Hold.** The dividend goes to a holding account owned by the collection-policy PDA. Buybacks can't sign for it. A receipt records the landlord, amount, time, and the collector's evidence hash. Each receipt has its own 24-hour timer.
 3. **Review.** After 24 hours the reviewer approves an amount up to the receipt (`review_collection`).
@@ -23,7 +23,7 @@ Held dividend has two possible destinations: the endowment's vault, or the landl
 
 - **The landlord reclaims a current receipt:** its collection switches off until it calls `enable_collection` again. Its other pending receipts then can only be refunded.
 - **Anyone else refunds, or a release approves only part:** the landlord stays enrolled.
-- **Every refund** raises the landlord's baseline by what came back, so it is never collected again, and takes it out of the contribution totals.
+- **Every refund** raises the landlord's baseline by what came back, so it is never collected again, and takes it out of the global contribution total. It adjusts the current landlord total only if the receipt belongs to that registration; refunds from before a leave/rejoin cannot erase new contributions. Consent renewal within one registration still adjusts that registration.
 
 ## Timing
 
@@ -32,7 +32,7 @@ Held dividend has two possible destinations: the endowment's vault, or the landl
 | Report valid for | at most 60 seconds |
 | Hold before review and release | 24 hours |
 | Refund-only after | 72 hours |
-| A pause | blocks release, never a refund; the 48-hour review window starts again when it ends |
+| A pause | blocks release, never a refund; only a pause beginning before the original expiry can extend the review window; expired receipts never reopen |
 
 ## Roles
 
@@ -62,3 +62,13 @@ The evidence hashes commit to the payout and spending records each service keeps
 ```sh
 HOLD_FIXTURE_PATH=/absolute/path/to/holding-chain.json cargo test -p endowment export_cross_language_hold_fixture
 ```
+
+## PR #5 follow-up corrections
+
+The `brett_review` regressions reproduce and prevent three defects: an expired receipt reopened by a later pause; allowance surviving a multi-day reward-post outage; and an old registration's refund erasing a new registration's contribution total. Additional cases exercise same-timestamp re-enrollment, renewal without re-enrollment, the exact 72-hour boundary, and resumed/flat reward posts.
+
+`Config.pause_started_at` consumes eight reserved bytes, and `Landlord.first_collection_nonce` consumes eight reserved bytes. Account sizes do not change. The client must use the regenerated IDL; size alone cannot distinguish the old semantics. This is a pre-deployment change, **not** a migration for existing deployed accounts. Any existing deployment would need a separate reviewed migration before using these fields.
+
+The three retained reward marks are pre-post index snapshots. Expired marks are ignored even if posting stops. This may discard some still-recent allowance between mark boundaries, conservatively under-collecting. It limits the age of posted credit, not the age or provenance of an actual wallet payout: the refresher's cumulative total remains trusted, and neither the bound nor the passage of time proves a wallet received PENIS rewards. The worker must apply its separate attribution checks.
+
+The pause logic relies on the seven-day pause cooldown exceeding the 48-hour review extension; another pause cannot overlap that prior extended window. If those constants change, revisit this invariant.
