@@ -2,7 +2,7 @@
 //! counted coin earned, per the reward totals the refresher posts.
 use super::*;
 
-const MARGIN_BPS: u16 = 15_000;
+const MARGIN_BPS: u16 = ALLOWANCE_MARGIN_BPS;
 const DAY: i64 = 24 * 60 * 60;
 
 impl Env {
@@ -72,7 +72,7 @@ fn a_sweep_takes_at_most_what_the_coin_earned() {
     // Holders as a whole earned 1,000 PUMP; this landlord holds a tenth.
     assert!(env.post(1_000 * UNIT));
     let first = env.earned(counted, 1_000 * UNIT);
-    assert_eq!(first, 150 * UNIT, "a tenth of 1,000, times the 1.5x margin");
+    assert_eq!(first, 100 * UNIT, "a tenth of 1,000, and no more");
 
     assert!(env.sweep(&owner, &account));
     assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT - first, "the rest stays with the landlord");
@@ -98,14 +98,14 @@ fn the_baseline_still_protects_what_the_landlord_held_on_joining() {
     assert!(env.post(0));
     env.warp(DAY);
     assert!(env.post(1_000 * UNIT));
-    // Allowance is 150 PUMP, but nothing sits above the baseline.
+    // Allowance is 100 PUMP, but nothing sits above the baseline.
     assert!(env.sweep(&owner, &account));
     assert_eq!(token_balance(&env.svm, &account), 500 * UNIT);
     // The allowance waits for rewards that do arrive.
     env.airdrop_dividend(&account, 40 * UNIT);
     assert!(env.sweep(&owner, &account));
     assert_eq!(token_balance(&env.svm, &account), 500 * UNIT);
-    assert_eq!(env.landlord_state(&owner).allowance, 110 * UNIT);
+    assert_eq!(env.landlord_state(&owner).allowance, 60 * UNIT);
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn opting_back_in_starts_the_allowance_afresh() {
     assert!(env.post(0));
     env.warp(DAY);
     assert!(env.post(1_000 * UNIT));
-    // Earned 150 PUMP of allowance, never swept (say, while away). On opting
+    // Earned 100 PUMP of allowance, never swept (say, while away). On opting
     // back in, the website resyncs: that allowance is gone, so PUMP bought
     // afterwards can't be taken against it.
     let resync = env.resync_ix(&owner);
@@ -221,8 +221,34 @@ fn each_stretch_is_credited_at_the_amount_counted_during_it() {
     assert!(env.post(2_000 * UNIT));
     env.airdrop_dividend(&account, 1_000 * UNIT);
     assert!(env.sweep(&owner, &account));
-    let expected = env.earned(before, 1_000 * UNIT) + env.earned(after, 1_000 * UNIT);
+    let credited = env.earned(before, 1_000 * UNIT) + env.earned(after, 1_000 * UNIT);
+    // What carries over is held to what the coin counted now would have earned
+    // over the same days, so a landlord whose coin fell keeps a little less.
+    let expected = credited.min(env.earned(after, 2_000 * UNIT));
+    assert!(expected < credited);
     assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT - expected);
+}
+
+#[test]
+fn unused_allowance_carries_over_for_three_days_and_no_longer() {
+    let (mut env, owners) = allowance_env(1_000_000 * UNIT);
+    let owner = owners[0].pubkey();
+    let account = env.inst.dividend_account(&owner);
+    let counted = env.landlord_state(&owner).counted_amount;
+    assert!(env.post(0));
+    // Five days of rewards, 1,000 PUMP a day to holders as a whole, and the
+    // landlord spends its share each day: nothing is there to sweep.
+    for day in 1..=5u64 {
+        env.warp(DAY);
+        assert!(env.count());
+        assert!(env.post(day * 1_000 * UNIT));
+    }
+    // It then buys 1,000 PUMP. Only the last three days' allowance is left.
+    env.airdrop_dividend(&account, 1_000 * UNIT);
+    assert!(env.sweep(&owner, &account));
+    let kept = 3 * env.earned(counted, 1_000 * UNIT);
+    assert_eq!(token_balance(&env.svm, &account), 1_000 * UNIT - kept);
+    assert_eq!(env.landlord_state(&owner).allowance, 0);
 }
 
 #[test]

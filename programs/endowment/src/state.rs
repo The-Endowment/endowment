@@ -39,8 +39,9 @@ pub struct Params {
     /// none, so nobody counts and sweeps stay off.
     pub refresher: Pubkey,
     /// Reward allowance, in bps: each landlord can be swept at most what its
-    /// counted coin earned (from the reward totals the refresher posts), times
-    /// this. 0 = off: sweeps take everything above the baseline.
+    /// counted coin earned (from the reward totals the refresher posts).
+    /// ALLOWANCE_MARGIN_BPS (1.0x) = on; 0 = off: sweeps take everything above
+    /// the baseline.
     pub allowance_margin_bps: u16,
     /// The most the coin's holders can plausibly earn per day, in dividend base
     /// units. Each posted total is clamped to this rate for the time since the
@@ -75,8 +76,7 @@ impl Params {
         require!(self.min_stake_bps <= MAX_MIN_STAKE_BPS, EndowmentError::InvalidParams);
         require!(
             self.allowance_margin_bps == 0
-                || ((MIN_ALLOWANCE_MARGIN_BPS..=MAX_ALLOWANCE_MARGIN_BPS).contains(&self.allowance_margin_bps)
-                    && self.max_rewards_per_day > 0),
+                || (self.allowance_margin_bps == ALLOWANCE_MARGIN_BPS && self.max_rewards_per_day > 0),
             EndowmentError::InvalidAllowance
         );
         Ok(())
@@ -109,6 +109,13 @@ pub struct PendingParams {
     pub params: Params,
     /// 0 = nothing pending.
     pub effective_at: i64,
+}
+
+/// The endowment's reward index at one moment (see `Config::reward_marks`).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, InitSpace, PartialEq)]
+pub struct RewardMark {
+    pub at: i64,
+    pub index: u128,
 }
 
 /// One endowment instance. Seeds: [CONFIG_SEED, coin_mint, creator].
@@ -196,9 +203,13 @@ pub struct Config {
     /// The last reward total the refresher posted, and when (0 = never).
     pub last_reward_total: u64,
     pub last_reward_post_at: i64,
+    /// The reward index at recent reward posts, newest first, each taken before
+    /// that post's own increase and at least ALLOWANCE_MARK_SPACING_SECS after
+    /// the one before. The oldest is the carry-over floor (`carry_floor`).
+    pub reward_marks: [RewardMark; ALLOWANCE_CARRY_MARKS],
 
     /// Room for future fields without a migration.
-    pub reserved: [u8; 92],
+    pub reserved: [u8; 20],
 }
 
 /// Everything a creator chooses for a new endowment. All bounded; the pool and
@@ -232,6 +243,21 @@ impl Config {
     /// allowances accrue during (`post_reward_total`).
     pub fn collecting(&self, now: i64) -> bool {
         !self.is_paused(now) && !self.retired && self.sweeps_on(now)
+    }
+
+    /// Takes a mark of the reward index, if the last one is old enough. Called
+    /// by a reward post before it adds its own increase.
+    pub fn mark_rewards(&mut self, now: i64) {
+        if now.saturating_sub(self.reward_marks[0].at) >= ALLOWANCE_MARK_SPACING_SECS {
+            self.reward_marks.rotate_right(1);
+            self.reward_marks[0] = RewardMark { at: now, index: self.reward_index };
+        }
+    }
+
+    /// The reward index about three days of posts ago: allowance earned before
+    /// it has expired (`Landlord::settle`). 0 until that many marks exist.
+    pub fn carry_floor(&self) -> u128 {
+        self.reward_marks[ALLOWANCE_CARRY_MARKS - 1].index
     }
 
     /// Records the goal once the coin vault holds `contribution_cap`, however
@@ -399,15 +425,23 @@ impl Landlord {
     /// `counted_amount`, so each stretch of time is credited at the amount that
     /// was counted during it. Saturates rather than fails: the worst case is an
     /// allowance stuck at its cap, never a blocked sweep or count.
-    pub fn settle(&mut self, reward_index: u128) {
+    ///
+    /// Unused allowance carries over only so far: what is left never exceeds
+    /// what the coin now counted earned since `carry_floor`
+    /// (`Config::carry_floor`, about three days of posts back). So a landlord
+    /// that spends its rewards for weeks can't later be swept weeks of
+    /// allowance out of dividend it bought, and one counted at zero keeps none.
+    pub fn settle(&mut self, reward_index: u128, carry_floor: u128) {
+        let earned = |grown: u128, counted: u64| {
+            (counted as u128).checked_mul(grown).map_or(u128::MAX, |v| v / REWARD_INDEX_SCALE).min(u64::MAX as u128)
+                as u64
+        };
         let grown = reward_index.saturating_sub(self.index_at);
         if grown > 0 && self.counted_amount > 0 {
-            let earned = (self.counted_amount as u128)
-                .checked_mul(grown)
-                .map_or(u128::MAX, |v| v / REWARD_INDEX_SCALE);
-            self.allowance = self.allowance.saturating_add(earned.min(u64::MAX as u128) as u64);
+            self.allowance = self.allowance.saturating_add(earned(grown, self.counted_amount));
         }
         self.index_at = reward_index;
+        self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), self.counted_amount));
     }
 
     /// How much of `balance` is sweepable: only what sits above the baseline,
@@ -473,7 +507,7 @@ mod tests {
             deactivate_bps: 2_500,
             min_stake_bps: 10,
             refresher: Pubkey::new_unique(),
-            allowance_margin_bps: 15_000,
+            allowance_margin_bps: 10_000,
             max_rewards_per_day: 1_000_000,
         }
     }
@@ -543,7 +577,7 @@ mod tests {
         })
         .validate()
         .is_ok());
-        // The allowance: off, or 1x-3x with a daily ceiling.
+        // The allowance: off, or exactly 1x with a daily ceiling.
         assert!(with(&|p| p.allowance_margin_bps = 0).validate().is_ok());
         assert!(with(&|p| {
             p.allowance_margin_bps = 0;
@@ -553,8 +587,8 @@ mod tests {
         .is_ok());
         assert!(with(&|p| p.allowance_margin_bps = 9_999).validate().is_err());
         assert!(with(&|p| p.allowance_margin_bps = 10_000).validate().is_ok());
-        assert!(with(&|p| p.allowance_margin_bps = 30_000).validate().is_ok());
-        assert!(with(&|p| p.allowance_margin_bps = 30_001).validate().is_err());
+        assert!(with(&|p| p.allowance_margin_bps = 10_001).validate().is_err());
+        assert!(with(&|p| p.allowance_margin_bps = 15_000).validate().is_err());
         assert!(with(&|p| p.max_rewards_per_day = 0).validate().is_err());
     }
 
@@ -563,24 +597,56 @@ mod tests {
         let mut l = landlord(0);
         l.counted_amount = 1_000_000;
         // Index 0 -> 2 PUMP-units per coin unit, scaled.
-        l.settle(2 * REWARD_INDEX_SCALE);
+        l.settle(2 * REWARD_INDEX_SCALE, 0);
         assert_eq!((l.allowance, l.index_at), (2_000_000, 2 * REWARD_INDEX_SCALE));
         // Settling twice at the same index adds nothing.
-        l.settle(2 * REWARD_INDEX_SCALE);
+        l.settle(2 * REWARD_INDEX_SCALE, 0);
         assert_eq!(l.allowance, 2_000_000);
-        // A landlord counted at zero earns nothing, but its index still moves.
+        // A landlord counted at zero earns nothing and keeps nothing, but its index still moves.
         l.counted_amount = 0;
-        l.settle(5 * REWARD_INDEX_SCALE);
-        assert_eq!((l.allowance, l.index_at), (2_000_000, 5 * REWARD_INDEX_SCALE));
+        l.settle(5 * REWARD_INDEX_SCALE, 0);
+        assert_eq!((l.allowance, l.index_at), (0, 5 * REWARD_INDEX_SCALE));
+    }
+
+    #[test]
+    fn unused_allowance_carries_over_only_from_the_carry_floor() {
+        let mut l = landlord(0);
+        l.counted_amount = 1_000_000;
+        l.settle(5 * REWARD_INDEX_SCALE, 0);
+        assert_eq!(l.allowance, 5_000_000);
+        // The floor moves up to index 3: only what was earned since is kept.
+        l.settle(6 * REWARD_INDEX_SCALE, 3 * REWARD_INDEX_SCALE);
+        assert_eq!(l.allowance, 3_000_000);
+        // What was already used isn't given back.
+        l.allowance = 1_000_000;
+        l.settle(6 * REWARD_INDEX_SCALE, 3 * REWARD_INDEX_SCALE);
+        assert_eq!(l.allowance, 1_000_000);
+    }
+
+    #[test]
+    fn a_mark_is_taken_once_the_last_is_old_enough_and_the_oldest_is_the_floor() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        let day = 86_400;
+        for (n, index) in [(1, 10u128), (2, 20), (3, 30)] {
+            config.reward_index = index;
+            config.mark_rewards(n * day);
+        }
+        assert_eq!(config.carry_floor(), 10);
+        // Too soon after the last mark: nothing moves.
+        config.reward_index = 35;
+        config.mark_rewards(3 * day + ALLOWANCE_MARK_SPACING_SECS - 1);
+        assert_eq!(config.carry_floor(), 10);
+        config.mark_rewards(4 * day);
+        assert_eq!((config.carry_floor(), config.reward_marks[0].index), (20, 35));
     }
 
     #[test]
     fn settling_saturates_instead_of_failing() {
         let mut l = landlord(0);
         l.counted_amount = u64::MAX;
-        l.settle(u128::MAX);
+        l.settle(u128::MAX, 0);
         assert_eq!(l.allowance, u64::MAX);
-        l.settle(u128::MAX);
+        l.settle(u128::MAX, 0);
         assert_eq!(l.allowance, u64::MAX);
     }
 

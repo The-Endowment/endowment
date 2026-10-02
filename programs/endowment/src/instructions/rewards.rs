@@ -7,11 +7,13 @@
 //! and multiplied by the endowment's margin, is what each coin base unit
 //! earned; it accumulates in `Config::reward_index`, and each landlord's
 //! allowance grows by its counted coin times the index's growth
-//! (`Landlord::settle`). Sweeps take at most that allowance.
+//! (`Landlord::settle`). Sweeps take at most that allowance, and allowance a
+//! landlord doesn't use carries over for about three days, no longer
+//! (`Config::reward_marks`).
 //!
 //! Dividing by the whole supply understates what each eligible unit earned
 //! (pools and other non-earning holders get nothing), which errs toward taking
-//! less, never more; the margin covers it.
+//! less, never more. The margin is exactly 1.0x.
 //!
 //! The total is public and checkable, but the post is trusted: a refresher that
 //! posts too high releases more allowance than earned. That is bounded:
@@ -54,6 +56,7 @@ pub fn handle_post_reward_total(ctx: Context<PostRewardTotal>, total: u64) -> Re
     let config = &mut ctx.accounts.config;
 
     let mut credited = 0;
+    config.mark_rewards(now);
     if config.last_reward_post_at != 0 {
         let elapsed = now.saturating_sub(config.last_reward_post_at);
         require!(elapsed >= MIN_REWARD_POST_SPACING_SECS, EndowmentError::RewardPostTooSoon);
@@ -61,7 +64,7 @@ pub fn handle_post_reward_total(ctx: Context<PostRewardTotal>, total: u64) -> Re
         if margin > 0 && supply > 0 && config.collecting(now) {
             let ceiling = (config.params.max_rewards_per_day as u128 * elapsed as u128 / 86_400).min(u64::MAX as u128);
             credited = total.saturating_sub(config.last_reward_total).min(ceiling as u64);
-            // At most u64::MAX * MAX_ALLOWANCE_MARGIN_BPS * REWARD_INDEX_SCALE, well within u128.
+            // At most u64::MAX * ALLOWANCE_MARGIN_BPS * REWARD_INDEX_SCALE, well within u128.
             let grown = credited as u128 * margin as u128 * REWARD_INDEX_SCALE / (supply as u128 * 10_000);
             config.reward_index = config.reward_index.saturating_add(grown);
         }

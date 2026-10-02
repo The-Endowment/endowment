@@ -132,11 +132,11 @@ pub fn handle_sweep(ctx: Context<Sweep>) -> Result<()> {
     let vault_before = ctx.accounts.dividend_vault.amount;
     let vault_cap = config.vault_cap();
     let (balance, delegated) = (dividend_account.amount, dividend_account.delegated_amount);
-    let (reward_index, capped, authority_bump) =
-        (config.reward_index, config.params.allowance_margin_bps > 0, config.authority_bump);
+    let (reward_index, carry_floor, capped, authority_bump) =
+        (config.reward_index, config.carry_floor(), config.params.allowance_margin_bps > 0, config.authority_bump);
     let landlord = &mut ctx.accounts.landlord;
     // And, with the allowance on, never more than what its coin earned.
-    landlord.settle(reward_index);
+    landlord.settle(reward_index, carry_floor);
     let mut amount = landlord.sweepable(balance, delegated).min(vault_cap.saturating_sub(vault_before));
     if capped {
         amount = amount.min(landlord.allowance);

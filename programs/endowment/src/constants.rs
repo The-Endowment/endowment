@@ -147,10 +147,17 @@ pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 pub const ACTIVE_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
 
 /// Reward allowance (`post_reward_total`): a landlord can be swept at most what
-/// its counted coin earned, times `allowance_margin_bps`. The margin is 0 (off:
-/// sweeps take everything above the baseline) or between these bounds.
-pub const MIN_ALLOWANCE_MARGIN_BPS: u16 = 10_000;
-pub const MAX_ALLOWANCE_MARGIN_BPS: u16 = 30_000;
+/// its counted coin earned. `allowance_margin_bps` is 0 (off: sweeps take
+/// everything above the baseline) or exactly this: 1.0x, never more.
+pub const ALLOWANCE_MARGIN_BPS: u16 = 10_000;
+
+/// Allowance a landlord hasn't used carries over for about three days: a
+/// landlord's allowance never exceeds what its counted coin earned since the
+/// oldest of this many marks, and the endowment takes a mark of its reward
+/// index at a reward post once the last mark is this old (a little under a
+/// day, so daily posts each take one whatever their jitter).
+pub const ALLOWANCE_CARRY_MARKS: usize = 3;
+pub const ALLOWANCE_MARK_SPACING_SECS: i64 = 20 * 60 * 60;
 
 /// `Config::reward_index` is dividend earned per coin base unit, scaled by this.
 pub const REWARD_INDEX_SCALE: u128 = 1_000_000_000_000;

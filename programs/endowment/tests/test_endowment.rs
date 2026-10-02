@@ -20,7 +20,7 @@ use {
     },
     endowment::{
         constants::{
-            ACTIVE_MAX_AGE_SECS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
+            ACTIVE_MAX_AGE_SECS, ALLOWANCE_MARGIN_BPS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
             LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
             PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
             REQUIRED_ATTESTATIONS, REWARD_INDEX_SCALE,
@@ -1383,6 +1383,7 @@ fn creation_rejects_out_of_bounds_parameters() {
     assert_err!(env.create_with(with(&|p| p.params.deactivate_bps = 3_001)), InvalidActivation);
     assert_err!(env.create_with(with(&|p| p.params.min_stake_bps = 501)), InvalidParams);
     assert_err!(env.create_with(with(&|p| p.params.allowance_margin_bps = 9_999)), InvalidAllowance);
+    assert_err!(env.create_with(with(&|p| p.params.allowance_margin_bps = 15_000)), InvalidAllowance);
     assert!(env.create_with(params(guardian)));
 }
 
