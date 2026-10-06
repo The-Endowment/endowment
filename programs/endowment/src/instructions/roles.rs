@@ -168,8 +168,9 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
 /// (cancel it first), so nothing half-decided is left behind, and (unless
 /// retired) a refresher, without which nobody could ever count again.
 ///
-/// One live role remains: the refresher, whose reads decide who counts (see
-/// `count`). After renounce it can't be replaced, only resign
+/// Three live roles remain: the collector and reviewer (see `collection`),
+/// which can no longer be replaced, and the refresher, whose reads decide who
+/// counts (see `count`). After renounce the refresher can't be replaced, only resign
 /// (`resign_refresher`), which switches sweeps off at once and voids its
 /// reads: a leaked or distrusted refresher key can always be retired by
 /// whoever holds it, and never handed to anyone else.

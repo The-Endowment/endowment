@@ -87,7 +87,7 @@ Regressions are in `tests/regressions/review_fixes.rs`.
 
 ## Known limits
 
-- The report's balance must match exactly, so a transfer into the landlord's account between signing and landing voids that report. The collector signs again; the exact match is what protects a landlord who spends and re-buys in between.
+- The report's balance must match exactly, so a transfer into the landlord's account between signing and landing voids that report. The collector signs again. The exact match catches a landlord whose balance changed in between, but not one who spends and re-buys the same amount; the reviewer's history replay is what covers that.
 - Whoever settles a receipt pays the rent to re-create the landlord's token account if the landlord closed it.
 - A release does not re-run the sweep's market checks. What it moves was collected while they passed, and is bounded by the vault cap.
 - PUMP's transfer-hook authority could delay every transfer of PUMP, refunds included, by setting a hook. Sweeps stop while one is set.
