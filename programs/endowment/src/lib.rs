@@ -16,7 +16,7 @@ pub use constants::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u");
+declare_id!("HhJJRPcwABobT6jCEusieGuZxv6XvSKKvU32XyXASVF6");
 
 /// The $PENIS Endowment.
 ///

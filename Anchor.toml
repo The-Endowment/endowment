@@ -7,7 +7,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-endowment = "5VBiPX39xFTgwRaUbC3F3HCuVcM3VkTuYDkxwrhYby2u"
+endowment = "HhJJRPcwABobT6jCEusieGuZxv6XvSKKvU32XyXASVF6"
 
 [provider]
 cluster = "localnet"

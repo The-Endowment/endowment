@@ -783,8 +783,8 @@ mod tests {
 
     #[cfg(not(feature = "test-flagship"))]
     #[test]
-    fn nobody_can_create_while_the_creator_is_a_placeholder() {
-        assert!(!flagship_is_set());
+    fn the_flagship_creator_is_set() {
+        assert!(flagship_is_set());
     }
 
     #[test]

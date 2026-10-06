@@ -195,10 +195,10 @@ pub const FLAGSHIP_COIN_MINT: Pubkey = pubkey!("JE3HT7SbCgXDQWV6xp3oiiAisDzq4HyZ
 /// `create_endowment`. This program runs the $PENIS endowment only; other
 /// projects are welcome to deploy their own copy of the open-source code.
 ///
-/// SET BEFORE DEPLOY: replace with the creator's address. While this is the
-/// all-zero placeholder, nobody can create an endowment.
+/// A key used once, to create the endowment. Creation names the founders'
+/// multisig as admin and guardian, so this key keeps no power afterwards.
 #[cfg(not(feature = "test-flagship"))]
-pub const FLAGSHIP_CREATOR: Pubkey = Pubkey::new_from_array([0; 32]);
+pub const FLAGSHIP_CREATOR: Pubkey = pubkey!("b5b42jEAoEj3WJnf2R29aPuKkkeUWmRLFsg1b8R3Fta");
 
 /// A fixed test creator, only in builds made for the integration tests
 /// (`--features test-flagship`). Never deploy such a build.
