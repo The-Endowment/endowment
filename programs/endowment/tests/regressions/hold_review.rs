@@ -42,9 +42,11 @@ fn post_total(env: &mut Env, total: u64) {
 #[test]
 fn three_day_allowance_must_expire_when_reward_posts_stop() {
     let (mut env, owners) = counted_env();
+    env.synthetic_allowance = false;
     env.change_params(|p| {
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
         p.max_rewards_per_day = 1_000_000 * UNIT;
+        p.max_buy_per_day = 100_000 * UNIT;
     });
     assert!(env.count());
     env.warp(COUNT_INTERVAL_SECS);

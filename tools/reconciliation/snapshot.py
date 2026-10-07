@@ -103,7 +103,7 @@ def capture(rpc, program, config):
         (x["landlord"], x["data_sha256"]) for x in ending
     ]
     return {
-        "schema": 1, "kind": "observational-wallet-checkpoint", "source_layout": "PR3-0f7cb96-v3",
+        "schema": 2, "kind": "observational-wallet-checkpoint", "source_layout": "Config-v4-Landlord-v3",
         "program": program, "config": config, **settings,
         "started_at": start, "finished_at": now(),
         "config_slot": start_slot, "enrollment_slot": enrollment_slot, "end_slot": end_slot,
@@ -113,7 +113,8 @@ def capture(rpc, program, config):
             "Only enrolled token accounts are read, not every account owned by each wallet.",
             "Endpoint balances do not reveal intraday trades, reward provenance, or spent rewards.",
             "Registration is not proof of current consent or a valid delegation to the endowment.",
-            "Gross collection counters can reset on deregistration/re-enrollment.",
+            "Contribution counters are net of this registration's refunds and reset on re-enrollment.",
+            "Counter deltas cannot separate gross collections from refunds; use receipt/events for that.",
             "This file cannot authorize collection, refund, approval, or release.",
         ],
     }

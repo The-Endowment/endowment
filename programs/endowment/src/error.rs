@@ -46,7 +46,7 @@ pub enum EndowmentError {
     VaultWouldShrink,
     #[msg("The contribution cap must be greater than zero")]
     InvalidContributionCap,
-    #[msg("A pause is active or ended too recently")]
+    #[msg("An incident pause is already active")]
     PauseCooldown,
     #[msg("No parameter change is pending")]
     NoPendingParams,
@@ -106,7 +106,7 @@ pub enum EndowmentError {
     Completed,
     #[msg("The reward total was posted too recently")]
     RewardPostTooSoon,
-    #[msg("The allowance margin must be 0 or within bounds, with a daily rewards ceiling")]
+    #[msg("Allowance must be 1.0x with a positive rewards ceiling at most 10x the daily buy refill")]
     InvalidAllowance,
     #[msg("Only the endowment's creator can create it")]
     NotFlagshipCreator,
@@ -130,4 +130,10 @@ pub enum EndowmentError {
     RefundNotAllowed,
     #[msg("This dividend mint cannot support exact refundable custody")]
     UnsupportedRefundMint,
+    #[msg("Public participation rules cannot return to founders mode")]
+    PublicLaunchLocked,
+    #[msg("Retire contributions before renouncing operator and recovery administration")]
+    RetirementRequired,
+    #[msg("A guardian must remain configured while contributions are possible")]
+    GuardianRequired,
 }

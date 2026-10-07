@@ -46,9 +46,11 @@ impl Env {
 /// counts done, so they count and sweeps are on.
 fn allowance_env(max_rewards_per_day: u64) -> (Env, Vec<Keypair>) {
     let (mut env, owners) = counted_env();
+    env.synthetic_allowance = false;
     env.change_params(|p| {
         p.allowance_margin_bps = MARGIN_BPS;
         p.max_rewards_per_day = max_rewards_per_day;
+        p.max_buy_per_day = p.max_buy_per_day.max(max_rewards_per_day.div_ceil(10));
     });
     assert!(env.count());
     env.warp(COUNT_INTERVAL_SECS);
@@ -260,14 +262,10 @@ fn unused_allowance_carries_over_for_three_days_and_no_longer() {
 }
 
 #[test]
-fn with_the_margin_at_zero_sweeps_take_everything_above_the_baseline() {
-    let (mut env, owners) = counted_env();
-    assert!(env.count());
-    env.warp(COUNT_INTERVAL_SECS);
-    assert!(env.count());
-    let owner = owners[0].pubkey();
-    let account = env.inst.dividend_account(&owner);
-    env.airdrop_dividend(&account, 1_000 * UNIT);
-    assert!(env.sweep(&owner, &account));
-    assert_eq!(token_balance(&env.svm, &account), 0);
+fn reward_allowance_cannot_be_disabled() {
+    let (mut env, _) = allowance_env(1_000_000 * UNIT);
+    let admin = env.admin();
+    let mut next = env.config_state().params;
+    next.allowance_margin_bps = 0;
+    assert_err!(env.propose(&admin, next), InvalidAllowance);
 }

@@ -163,18 +163,15 @@ pub fn handle_sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -
         .ok_or(EndowmentError::Overflow)?;
     let vault_cap = config.vault_cap();
     let (balance, delegated) = (dividend_account.amount, dividend_account.delegated_amount);
-    let (reward_index, carry_floor, capped, authority_bump) =
-        (config.reward_index, config.carry_floor(now), config.params.allowance_margin_bps > 0, config.authority_bump);
+    let authority_bump = config.authority_bump;
     let landlord = &mut ctx.accounts.landlord;
-    // And, with the allowance on, never more than what its coin earned.
-    landlord.settle(reward_index, carry_floor);
-    let mut amount = landlord
+    // An omitted or invalidated balance cannot authorize a collection.
+    config.settle_landlord(landlord, now);
+    let amount = landlord
         .sweepable(balance, delegated)
         .min(vault_cap.saturating_sub(committed))
-        .min(report.amount);
-    if capped {
-        amount = amount.min(landlord.allowance);
-    }
+        .min(report.amount)
+        .min(landlord.allowance);
     if amount == 0 {
         // An accepted report is consumed even if another collection filled the
         // vault first. Durable workers can distinguish this finalized no-op
@@ -251,9 +248,7 @@ pub fn handle_sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -
         .checked_add(amount)
         .ok_or(EndowmentError::Overflow)?;
     landlord.last_sweep_at = now;
-    if capped {
-        landlord.allowance -= amount;
-    }
+    landlord.allowance -= amount;
     let config = &mut ctx.accounts.config;
     config.total_swept = config
         .total_swept

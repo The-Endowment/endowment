@@ -28,7 +28,7 @@ def encoded(data):
 
 def config_account():
     # Independent Borsh fixture of the stable Config header in state.rs.
-    return encoded(discriminator("Config") + bytes([3]) + bytes(128) + bytes([4]) * 32 + bytes([5]) * 32)
+    return encoded(discriminator("Config") + bytes([4]) + bytes(128) + bytes([4]) * 32 + bytes([5]) * 32)
 
 
 def landlord_account(collected=25, version=3):
@@ -90,7 +90,9 @@ class SnapshotTests(unittest.TestCase):
         row = result["wallets"][0]
         self.assertEqual(row["coin"]["amount_raw"], str(2**60 + 1))
         self.assertEqual(row["counted_coin_raw"], "100")
-        self.assertEqual(row["collected_gross_raw"], "25")
+        self.assertEqual(row["contributed_net_raw"], "25")
+        self.assertNotIn("collected_gross_raw", row)
+        self.assertEqual(result["schema"], 2)
         self.assertEqual(result["token_batches"][0]["slot"], 102)
         self.assertEqual(result["enrollment_slot"], 101)
         self.assertTrue(result["enrollment_unchanged_during_scan"])
@@ -152,7 +154,16 @@ class SnapshotTests(unittest.TestCase):
         rpc.closing_account = landlord_account(collected=30)
         result = capture(rpc, PROGRAM, CONFIG)
         self.assertFalse(result["enrollment_unchanged_during_scan"])
-        self.assertEqual(result["wallets"][0]["collected_gross_raw"], "25")
+        self.assertEqual(result["wallets"][0]["contributed_net_raw"], "25")
+
+    def test_refund_can_reduce_net_contributions_without_being_reported_as_gross(self):
+        before = capture(FixtureRpc(), PROGRAM, CONFIG)
+        rpc = FixtureRpc()
+        rpc.opening_account = rpc.closing_account = landlord_account(collected=10)
+        after = capture(rpc, PROGRAM, CONFIG)
+        self.assertEqual(before["wallets"][0]["contributed_net_raw"], "25")
+        self.assertEqual(after["wallets"][0]["contributed_net_raw"], "10")
+        self.assertTrue(any("cannot separate gross" in text for text in after["limitations"]))
 
     def test_partial_response_stops_the_run(self):
         rpc = FixtureRpc()

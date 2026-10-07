@@ -312,27 +312,26 @@ fn a_reviewers_refund_leaves_consent_and_other_receipts_alone() {
 }
 
 #[test]
-fn a_pause_does_not_run_out_the_time_to_review() {
-    let (mut env, owner, _) = held(100);
-    let guardian = env.guardian.insecure_clone();
-    assert!(env.pause(&guardian));
-    env.warp(MAX_PAUSE_SECONDS);
-    // Seven days on, the pause has just ended: the receipt hasn't expired, so
-    // nobody but the holder or the reviewer can send it back,
-    assert_err!(env.settle_hold(&owner.pubkey(), 0, &collector(), false), RefundNotAllowed);
-    env.warp(REFUND_SECONDS - HOLD_SECONDS - 1);
-    // and the reviewer has the usual 48 hours from then.
-    assert!(env.review_hold(&owner.pubkey(), 0, 100));
-    assert!(env.settle_hold(&owner.pubkey(), 0, &collector(), true));
-    assert_eq!(env.hold_state().released, 100);
-}
-
-#[test]
-fn a_paused_receipt_still_expires_once_the_window_after_the_pause_is_over() {
+fn paused_receipts_expire_on_the_original_deadline() {
     let (mut env, owner, account) = held(100);
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
-    env.warp(MAX_PAUSE_SECONDS + REFUND_SECONDS - HOLD_SECONDS);
+    env.warp(REFUND_SECONDS - 1);
+    assert_err!(env.settle_hold(&owner.pubkey(), 0, &collector(), false), RefundNotAllowed);
+    env.warp(1);
+    assert!(env.config_state().is_paused(env.now()));
+    assert_err!(env.review_hold(&owner.pubkey(), 0, 100), CollectionExpired);
+    assert!(env.settle_hold(&owner.pubkey(), 0, &collector(), false));
+    assert_eq!(token_balance(&env.svm, &account), 100);
+}
+
+#[test]
+fn resuming_after_expiry_cannot_revive_a_collection() {
+    let (mut env, owner, account) = held(100);
+    let guardian = env.guardian.insecure_clone();
+    assert!(env.pause(&guardian));
+    env.warp(7 * DAY);
+    assert!(env.unpause(&env.admin()));
     assert_err!(env.review_hold(&owner.pubkey(), 0, 100), CollectionExpired);
     assert!(env.settle_hold(&owner.pubkey(), 0, &collector(), false));
     assert_eq!(token_balance(&env.svm, &account), 100);

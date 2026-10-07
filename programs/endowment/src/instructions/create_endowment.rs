@@ -149,6 +149,9 @@ pub fn handle_create_endowment(ctx: Context<CreateEndowment>, create: CreatePara
     // An activation threshold of 0 means sweeps run from the start (for a
     // founders-only test window; renouncing requires production thresholds).
     let config = &mut ctx.accounts.config;
+    if params.activate_bps == PUBLIC_ACTIVATE_BPS {
+        config.lock_public_launch();
+    }
     config.apply_committed_bps(0);
 
     emit!(EndowmentCreated {

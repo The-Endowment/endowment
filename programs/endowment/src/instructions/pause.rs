@@ -26,25 +26,23 @@ pub struct Unpause<'info> {
     pub config: Box<Account<'info, Config>>,
 }
 
-/// A circuit breaker, not a switch: a pause lasts MAX_PAUSE_SECONDS and can't be
-/// extended, and a new one can only start PAUSE_COOLDOWN_SECONDS after the last
-/// one ended. So the guardian can stop an endowment at most half the time, and
-/// never for good. Leaving (revoke, deregister) is never paused.
+/// Stops new collection and spending until explicit admin resume. There is no
+/// timeout or cooldown: another incident must always be stoppable immediately.
+/// Holder exits and all permitted refunds remain available.
 pub fn handle_pause(ctx: Context<Pause>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    require!(
-        config.paused_until == 0 || now >= config.paused_until.saturating_add(PAUSE_COOLDOWN_SECONDS),
-        EndowmentError::PauseCooldown
-    );
+    require!(!config.is_paused(now), EndowmentError::PauseCooldown);
     config.pause_started_at = now;
-    config.paused_until = now + MAX_PAUSE_SECONDS;
+    config.paused_until = INCIDENT_PAUSE_UNTIL;
+    config.reward_credit_ok = false;
     emit!(PauseChanged { config: config_key, paused_until: config.paused_until });
     Ok(())
 }
 
-/// Lifting a pause early takes the admin. The cooldown runs from now.
+/// Only the admin can resume after investigating an incident. Old receipt
+/// deadlines are unchanged, so expired collections cannot become spendable.
 pub fn handle_unpause(ctx: Context<Unpause>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();

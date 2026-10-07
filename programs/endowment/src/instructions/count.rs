@@ -221,7 +221,7 @@ pub fn handle_count_landlords<'info>(ctx: Context<'info, CountLandlords<'info>>)
         let counted = if eligible { held } else { 0 };
 
         // Credit the reward allowance at the old counted amount before it changes.
-        landlord.settle(config.reward_index, config.carry_floor(now));
+        config.settle_landlord(&mut landlord, now);
         // The next count credits at most this, and only after fresh reads.
         landlord.snapshot = if delegated { balance } else { 0 };
         landlord.snapshot_valid = delegated;

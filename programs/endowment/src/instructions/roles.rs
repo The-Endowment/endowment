@@ -70,7 +70,7 @@ pub fn handle_propose_params(ctx: Context<AdminOnly>, params: Params) -> Result<
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
-    params.validate()?;
+    config.validate_params_change(&params)?;
     let effective_at = now + PARAM_TIMELOCK_SECONDS;
     config.pending = PendingParams { params, effective_at };
     emit!(ParamsProposed { config: config_key, params, effective_at });
@@ -104,22 +104,31 @@ pub fn handle_apply_params(ctx: Context<ApplyParams>) -> Result<()> {
             || ctx.accounts.caller.key() == config.admin,
         EndowmentError::ApplyGrace
     );
+    config.validate_params_change(&pending.params)?;
+    let public_launch = !config.public_launched() && pending.params.activate_bps == PUBLIC_ACTIVATE_BPS;
     let refresher_changes = pending.params.refresher != config.params.refresher;
     let swept_before = config.sweeps_on(now);
     config.params = pending.params;
     config.pending = PendingParams::default();
-    if refresher_changes {
+    if refresher_changes || public_launch {
         // Reads made under the previous refresher stop counting, and neither an
         // open round nor the last count's result can switch sweeps back on
         // (FC-R3-03, PR #1).
         config.retire_refresher_reads();
+    }
+    if public_launch {
+        config.lock_public_launch();
+        // No inherited founder count or unused founder allowance. Public
+        // collection needs a new count reaching 30% and new reward posts.
+        config.reward_marks = Default::default();
+        config.reward_credit_ok = false;
     }
     // Keep the buy allowance within the (possibly smaller) new per-transaction cap.
     config.buy_allowance = config.buy_allowance.min(config.params.max_buy_per_tx);
     // New thresholds apply to the last count at once, unless the refresher is
     // gone or changed: that count rests on reads that no longer count, so
     // sweeps stay off until a count under the new refresher (FC-R3-03).
-    if config.params.refresher == Pubkey::default() || refresher_changes {
+    if config.params.refresher == Pubkey::default() || refresher_changes || public_launch {
         config.active = false;
     } else {
         let last = config.last_count_bps;
@@ -160,42 +169,16 @@ pub fn handle_retire(ctx: Context<AdminOnly>) -> Result<()> {
     Ok(())
 }
 
-/// One-way: gives up the admin role for good, freezing every parameter as it
-/// stands. It also clears the guardian and any pending change, so no key is left
-/// that can pause or reconfigure the endowment. It requires production
-/// activation thresholds, so sweeps can't be frozen on, the reward allowance
-/// on, so they can't be frozen uncapped, no pending change
-/// (cancel it first), so nothing half-decided is left behind, and (unless
-/// retired) a refresher, without which nobody could ever count again.
-///
-/// Three live roles remain: the collector and reviewer (see `collection`),
-/// which can no longer be replaced, and the refresher, whose reads decide who
-/// counts (see `count`). After renounce the refresher can't be replaced, only resign
-/// (`resign_refresher`), which switches sweeps off at once and voids its
-/// reads: a leaked or distrusted refresher key can always be retired by
-/// whoever holds it, and never handed to anyone else.
+/// Retirement must precede renunciation: while contributions remain possible,
+/// the admin must retain the ability to replace failed operators and the
+/// guardian. Also forbidden during a pause, whose only resume authority would
+/// otherwise be destroyed. This is separate from removing upgrade authority.
 pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     require!(config.pending.effective_at == 0 && config.retire_at == 0, EndowmentError::PendingChange);
-    require!(
-        config.retired || config.params.refresher != Pubkey::default(),
-        EndowmentError::NoRefresher
-    );
-    require!(
-        config.retired
-            || (config.params.activate_bps >= MIN_RENOUNCE_ACTIVATE_BPS
-                && config.params.deactivate_bps >= MIN_RENOUNCE_DEACTIVATE_BPS),
-        EndowmentError::RenounceThresholds
-    );
-    // And the reward allowance on, so sweeps can never be frozen uncapped.
-    require!(
-        config.retired
-            || (config.params.allowance_margin_bps == ALLOWANCE_MARGIN_BPS
-                && config.params.max_rewards_per_day
-                    <= config.params.max_buy_per_day.saturating_mul(MAX_RENOUNCE_REWARDS_TO_BUYS)),
-        EndowmentError::InvalidAllowance
-    );
+    require!(config.retired, EndowmentError::RetirementRequired);
+    require!(!config.is_paused(Clock::get()?.unix_timestamp), EndowmentError::Paused);
     config.admin = Pubkey::default();
     config.pending_admin = Pubkey::default();
     config.guardian = Pubkey::default();
@@ -205,10 +188,12 @@ pub fn handle_renounce_admin(ctx: Context<AdminOnly>) -> Result<()> {
     Ok(())
 }
 
-/// Immediate: the guardian can only pause (within its limits), so rotating it
-/// is low risk. `Pubkey::default()` removes it.
+/// Immediate guardian rotation preserves an emergency stop. Removal is only
+/// allowed after retirement; it never resumes an existing pause.
 pub fn handle_set_guardian(ctx: Context<AdminOnly>, new_guardian: Pubkey) -> Result<()> {
     let config_key = ctx.accounts.config.key();
+    require!(ctx.accounts.config.retired || new_guardian != Pubkey::default(),
+        EndowmentError::GuardianRequired);
     ctx.accounts.config.guardian = new_guardian;
     emit!(GuardianChanged { config: config_key, guardian: new_guardian });
     Ok(())

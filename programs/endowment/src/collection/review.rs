@@ -16,7 +16,7 @@ pub struct ReviewCollection<'info> {
 }
 pub fn review(ctx: Context<ReviewCollection>, approved_amount: u64, evidence_hash: [u8; 32]) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
-    let deadline = ctx.accounts.receipt.deadline(ctx.accounts.config.pause_started_at, ctx.accounts.config.paused_until);
+    let deadline = ctx.accounts.receipt.refund_at;
     let receipt = &mut ctx.accounts.receipt;
     // Nobody reviews what it collected itself, whatever role changes happened
     // since (the receipt's rent payer is the collector that signed it).
