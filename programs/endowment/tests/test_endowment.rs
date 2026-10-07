@@ -7,7 +7,7 @@ use {
             program_pack::Pack,
             system_program,
         },
-        AccountDeserialize, InstructionData, ToAccountMetas,
+        AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas,
     },
     anchor_spl::{
         associated_token::{
@@ -22,8 +22,8 @@ use {
         collection::*,
         constants::{
             ACTIVE_MAX_AGE_SECS, ALLOWANCE_MARGIN_BPS, AUTHORITY_SEED, CONFIG_SEED, COUNT_INTERVAL_SECS, COUNT_TIMEOUT_SECS,
-            LANDLORD_SEED, MAX_PAUSE_SECONDS, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
-            PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS, PAUSE_COOLDOWN_SECONDS,
+            LANDLORD_SEED, MIN_ATTEST_SPACING_SECS, MIN_REWARD_POST_SPACING_SECS,
+            PARAM_APPLY_GRACE_SECONDS, PARAM_EXPIRY_SECONDS, PARAM_TIMELOCK_SECONDS,
             REQUIRED_ATTESTATIONS, REWARD_INDEX_SCALE,
         },
         error::EndowmentError,
@@ -330,10 +330,8 @@ fn base_params() -> Params {
         deactivate_bps: 2_500,
         min_stake_bps: 10,
         refresher: refresher().pubkey(),
-        // Off here, so the sweep tests below cover the uncapped sweep; the
-        // allowance has its own tests (regressions/allowance.rs).
-        allowance_margin_bps: 0,
-        max_rewards_per_day: 0,
+        allowance_margin_bps: ALLOWANCE_MARGIN_BPS,
+        max_rewards_per_day: MAX_BUY_PER_DAY,
     }
 }
 
@@ -413,6 +411,9 @@ struct Env {
     inst: Inst,
     /// Every (config, owner) registered through `register`, for counts to find.
     known: Vec<(Pubkey, Pubkey)>,
+    /// Baseline/custody tests provide eligible allowance directly. Allowance
+    /// regressions disable this and exercise real counts and reward posts.
+    synthetic_allowance: bool,
 }
 
 impl Env {
@@ -471,6 +472,7 @@ impl Env {
             mint_authority,
             inst: Inst { creator, coin_mint, dividend_mint, coin_program, dividend_program, pool },
             known: vec![],
+            synthetic_allowance: true,
         }
     }
 
@@ -510,6 +512,7 @@ impl Env {
                 pool: fixtures::key(fixtures::POOL),
             },
             known: vec![],
+            synthetic_allowance: true,
         };
         // The fixture's recorded prices end a day before this clock and average
         // 4.5% away from its final price, so buys would (rightly) be refused.
@@ -1206,6 +1209,9 @@ impl Env {
     }
 
     fn sweep_with(&mut self, accounts: endowment::accounts::Sweep) -> bool {
+        if self.synthetic_allowance {
+            self.seed_eligible_allowance(&accounts.config, &accounts.landlord);
+        }
         let consent = self.read_consent(&accounts.consent);
         let report = CollectionReport {
             consent_epoch: consent.epoch,
@@ -1216,6 +1222,37 @@ impl Env {
             &endowment::instruction::Sweep { nonce: consent.next_nonce, report }.data(), accounts.to_account_metas(None));
         let signer = collector();
         send(&mut self.svm, &[ix], &signer, &[&signer])
+    }
+
+    /// Fixture only: separates baseline/custody assertions from reward accrual.
+    /// Never compiled into either deployed program. The dedicated allowance
+    /// suite and launch transition tests explicitly disable this helper.
+    fn seed_eligible_allowance(&mut self, config_key: &Pubkey, landlord_key: &Pubkey) {
+        let Some(mut landlord_account) = self.svm.get_account(landlord_key) else { return; };
+        let Ok(mut landlord) = Landlord::try_deserialize(&mut landlord_account.data.as_slice()) else { return; };
+        if landlord.config != *config_key { return; }
+        let mut config_account = self.svm.get_account(config_key).unwrap();
+        let mut config = Config::try_deserialize(&mut config_account.data.as_slice()).unwrap();
+        config.reward_index = REWARD_INDEX_SCALE;
+        config.reward_marks[0] = endowment::state::RewardMark { at: self.now(), index: 0 };
+        // These custody-only fixtures bypass real counts. Seed a qualifying
+        // count only if none ever ran; never make an existing stale count
+        // fresh or change its activation/epoch state.
+        if config.count.round == 0 {
+            config.count.round = 1;
+            config.last_count_at = self.now();
+        }
+        config.try_serialize(&mut &mut config_account.data[..]).unwrap();
+        self.svm.set_account(*config_key, config_account).unwrap();
+        landlord.counted_amount = u64::MAX;
+        landlord.counted_round = config.count.round;
+        landlord.attestation_epoch = config.refresher_epoch;
+        landlord.snapshot = u64::MAX;
+        landlord.snapshot_valid = true;
+        landlord.index_at = REWARD_INDEX_SCALE;
+        landlord.allowance = u64::MAX;
+        landlord.try_serialize(&mut &mut landlord_account.data[..]).unwrap();
+        self.svm.set_account(*landlord_key, landlord_account).unwrap();
     }
 
     fn sweep(&mut self, owner: &Pubkey, account: &Pubkey) -> bool {
@@ -1313,7 +1350,7 @@ fn the_creator_creates_the_endowment_and_is_admin_by_default() {
     let mut env = Env::new();
     env.create();
     let config = env.config_state();
-    assert_eq!(config.version, 3);
+    assert_eq!(config.version, 4);
     assert_eq!(config.creator, env.inst.creator.pubkey());
     assert_eq!(config.admin, env.inst.creator.pubkey());
     assert_eq!(config.guardian, env.guardian.pubkey());
@@ -1551,7 +1588,7 @@ fn deregistering_closes_the_record_and_a_landlord_can_register_again_cleanly() {
 }
 
 #[test]
-fn guardian_pause_blocks_sweeps_and_expires() {
+fn guardian_pause_blocks_sweeps_until_explicit_resume() {
     let mut env = Env::new();
     env.create_active();
     let (owner, account) = env.registered_landlord(0);
@@ -1564,7 +1601,9 @@ fn guardian_pause_blocks_sweeps_and_expires() {
     assert!(env.pause(&guardian));
     assert_err!(env.sweep(&owner.pubkey(), &account), Paused);
 
-    env.warp(MAX_PAUSE_SECONDS);
+    env.warp(7 * DAY);
+    assert_err!(env.sweep(&owner.pubkey(), &account), Paused);
+    assert!(env.unpause(&env.admin()));
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &env.pending_vault()), 50);
 }
@@ -1585,9 +1624,7 @@ fn guardian_pauses_but_only_admin_unpauses_early() {
     assert!(env.unpause(&admin));
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &env.pending_vault()), 5);
-    // The cooldown runs from the early unpause.
-    assert_err!(env.pause(&guardian), PauseCooldown);
-    env.warp(PAUSE_COOLDOWN_SECONDS);
+    // A new incident can always be stopped immediately.
     assert!(env.pause(&guardian));
 }
 
@@ -1664,6 +1701,7 @@ fn parameter_changes_wait_out_the_timelock() {
     let mut next = base_params();
     next.max_buy_per_tx = UNIT;
     next.max_buy_per_day = 10 * UNIT;
+    next.max_rewards_per_day = 100 * UNIT;
     next.max_price_impact_bps = 50;
     next.buy_bps = 6_000;
     next.min_buy_interval_secs = 900;
@@ -1722,6 +1760,7 @@ fn regression_r2roles04_a_matured_proposal_is_the_admins_to_apply_for_a_day_and_
     assert!(env.propose(&admin, next));
     assert_err!(env.renounce(&admin), PendingChange);
     assert!(env.cancel_params(&admin));
+    if !env.config_state().retired { env.retire_now(&admin); }
     assert!(env.renounce(&admin));
 }
 
@@ -1779,21 +1818,18 @@ fn proposals_are_bounded() {
 }
 
 #[test]
-fn new_activation_thresholds_apply_to_the_last_count_at_once() {
+fn public_activation_thresholds_cannot_be_lowered() {
     let mut env = Env::new();
     env.create();
-    assert!(!env.config_state().active);
-    // Zero turns sweeps on at once, for a founders-only test window.
-    env.change_params(|p| {
-        p.activate_bps = 0;
-        p.deactivate_bps = 0;
-    });
-    assert!(env.config_state().active);
-    env.change_params(|p| {
-        p.activate_bps = 4_000;
-        p.deactivate_bps = 3_500;
-    });
-    assert!(!env.config_state().active);
+    assert!(env.config_state().public_launched());
+    let admin = env.admin();
+    let mut next = env.config_state().params;
+    next.activate_bps = 0;
+    next.deactivate_bps = 0;
+    assert_err!(env.propose(&admin, next), PublicLaunchLocked);
+    next.activate_bps = 4_000;
+    next.deactivate_bps = 3_500;
+    assert_err!(env.propose(&admin, next), InvalidActivation);
 }
 
 #[test]
@@ -1809,6 +1845,7 @@ fn renounced_admin_freezes_every_parameter_and_removes_the_guardian() {
     assert!(env.propose(&admin, base_params()));
     assert_err!(env.renounce(&admin), PendingChange);
     assert!(env.cancel_params(&admin));
+    if !env.config_state().retired { env.retire_now(&admin); }
     assert!(env.renounce(&admin));
 
     let config = env.config_state();
@@ -2164,7 +2201,7 @@ fn the_admin_can_renounce_once_retired_even_with_test_thresholds() {
     let mut env = Env::new();
     env.create_active();
     let admin = env.admin();
-    assert_err!(env.renounce(&admin), RenounceThresholds);
+    assert_err!(env.renounce(&admin), RetirementRequired);
     env.retire_now(&admin);
     assert!(env.renounce(&admin));
 }
@@ -2362,7 +2399,8 @@ fn count_runs_at_most_once_a_day_and_not_while_paused() {
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
     assert_err!(env.crank(&[begin]), Paused);
-    env.warp(MAX_PAUSE_SECONDS);
+    env.warp(7 * DAY);
+    assert!(env.unpause(&env.admin()));
     assert!(env.count());
 }
 
@@ -2760,26 +2798,18 @@ fn regression_m01_a_revoked_landlord_counts_nothing() {
 }
 
 #[test]
-fn regression_h02_the_guardian_cant_pause_indefinitely() {
+fn regression_h02_an_incident_stays_paused_until_admin_resume() {
     let mut env = Env::new();
-    env.create_custom(|p| {
-        p.params.activate_bps = 0;
-        p.params.deactivate_bps = 0;
-    });
+    env.create_active();
     let guardian = env.guardian.insecure_clone();
     let (owner, account) = env.registered_landlord(0);
-
     assert!(env.pause(&guardian));
-    // Re-pausing before expiry is refused: no extensions.
-    env.warp(MAX_PAUSE_SECONDS - 1);
+    env.warp(365 * DAY);
     assert_err!(env.pause(&guardian), PauseCooldown);
-    // The pause ends on its own, and the cooldown must pass before another.
-    env.warp(1);
     env.airdrop_dividend(&account, 10);
+    assert_err!(env.sweep(&owner.pubkey(), &account), Paused);
+    assert!(env.unpause(&env.admin()));
     assert!(env.sweep(&owner.pubkey(), &account));
-    env.warp(PAUSE_COOLDOWN_SECONDS - 1);
-    assert_err!(env.pause(&guardian), PauseCooldown);
-    env.warp(1);
     assert!(env.pause(&guardian));
 }
 
@@ -2789,30 +2819,26 @@ fn regression_h02_renouncing_removes_the_guardian() {
     env.create();
     let admin = env.admin();
     let guardian = env.guardian.insecure_clone();
-    // Sweeps can't be frozen uncapped: renouncing needs the reward allowance on.
-    assert_err!(env.renounce(&admin), InvalidAllowance);
-    env.allowance_on();
+    // Recovery administration cannot disappear during live collection.
+    assert_err!(env.renounce(&admin), RetirementRequired);
+    if !env.config_state().retired { env.retire_now(&admin); }
     assert!(env.renounce(&admin));
     assert_eq!(env.config_state().guardian, Pubkey::default());
     assert_err!(env.pause(&guardian), NotGuardian);
 }
 
 #[test]
-fn regression_l03_sweeps_cant_be_frozen_on_by_renouncing_with_zero_thresholds() {
+fn regression_l03_renunciation_cannot_remove_live_operator_recovery() {
     let mut env = Env::new();
     env.create_active();
     let admin = env.admin();
-    assert_err!(env.renounce(&admin), RenounceThresholds);
+    assert_err!(env.renounce(&admin), RetirementRequired);
     env.change_params(|p| {
-        p.activate_bps = 1_000;
-        p.deactivate_bps = 499;
+        p.activate_bps = 3_000;
+        p.deactivate_bps = 2_500;
     });
-    assert_err!(env.renounce(&admin), RenounceThresholds);
-    env.change_params(|p| {
-        p.deactivate_bps = 500;
-        p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-        p.max_rewards_per_day = MAX_BUY_PER_DAY;
-    });
+    assert_err!(env.renounce(&admin), RetirementRequired);
+    env.retire_now(&admin);
     assert!(env.renounce(&admin));
 }
 
@@ -3272,7 +3298,8 @@ fn regression_r2cnt08_a_pause_doesnt_run_out_an_open_rounds_clock() {
     assert!(env.count_batch(&[owners[0].pubkey()]));
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
-    env.warp(MAX_PAUSE_SECONDS);
+    env.warp(7 * DAY);
+    assert!(env.unpause(&env.admin()));
     // The pause is over, but the round's timeout starts again from its end.
     assert_err!(env.finish(), CountIncomplete);
     assert!(env.count_batch(&[owners[1].pubkey(), owners[2].pubkey()]));
@@ -3349,10 +3376,12 @@ fn regression_r2t02_sweeps_fail_closed_on_a_dividend_fee_above_the_cap() {
 #[test]
 fn regression_r2roles01_sweeps_fail_closed_when_buybacks_cant_run() {
     // The pool's swaps disabled.
-    let mut env = funded_pool_env(0);
+    let mut env = pool_env_with(0, |create| {
+        create.params.activate_bps = 0;
+        create.params.deactivate_bps = 0;
+        create.params.min_stake_bps = 0;
+    });
     env.change_params(|p| {
-        p.activate_bps = 0;
-        p.deactivate_bps = 0;
         p.min_stake_bps = 0;
     });
     let (owner, account) = env.registered_landlord(0);
@@ -3536,7 +3565,7 @@ fn resign_refresher(env: &mut Env, signer: &Keypair) -> bool {
 }
 
 #[test]
-fn regression_r3rf01_the_refresher_can_resign_after_renounce_and_then_sweeps_stop() {
+fn regression_r3rf01_the_refresher_can_resign_and_then_sweeps_stop() {
     let (mut env, owners) = counted_env();
     env.allowance_on();
     assert!(env.count());
@@ -3544,11 +3573,11 @@ fn regression_r3rf01_the_refresher_can_resign_after_renounce_and_then_sweeps_sto
     assert!(env.count());
     assert!(env.config_state().active);
     let admin = env.admin();
-    assert!(env.renounce(&admin));
+    assert_err!(env.renounce(&admin), RetirementRequired);
     // Nobody else can resign it.
     let stranger = env.funded();
     assert_err!(resign_refresher(&mut env, &stranger), NotRefresher);
-    // A refresher whose key may have leaked shuts itself off, with no admin left.
+    // A refresher whose key may have leaked shuts itself off, while the admin can replace it.
     assert!(resign_refresher(&mut env, &refresher()));
     assert_eq!(env.config_state().params.refresher, Pubkey::default());
     assert_err!(resign_refresher(&mut env, &refresher()), NotRefresher);
@@ -3653,12 +3682,13 @@ fn regression_r3rf06_renounce_needs_a_refresher() {
     let (mut env, _) = counted_env();
     env.change_params(|p| p.refresher = Pubkey::default());
     let admin = env.admin();
-    assert_err!(env.renounce(&admin), NoRefresher);
+    assert_err!(env.renounce(&admin), RetirementRequired);
     env.change_params(|p| {
         p.refresher = refresher().pubkey();
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
         p.max_rewards_per_day = MAX_BUY_PER_DAY;
     });
+    if !env.config_state().retired { env.retire_now(&admin); }
     assert!(env.renounce(&admin));
 }
 
@@ -3756,10 +3786,12 @@ fn regression_r3tw04_a_transfer_then_a_swap_colours_at_most_a_quarter_of_the_twa
 
 #[test]
 fn regression_r3mint01_a_sweep_never_fills_the_vault_beyond_three_days_of_buys() {
-    let mut env = funded_pool_env(0);
+    let mut env = pool_env_with(0, |create| {
+        create.params.activate_bps = 0;
+        create.params.deactivate_bps = 0;
+        create.params.min_stake_bps = 0;
+    });
     env.change_params(|p| {
-        p.activate_bps = 0;
-        p.deactivate_bps = 0;
         p.min_stake_bps = 0;
     });
     let (owner, account) = env.registered_landlord(0);
@@ -3889,10 +3921,12 @@ fn regression_fcr303_resigning_switches_sweeps_off_and_voids_its_reads() {
 
 #[test]
 fn regression_fcr304_the_vault_cap_counts_what_the_buy_interval_lets_it_spend() {
-    let mut env = funded_pool_env(0);
+    let mut env = pool_env_with(0, |create| {
+        create.params.activate_bps = 0;
+        create.params.deactivate_bps = 0;
+        create.params.min_stake_bps = 0;
+    });
     env.change_params(|p| {
-        p.activate_bps = 0;
-        p.deactivate_bps = 0;
         p.min_stake_bps = 0;
         p.min_buy_interval_secs = DAY;
     });
@@ -3962,3 +3996,9 @@ mod hold_review;
 
 #[path = "regressions/review_fixes.rs"]
 mod review_fixes;
+
+#[path = "regressions/launch_safety.rs"]
+mod launch_safety;
+
+#[path = "regressions/stale_allowance.rs"]
+mod stale_allowance;

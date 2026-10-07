@@ -16,14 +16,12 @@ pub const AUTHORITY_SEED: &[u8] = b"authority";
 pub const LANDLORD_SEED: &[u8] = b"landlord";
 
 /// Account layout versions, for future migrations.
-pub const CONFIG_VERSION: u8 = 3;
+pub const CONFIG_VERSION: u8 = 4;
 pub const LANDLORD_VERSION: u8 = 3;
 
-/// A guardian pause lifts on its own after this long, and a new pause can only
-/// start this long after the last one ended. The guardian can therefore stop an
-/// endowment at most half the time, and never for good.
-pub const MAX_PAUSE_SECONDS: i64 = 7 * 24 * 60 * 60;
-pub const PAUSE_COOLDOWN_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// An incident pause has no automatic expiry. Only the admin can resume.
+/// Reuses the existing timestamp field without changing the account layout.
+pub const INCIDENT_PAUSE_UNTIL: i64 = i64::MAX;
 
 /// Parameter changes (and retiring) wait this long between proposal and effect.
 pub const PARAM_TIMELOCK_SECONDS: i64 = 72 * 60 * 60;
@@ -93,19 +91,10 @@ pub const TWAP_ROUNDING_BPS: u64 = 10;
 /// needs four coloured stretches to own the average (R3-TW-04).
 pub const MAX_STRETCH_SHARE_BPS: u64 = 2_500;
 
-/// Landlord sweeps switch on at `activate_bps` of the coin's supply committed
-/// and off below `deactivate_bps`. Both are bounded by this.
-pub const MAX_ACTIVATION_BPS: u16 = 5_000;
-
-/// The admin can only renounce once the thresholds are at least this, so sweeps
-/// can never be frozen on.
-pub const MIN_RENOUNCE_ACTIVATE_BPS: u16 = 1_000;
-pub const MIN_RENOUNCE_DEACTIVATE_BPS: u16 = 500;
-
-/// Whenever the activation threshold is above 0, the deactivation threshold
-/// must be at least this, so a count that finds nothing always switches sweeps
-/// off (R3-RF-04). A threshold of 0/0 is a founders-only test window.
-pub const MIN_DEACTIVATE_BPS: u16 = 1;
+/// Public participation rules. A 0/0 founders phase is allowed only before
+/// the one-way transition to these thresholds.
+pub const PUBLIC_ACTIVATE_BPS: u16 = 3_000;
+pub const PUBLIC_DEACTIVATE_BPS: u16 = 2_500;
 
 /// A landlord must hold at least `min_stake_bps` of the coin's supply to register
 /// and to be counted. Bounded by this.
@@ -147,8 +136,8 @@ pub const MAX_VAULT_DAYS_OF_BUYS: u64 = 3;
 pub const ACTIVE_MAX_AGE_SECS: i64 = 3 * 24 * 60 * 60;
 
 /// Reward allowance (`post_reward_total`): a landlord can be swept at most what
-/// its counted coin earned. `allowance_margin_bps` is 0 (off: sweeps take
-/// everything above the baseline) or exactly this: 1.0x, never more.
+/// its counted coin earned according to the posted totals. It is mandatory
+/// at exactly 1.0x; this bound does not prove a payout reached the wallet.
 pub const ALLOWANCE_MARGIN_BPS: u16 = 10_000;
 
 /// Allowance a landlord hasn't used carries over for about three days: a
@@ -165,10 +154,9 @@ pub const ALLOWANCE_CARRY_SECONDS: i64 = 3 * 24 * 60 * 60;
 /// more than two days of allowance at once.
 pub const MAX_REWARD_CREDIT_SECS: i64 = 2 * 24 * 60 * 60;
 
-/// Renouncing requires the daily rewards ceiling to be at most this many times
-/// the daily buy limit, so the allowance can't be frozen at a ceiling that
-/// caps nothing.
-pub const MAX_RENOUNCE_REWARDS_TO_BUYS: u64 = 10;
+/// Every configuration limits the daily rewards ceiling to this multiple of
+/// the daily buy refill rate. Enforced at creation and every parameter change.
+pub const MAX_REWARDS_TO_BUYS: u64 = 10;
 
 /// The SPL Memo program: a refund is preceded by a memo, so a landlord whose
 /// token account requires memos on incoming transfers can still be refunded.

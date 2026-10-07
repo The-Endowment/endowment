@@ -83,8 +83,8 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
     let enrolled = *a.landlord.owner == crate::ID && !a.landlord.data_is_empty();
     let goal = a.config.record_completion(config_key, a.coin_vault.amount);
     let current_consent = a.consent.enabled && a.consent.epoch == a.receipt.consent_epoch;
-    // A pause doesn't run out the time to review (`PendingCollection::deadline`).
-    let deadline = a.receipt.deadline(a.config.pause_started_at, a.config.paused_until);
+    // Fixed expiry: a pause cannot strand pending funds or revive old credit.
+    let deadline = a.receipt.refund_at;
     let reclaimed = !release && a.caller.key() == a.receipt.owner;
     let released = if release {
         require!(!a.config.is_paused(now), EndowmentError::Paused);

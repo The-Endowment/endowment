@@ -18,9 +18,11 @@ fn post_total(env: &mut Env, total: u64) {
 /// Counted landlords with the allowance on and sweeps running.
 fn allowance_env() -> (Env, Vec<Keypair>) {
     let (mut env, owners) = counted_env();
+    env.synthetic_allowance = false;
     env.change_params(|p| {
         p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
         p.max_rewards_per_day = 1_000_000 * UNIT;
+        p.max_buy_per_day = 100_000 * UNIT;
     });
     assert!(env.count());
     env.warp(COUNT_INTERVAL_SECS);
@@ -177,17 +179,14 @@ fn a_pruned_landlords_receipt_is_refunded_not_released() {
 }
 
 #[test]
-fn renouncing_needs_a_rewards_ceiling_that_caps_something() {
+fn rewards_ceiling_is_bounded_before_renunciation() {
     let mut env = Env::new();
     env.create();
     let admin = env.admin();
-    env.change_params(|p| {
-        p.allowance_margin_bps = ALLOWANCE_MARGIN_BPS;
-        p.max_rewards_per_day = u64::MAX;
-    });
-    assert_err!(env.renounce(&admin), InvalidAllowance);
+    let mut next = env.config_state().params;
+    next.max_rewards_per_day = u64::MAX;
+    assert_err!(env.propose(&admin, next), InvalidAllowance);
     env.change_params(|p| p.max_rewards_per_day = 10 * MAX_BUY_PER_DAY);
-    assert!(env.renounce(&admin));
 }
 
 #[test]

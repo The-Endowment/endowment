@@ -32,7 +32,7 @@ Held dividend has two possible destinations: the endowment's vault, or the landl
 | Report valid for | at most 60 seconds |
 | Hold before review and release | 24 hours |
 | Refund-only after | 72 hours |
-| A pause | blocks release, never a refund; only a pause beginning before the original expiry can extend the review window; expired receipts never reopen |
+| A pause | blocks release until explicit admin resume, never a refund; the original 72-hour expiry never moves, and expired receipts never reopen |
 
 ## Roles
 
@@ -71,7 +71,7 @@ The `hold_review` regressions reproduce and prevent three defects: an expired re
 
 The three retained reward marks are pre-post index snapshots. Expired marks are ignored even if posting stops. This may discard some still-recent allowance between mark boundaries, conservatively under-collecting. It limits the age of posted credit, not the age or provenance of an actual wallet payout: the refresher's cumulative total remains trusted, and neither the bound nor the passage of time proves a wallet received PENIS rewards. The worker must apply its separate attribution checks.
 
-The pause logic relies on the seven-day pause cooldown exceeding the 48-hour review extension; another pause cannot overlap that prior extended window. If those constants change, revisit this invariant.
+Version 4 removes the pause extension entirely. An incident can remain paused indefinitely, but every receipt still becomes permissionlessly refundable at its fixed 72-hour deadline. Resuming cannot revive an expired receipt.
 
 ## Corrections from the independent review
 
@@ -91,4 +91,8 @@ Regressions are in `tests/regressions/review_fixes.rs`.
 - Whoever settles a receipt pays the rent to re-create the landlord's token account if the landlord closed it.
 - A release does not re-run the sweep's market checks. What it moves was collected while they passed, and is bounded by the vault cap.
 - PUMP's transfer-hook authority could delay every transfer of PUMP, refunds included, by setting a hook. Sweeps stop while one is set.
-- Initialize the collection policy before renouncing the admin: afterwards neither it nor the roles can be set.
+- Initialize the collection policy during setup. Version 4 prevents live admin renunciation entirely; renouncing requires completed retirement and no active pause. Upgrade authority is a separate role.
+
+## Version 4 safety rules
+
+See [launch safety](launch-safety.md). A positive 1.0× allowance with a daily rewards ceiling no greater than ten times the daily buy refill is mandatory. Public 30%/25% participation settings cannot be lowered or returned to founders mode. Persistent pauses block release, while refunds keep their fixed deadline. Clients must require configuration version 4; this is a coordinated pre-deployment change, not an existing-account migration.

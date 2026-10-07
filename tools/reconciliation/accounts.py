@@ -1,4 +1,4 @@
-"""Read-only decoders for the PR #3 account layout (0f7cb96), not a signer.
+"""Read-only decoders for Config v4 and Landlord v3, not a signer.
 
 Amounts stay decimal strings in saved JSON. These observations are never
 collection permissions or evidence that a wallet received a particular reward.
@@ -47,8 +47,9 @@ def account_bytes(account, program, name):
     if not isinstance(encoded, list) or len(encoded) != 2 or encoded[1] != "base64":
         raise ValueError(f"Expected base64 {name} account")
     data = base64.b64decode(encoded[0], validate=True)
-    if data[:8] != discriminator(name) or len(data) < 9 or data[8] != 3:
-        raise ValueError(f"Unsupported {name} layout; this reader requires PR #3 version 3")
+    version = {"Config": 4, "Landlord": 3}[name]
+    if data[:8] != discriminator(name) or len(data) < 9 or data[8] != version:
+        raise ValueError(f"Unsupported {name} layout; this reader requires version {version}")
     return data
 
 
@@ -91,9 +92,9 @@ def decode_landlord(address, account, program, config):
         "landlord": public_key(address), "wallet": reader.key(),
         "pump_account": reader.key(), "coin_account": reader.key(),
         "baseline_raw": str(reader.number()),
-        # Upstream calls this total_contributed. It is the cumulative gross
-        # amount DEBITED during this registration, not the wallet's balance.
-        "collected_gross_raw": str(reader.number()),
+        # Refunds belonging to this registration reduce total_contributed.
+        # Gross collection requires receipt/event accounting, not this counter.
+        "contributed_net_raw": str(reader.number()),
         "registered_at": reader.number(signed=True),
         "last_sweep_at": reader.number(signed=True),
     }

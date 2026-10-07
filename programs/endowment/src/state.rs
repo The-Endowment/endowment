@@ -40,8 +40,7 @@ pub struct Params {
     pub refresher: Pubkey,
     /// Reward allowance, in bps: each landlord can be swept at most what its
     /// counted coin earned (from the reward totals the refresher posts).
-    /// ALLOWANCE_MARGIN_BPS (1.0x) = on; 0 = off: sweeps take everything above
-    /// the baseline.
+    /// Always ALLOWANCE_MARGIN_BPS (1.0x); it cannot be disabled.
     pub allowance_margin_bps: u16,
     /// The most the coin's holders can plausibly earn per day, in dividend base
     /// units. Each posted total is clamped to this rate for the time since the
@@ -68,15 +67,16 @@ impl Params {
             EndowmentError::InvalidBuyParams
         );
         require!(
-            self.activate_bps <= MAX_ACTIVATION_BPS
-                && self.deactivate_bps <= self.activate_bps
-                && (self.activate_bps == 0 || self.deactivate_bps >= MIN_DEACTIVATE_BPS),
+            (self.activate_bps == 0 && self.deactivate_bps == 0)
+                || (self.activate_bps == PUBLIC_ACTIVATE_BPS && self.deactivate_bps == PUBLIC_DEACTIVATE_BPS),
             EndowmentError::InvalidActivation
         );
         require!(self.min_stake_bps <= MAX_MIN_STAKE_BPS, EndowmentError::InvalidParams);
         require!(
-            self.allowance_margin_bps == 0
-                || (self.allowance_margin_bps == ALLOWANCE_MARGIN_BPS && self.max_rewards_per_day > 0),
+            self.allowance_margin_bps == ALLOWANCE_MARGIN_BPS
+                && self.max_rewards_per_day > 0
+                && u128::from(self.max_rewards_per_day)
+                    <= u128::from(self.max_buy_per_day) * u128::from(MAX_REWARDS_TO_BUYS),
             EndowmentError::InvalidAllowance
         );
         Ok(())
@@ -129,8 +129,8 @@ pub struct Config {
     pub admin: Pubkey,
     /// Proposed next admin; must sign `accept_admin`. Default = none.
     pub pending_admin: Pubkey,
-    /// Can pause for at most MAX_PAUSE_SECONDS, then must wait out a cooldown.
-    /// Cleared when the admin renounces. Cannot move funds.
+    /// Can stop collection and spending until the admin explicitly resumes.
+    /// Cannot move funds. Must remain configured until retirement.
     pub guardian: Pubkey,
     /// The meme coin this endowment holds forever.
     pub coin_mint: Pubkey,
@@ -148,7 +148,8 @@ pub struct Config {
     /// buybacks of what's left switch to the buy/liquidity split.
     pub contribution_cap: u64,
 
-    /// Unix timestamp; everything but leaving is blocked while `now < paused_until`.
+    /// i64::MAX during an incident; admin resume replaces it with the resume
+    /// timestamp. Holder exits and refunds are never paused.
     pub paused_until: i64,
     /// One-way: no more sweeps or registrations. Set only by the admin, after
     /// the parameter timelock (`retire_at`).
@@ -208,8 +209,8 @@ pub struct Config {
     /// the one before. The oldest still within 72 elapsed hours is the carry-over floor.
     pub reward_marks: [RewardMark; ALLOWANCE_CARRY_MARKS],
 
-    /// Start of the most recent guardian pause; lifting it early changes only
-    /// paused_until. Receipts that had already expired cannot be reopened.
+    /// Start of the most recent guardian pause, for public incident history.
+    /// Receipt refund deadlines are fixed and are never extended by a pause.
     pub pause_started_at: i64,
 
     /// Whether the next reward post may credit its increase: set by a post made
@@ -217,7 +218,8 @@ pub struct Config {
     /// post credits only a stretch that began and ended with them running.
     pub reward_credit_ok: bool,
 
-    /// Room for future fields without a migration.
+    /// Byte 0 is the irreversible public-launch flag; the rest is reserved.
+    /// Access through `public_launched` / `lock_public_launch`.
     pub reserved: [u8; 11],
 }
 
@@ -235,6 +237,24 @@ pub struct CreateParams {
 }
 
 impl Config {
+    /// Reuses a reserved byte: account size and offsets are unchanged in v4.
+    pub fn public_launched(&self) -> bool {
+        self.reserved[0] != 0
+    }
+
+    pub fn lock_public_launch(&mut self) {
+        self.reserved[0] = 1;
+    }
+
+    /// Validation at both proposal and execution prevents stale proposals
+    /// from reopening founders mode after the public rules have been locked.
+    pub fn validate_params_change(&self, params: &Params) -> Result<()> {
+        params.validate()?;
+        require!(!self.public_launched() || params.activate_bps == PUBLIC_ACTIVATE_BPS,
+            EndowmentError::PublicLaunchLocked);
+        Ok(())
+    }
+
     pub fn is_paused(&self, now: i64) -> bool {
         now < self.paused_until
     }
@@ -274,6 +294,33 @@ impl Config {
             .map(|mark| mark.index)
             .min()
             .unwrap_or(self.reward_index)
+    }
+
+    /// Only holdings included in the latest count earn an allowance. During
+    /// an open count, the preceding completed round remains valid until the
+    /// result is final, and wallets already read in this round are valid too.
+    /// Retired refresher reads and wallets omitted at timeout earn nothing.
+    pub fn allowance_count_is_current(&self, landlord: &Landlord) -> bool {
+        if landlord.attestation_epoch != self.refresher_epoch || landlord.counted_round == 0 {
+            return false;
+        }
+        if self.count.open && landlord.counted_round == self.count.round {
+            return true;
+        }
+        let completed_round = self.count.round.saturating_sub(u64::from(self.count.open));
+        self.last_count_at != 0 && landlord.counted_round == completed_round
+    }
+
+    /// Discard stale credit before either sweeping or changing a wallet's
+    /// count. Advancing the index also prevents its next valid count from
+    /// retroactively earning credit for the omitted/invalidated interval.
+    pub fn settle_landlord(&self, landlord: &mut Landlord, now: i64) {
+        if self.allowance_count_is_current(landlord) {
+            landlord.settle(self.reward_index, self.carry_floor(now));
+        } else {
+            landlord.allowance = 0;
+            landlord.index_at = self.reward_index;
+        }
     }
 
     /// Records the goal once the coin vault holds `contribution_cap`, however
@@ -536,7 +583,7 @@ mod tests {
             min_stake_bps: 10,
             refresher: Pubkey::new_unique(),
             allowance_margin_bps: 10_000,
-            max_rewards_per_day: 1_000_000,
+            max_rewards_per_day: 10_000,
         }
     }
 
@@ -598,21 +645,21 @@ mod tests {
         assert!(with(&|p| p.max_twap_deviation_bps = 1_001).validate().is_err());
         // R3-RF-04: with an activation line, a count that finds nothing always switches off.
         assert!(with(&|p| p.deactivate_bps = 0).validate().is_err());
-        assert!(with(&|p| p.deactivate_bps = 1).validate().is_ok());
+        assert!(with(&|p| p.deactivate_bps = 1).validate().is_err());
         assert!(with(&|p| {
             p.activate_bps = 0;
             p.deactivate_bps = 0
         })
         .validate()
         .is_ok());
-        // The allowance: off, or exactly 1x with a daily ceiling.
-        assert!(with(&|p| p.allowance_margin_bps = 0).validate().is_ok());
+        // The allowance is mandatory, exactly 1x, with a bounded daily ceiling.
+        assert!(with(&|p| p.allowance_margin_bps = 0).validate().is_err());
         assert!(with(&|p| {
             p.allowance_margin_bps = 0;
             p.max_rewards_per_day = 0
         })
         .validate()
-        .is_ok());
+        .is_err());
         assert!(with(&|p| p.allowance_margin_bps = 9_999).validate().is_err());
         assert!(with(&|p| p.allowance_margin_bps = 10_000).validate().is_ok());
         assert!(with(&|p| p.allowance_margin_bps = 10_001).validate().is_err());
@@ -797,6 +844,32 @@ mod tests {
         assert!(!config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS));
         config.params.activate_bps = 0;
         assert!(config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS), "not in a 0-threshold test window");
+    }
+
+    #[test]
+    fn an_invalidated_count_cannot_restore_credit_after_new_refresher_reads() {
+        let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
+        config.count.round = 4;
+        config.last_count_at = 100;
+        config.reward_index = REWARD_INDEX_SCALE;
+        config.reward_marks[0] = RewardMark { at: 100, index: 0 };
+        let mut holder = landlord(0);
+        holder.counted_round = 4;
+        holder.counted_amount = 100;
+        holder.snapshot = 100;
+        holder.snapshot_valid = true;
+        config.settle_landlord(&mut holder, 100);
+        assert_eq!(holder.allowance, 100);
+
+        config.retire_refresher_reads();
+        assert!(!config.allowance_count_is_current(&holder));
+        // A fresh attestation alone is not a completed count under the new
+        // refresher, even though it updates the holder's epoch in place.
+        holder.attestation_epoch = config.refresher_epoch;
+        assert!(!config.allowance_count_is_current(&holder));
+        config.reward_index += REWARD_INDEX_SCALE;
+        config.settle_landlord(&mut holder, 101);
+        assert_eq!((holder.allowance, holder.index_at), (0, config.reward_index));
     }
 
     #[test]
