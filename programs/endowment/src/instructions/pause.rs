@@ -34,15 +34,17 @@ pub fn handle_pause(ctx: Context<Pause>) -> Result<()> {
     let config_key = ctx.accounts.config.key();
     let config = &mut ctx.accounts.config;
     require!(!config.is_paused(now), EndowmentError::PauseCooldown);
-    config.pause_started_at = now;
+    // Never revive an earlier incident's receipts if the chain clock moves
+    // backwards. Same-second collection/resume is conservatively refundable.
+    config.pause_started_at = config.pause_started_at.max(now);
     config.paused_until = INCIDENT_PAUSE_UNTIL;
     config.reward_credit_ok = false;
     emit!(PauseChanged { config: config_key, paused_until: config.paused_until });
     Ok(())
 }
 
-/// Only the admin can resume after investigating an incident. Old receipt
-/// deadlines are unchanged, so expired collections cannot become spendable.
+/// Only the admin can resume after investigating an incident. The incident
+/// cutoff is retained: pre-pause receipts never become spendable again.
 pub fn handle_unpause(ctx: Context<Unpause>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let config_key = ctx.accounts.config.key();

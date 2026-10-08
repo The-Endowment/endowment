@@ -24,6 +24,10 @@ pub fn review(ctx: Context<ReviewCollection>, approved_amount: u64, evidence_has
     require!(now >= receipt.release_at, EndowmentError::HoldNotElapsed);
     require!(now < deadline, EndowmentError::CollectionExpired);
     require!(
+        !receipt.invalidated_by_pause(ctx.accounts.config.pause_started_at),
+        EndowmentError::CollectionInvalidated
+    );
+    require!(
         !receipt.reviewed && approved_amount <= receipt.amount && evidence_hash != [0; 32],
         EndowmentError::InvalidCollection
     );

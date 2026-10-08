@@ -209,8 +209,8 @@ pub struct Config {
     /// the one before. The oldest still within 72 elapsed hours is the carry-over floor.
     pub reward_marks: [RewardMark; ALLOWANCE_CARRY_MARKS],
 
-    /// Start of the most recent guardian pause, for public incident history.
-    /// Receipt refund deadlines are fixed and are never extended by a pause.
+    /// Latest guardian-pause cutoff, never decreased or cleared on resume.
+    /// Receipts collected at or before it remain refund-only permanently.
     pub pause_started_at: i64,
 
     /// Whether the next reward post may credit its increase: set by a post made
@@ -259,13 +259,14 @@ impl Config {
         now < self.paused_until
     }
 
-    /// Sweeps run only while active, only until the goal is reached, and
-    /// (outside a 0-threshold test window) only while a count has finished
-    /// recently: a count nobody runs can't keep an endowment switched on.
+    /// Founders and public collection both need a recent completed count.
+    /// Missing or future timestamps cannot establish fresh eligibility.
     pub fn sweeps_on(&self, now: i64) -> bool {
         !self.milestone_reached
             && self.active
-            && (self.params.activate_bps == 0 || now.saturating_sub(self.last_count_at) <= ACTIVE_MAX_AGE_SECS)
+            && self.last_count_at > 0
+            && self.last_count_at <= now
+            && now.saturating_sub(self.last_count_at) <= ACTIVE_MAX_AGE_SECS
     }
 
     /// Whether landlord contributions are running right now: what reward
@@ -764,9 +765,10 @@ mod tests {
         config.contribution_cap = 100;
         config.active = true;
         assert!(!config.record_completion(Pubkey::default(), 99));
-        assert!(config.sweeps_on(0));
+        config.last_count_at = 1;
+        assert!(config.sweeps_on(1));
         assert!(config.record_completion(Pubkey::default(), 100));
-        assert!(!config.sweeps_on(0) && !config.active);
+        assert!(!config.sweeps_on(1) && !config.active);
         // A lower balance later doesn't undo it, and no count switches sweeps back on.
         assert!(config.record_completion(Pubkey::default(), 0));
         config.apply_committed_bps(10_000);
@@ -838,12 +840,15 @@ mod tests {
     fn a_stale_count_switches_sweeps_off() {
         let mut config = Config::try_from_slice(&vec![0u8; Config::INIT_SPACE]).unwrap();
         config.active = true;
-        config.params.activate_bps = 3_000;
-        config.last_count_at = 1_000;
-        assert!(config.sweeps_on(1_000 + ACTIVE_MAX_AGE_SECS));
-        assert!(!config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS));
-        config.params.activate_bps = 0;
-        assert!(config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS), "not in a 0-threshold test window");
+        for threshold in [0, 3_000] {
+            config.params.activate_bps = threshold;
+            config.last_count_at = 0;
+            assert!(!config.sweeps_on(1_000), "a first completed count is required");
+            config.last_count_at = 1_000;
+            assert!(!config.sweeps_on(999), "future counts cannot qualify");
+            assert!(config.sweeps_on(1_000 + ACTIVE_MAX_AGE_SECS));
+            assert!(!config.sweeps_on(1_001 + ACTIVE_MAX_AGE_SECS));
+        }
     }
 
     #[test]

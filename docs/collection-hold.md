@@ -15,7 +15,7 @@ How dividend (PUMP) gets from a landlord's account to the endowment's buyback va
 5. **Or refund.** `refund_collection` sends the whole receipt back to the landlord's own token account. It can be called by:
    - the landlord, at any time before release;
    - the reviewer, at any time;
-   - anyone, once the receipt is 72 hours old, the landlord's consent has changed, the goal is reached, or the endowment is retired.
+   - anyone, once the receipt is 72 hours old, the landlord's consent has changed, the goal is reached, the endowment is retired, or an emergency pause has cancelled the receipt.
 
 Held dividend has two possible destinations: the endowment's vault, or the landlord it came from. No caller chooses another.
 
@@ -32,7 +32,14 @@ Held dividend has two possible destinations: the endowment's vault, or the landl
 | Report valid for | at most 60 seconds |
 | Hold before review and release | 24 hours |
 | Refund-only after | 72 hours |
-| A pause | blocks release until explicit admin resume, never a refund; the original 72-hour expiry never moves, and expired receipts never reopen |
+| A pause | permanently cancels pending receipts collected at or before the pause timestamp; anyone may refund them immediately, even after resume |
+
+The pause cutoff never decreases or clears on resume. An approved receipt is
+cancelled too; neither a later review nor restart can make it spendable. A
+collection in the same second as pause/resume is conservatively refund-only.
+New receipts collected later follow the normal 24-hour hold and 72-hour expiry.
+Refunds need an actual transaction; monitoring and a funded refund worker are
+still required.
 
 ## Roles
 
