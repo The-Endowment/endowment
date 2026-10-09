@@ -317,7 +317,7 @@ fn paused_receipts_expire_on_the_original_deadline() {
     let guardian = env.guardian.insecure_clone();
     assert!(env.pause(&guardian));
     env.warp(REFUND_SECONDS - 1);
-    assert_err!(env.settle_hold(&owner.pubkey(), 0, &collector(), false), RefundNotAllowed);
+    assert_eq!(env.receipt_state(&owner.pubkey(), 0).refund_at, env.now() + 1);
     env.warp(1);
     assert!(env.config_state().is_paused(env.now()));
     assert_err!(env.review_hold(&owner.pubkey(), 0, 100), CollectionExpired);

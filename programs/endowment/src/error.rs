@@ -136,4 +136,6 @@ pub enum EndowmentError {
     RetirementRequired,
     #[msg("A guardian must remain configured while contributions are possible")]
     GuardianRequired,
+    #[msg("An emergency pause cancelled this collection; it must be refunded")]
+    CollectionInvalidated,
 }

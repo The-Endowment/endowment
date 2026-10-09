@@ -14,6 +14,12 @@ approved. No deployment or authority transfer is part of this change.
 - Participation parameters are either founders 0/0 or public 3,000/2,500 bps.
   Public creation locks public mode immediately. Applying the first public
   parameter proposal is irreversible: no later proposal can return to 0/0.
+- Both modes require a nonzero completed-count timestamp no more than 72 hours
+  old and not in the future. Founders mode bypasses only the participation
+  threshold. A missing or stale count stops new collections and reward-index
+  growth even if reward totals keep arriving. Completing a recovery count
+  resets reward credit; the next post establishes a baseline without crediting
+  the outage, even if no reward post observed the stale interval.
 - That transition increments the attestation epoch, closes any open count,
   clears the last count and active flag, and invalidates carried founder
   allowance. A new count must reach 30%; an inherited 28% founder count cannot
@@ -27,9 +33,11 @@ approved. No deployment or authority transfer is part of this change.
 - The guardian's incident pause has no automatic expiry or cooldown. Only the
   admin resumes. A repeat incident can be paused immediately after resume.
 - Every pending collection keeps its original `refund_at`, 72 hours after it
-  was collected. A pause blocks release, but does not postpone permissionless
-  refund eligibility. The holder and reviewer can still refund earlier under
-  existing rules. Resuming never reopens expired receipts.
+  was collected. An emergency pause permanently makes every pending receipt
+  collected at or before `pause_started_at` refund-only, including receipts
+  already approved. Anyone may refund these receipts immediately to the
+  original holder. Review and release cannot restore them during or after
+  resume. Later collections retain the normal 24-hour hold and 72-hour expiry.
 - Admin renunciation requires completed retirement, no pending parameter or
   retirement proposal, and no active pause. Live collections retain the
   ability to rotate the collector, reviewer, refresher and guardian. The
@@ -40,8 +48,11 @@ approved. No deployment or authority transfer is part of this change.
 
 An unresolved incident may stop buybacks indefinitely. That favors stopping
 spending over liveness; admin custody must therefore have tested recovery.
-Pauses lasting through receipt expiry return contributions instead of saving
-those contributions for eventual buybacks. Permissionless refund eligibility
+Every incident cancels pending contributions instead of saving those
+contributions for eventual buybacks. The cutoff uses seconds: a collection
+made in the same second as pause/resume is conservatively refund-only. A later
+pause never decreases the cutoff, even if chain time moves backwards.
+Permissionless refund eligibility
 still needs someone to submit and fund a transaction; alerts and a funded
 refund service remain operational requirements.
 
@@ -80,8 +91,12 @@ During an incident `Config.paused_until` is `i64::MAX` (9223372036854775807),
 which is **not** a JavaScript-safe integer or a renderable calendar date. Clients
 must decode it losslessly as bigint and display "paused until admin resume".
 `unpause` replaces the value with the current chain timestamp. The receipt's
-`refund_at` is the only expiry; clients must remove the old pause-extension
-calculation. `pause_started_at` remains available as incident history.
+`refund_at` is the normal expiry; clients must remove the old pause-extension
+calculation. `pause_started_at` remains a permanent cancellation cutoff. Route
+any pending receipt with `collected_at <= pause_started_at` (when the cutoff is
+nonzero) directly to `refund_collection`; do not attempt review or release.
+The appended `CollectionInvalidated` error identifies a rejected incident
+receipt. Account sizes, fields and instruction arguments do not change.
 
 Regenerate the IDL and Rust-produced `holding-chain.json` fixture, and update
 all website, worker and reconciliation version guards together. Existing v3
@@ -95,6 +110,12 @@ fresh public activation at 30%, rejection of return to founders mode, proposal
 revalidation, loss-of-recovery prevention, and initialization before collection
 policy creation. Existing pause/refund tests now check fixed expiry during an
 indefinite pause and inability to revive an expired receipt after resume.
+`count_outage.rs` checks actual reward posts during a count outage, recovery
+with and without posts during the outage, first-count eligibility, exact
+freshness boundaries, and reclaim while counts are stale. `incident_refunds.rs`
+checks approved and unreviewed receipts across pause/resume, immediate
+permissionless refunds, same-second cancellation, normal post-resume releases,
+repeated incidents and a backwards-moving clock.
 
 Older baseline and custody tests used an allowance-off configuration that is
 now forbidden. Their explicit test-only `synthetic_allowance` fixture supplies

@@ -1604,6 +1604,8 @@ fn guardian_pause_blocks_sweeps_until_explicit_resume() {
     env.warp(7 * DAY);
     assert_err!(env.sweep(&owner.pubkey(), &account), Paused);
     assert!(env.unpause(&env.admin()));
+    assert_err!(env.sweep(&owner.pubkey(), &account), CountStale);
+    assert!(env.count());
     assert!(env.sweep(&owner.pubkey(), &account));
     assert_eq!(token_balance(&env.svm, &env.pending_vault()), 50);
 }
@@ -4002,3 +4004,9 @@ mod launch_safety;
 
 #[path = "regressions/stale_allowance.rs"]
 mod stale_allowance;
+
+#[path = "regressions/count_outage.rs"]
+mod count_outage;
+
+#[path = "regressions/incident_refunds.rs"]
+mod incident_refunds;

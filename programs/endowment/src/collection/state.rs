@@ -75,6 +75,14 @@ pub struct PendingCollection {
     pub bump: u8,
 }
 
+impl PendingCollection {
+    /// A pause cancels all still-pending contributions collected through that
+    /// second, including approved receipts. Resume never restores them.
+    pub fn invalidated_by_pause(&self, pause_started_at: i64) -> bool {
+        pause_started_at > 0 && self.collected_at <= pause_started_at
+    }
+}
+
 /// Exact, short-lived authorization, tied to one consent generation and nonce.
 /// A balance check catches intervening changes, but not a same-balance
 /// spend/rebuy. Independent review must replay the finalized history as well.

@@ -85,6 +85,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
     let current_consent = a.consent.enabled && a.consent.epoch == a.receipt.consent_epoch;
     // Fixed expiry: a pause cannot strand pending funds or revive old credit.
     let deadline = a.receipt.refund_at;
+    let incident_receipt = a.receipt.invalidated_by_pause(a.config.pause_started_at);
     let reclaimed = !release && a.caller.key() == a.receipt.owner;
     let released = if release {
         require!(!a.config.is_paused(now), EndowmentError::Paused);
@@ -92,6 +93,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
         require!(current_consent && enrolled, EndowmentError::CollectionConsentRequired);
         require!(now >= a.receipt.release_at, EndowmentError::HoldNotElapsed);
         require!(now < deadline, EndowmentError::CollectionExpired);
+        require!(!incident_receipt, EndowmentError::CollectionInvalidated);
         require!(a.receipt.reviewed, EndowmentError::CollectionNotReviewed);
         a.receipt.approved_amount
     } else {
@@ -101,6 +103,7 @@ pub fn settle<'info>(ctx: Context<'_, SettleCollection<'info>>, release: bool) -
                 || now >= deadline
                 || !current_consent
                 || !enrolled
+                || incident_receipt
                 || goal
                 || a.config.retired,
             EndowmentError::RefundNotAllowed
