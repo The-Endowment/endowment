@@ -43,16 +43,33 @@ fn report(env: &Env, owner: &Pubkey, amount: u64) -> CollectionReport {
         evidence_hash: [3; 32],
     }
 }
-fn authorize(
-    env: &mut Env,
+fn observation(env: &Env) -> CollectionObservation {
+    let config = env.config_state();
+    let policy = env.hold_state();
+    CollectionObservation {
+        collector: policy.collector,
+        reviewer: policy.reviewer,
+        count_at: config.last_count_at,
+        refresher_epoch: config.refresher_epoch,
+        pause_started_at: config.pause_started_at,
+        observation_day: env.now().div_euclid(86_400),
+    }
+}
+fn authorize_ix(
+    env: &Env,
     owner: &Pubkey,
     nonce: u64,
     r: CollectionReport,
     signer: &Keypair,
-) -> bool {
-    let ix = Instruction::new_with_bytes(
+) -> Instruction {
+    Instruction::new_with_bytes(
         endowment::id(),
-        &endowment::instruction::AuthorizeCollection { nonce, report: r }.data(),
+        &endowment::instruction::AuthorizeCollection {
+            nonce,
+            report: r,
+            observation: observation(env),
+        }
+        .data(),
         endowment::accounts::AuthorizeCollection {
             reviewer: signer.pubkey(),
             owner: *owner,
@@ -66,7 +83,16 @@ fn authorize(
             system_program: system_program::ID,
         }
         .to_account_metas(None),
-    );
+    )
+}
+fn authorize(
+    env: &mut Env,
+    owner: &Pubkey,
+    nonce: u64,
+    r: CollectionReport,
+    signer: &Keypair,
+) -> bool {
+    let ix = authorize_ix(env, owner, nonce, r, signer);
     send(&mut env.svm, &[ix], signer, &[signer])
 }
 fn collect(
@@ -220,6 +246,87 @@ fn permit_is_bound_to_balance_epoch_deadline_and_count() {
             InvalidCollection
         );
         assert_eq!(token_balance(&env.svm, &env.pending_vault()), 0);
+    }
+}
+
+#[test]
+fn delayed_authorization_cannot_adopt_a_new_observation_boundary() {
+    for change in 0..4 {
+        let (mut env, owner, _) = tracked(100);
+        let signer = reviewer();
+        // These exact instruction bytes are prepared before the transition.
+        // Landing later must not make the old review valid for the new state.
+        let r = report(&env, &owner.pubkey(), 20);
+        let ix = authorize_ix(&env, &owner.pubkey(), 0, r, &signer);
+        match change {
+            0 | 1 => {
+                let mut acc = env.svm.get_account(&env.config()).unwrap();
+                let mut c = env.config_state();
+                if change == 0 {
+                    c.last_count_at -= 1;
+                } else {
+                    c.refresher_epoch += 1;
+                }
+                c.try_serialize(&mut &mut acc.data[..]).unwrap();
+                env.svm.set_account(env.config(), acc).unwrap();
+            }
+            2 => {
+                let guardian = env.guardian.insecure_clone();
+                let admin = env.admin();
+                assert!(env.pause(&guardian));
+                assert!(env.unpause(&admin));
+            }
+            _ => {
+                let key = policy_pda(&env.config());
+                let mut acc = env.svm.get_account(&key).unwrap();
+                let mut p = env.hold_state();
+                p.collector = owner.pubkey();
+                p.try_serialize(&mut &mut acc.data[..]).unwrap();
+                env.svm.set_account(key, acc).unwrap();
+            }
+        }
+        // Keep the other on-chain limits usable, isolating the stale review.
+        env.seed_eligible_allowance(&env.config(), &landlord_pda(&env.config(), &owner.pubkey()));
+        assert_err!(
+            send(&mut env.svm, &[ix], &signer, &[&signer]),
+            InvalidCollection
+        );
+        assert!(env
+            .svm
+            .get_account(&permit_pda(&env, &owner.pubkey()))
+            .is_none());
+    }
+}
+
+#[test]
+fn delayed_and_existing_authorizations_cannot_cross_midnight() {
+    for already_authorized in [false, true] {
+        let (mut env, owner, account) = tracked(100);
+        env.warp(86_400 - env.now().rem_euclid(86_400) - 30);
+        let signer = reviewer();
+        let mut r = report(&env, &owner.pubkey(), 20);
+        r.valid_until = env.now() + PERMIT_SECONDS;
+        let ix = authorize_ix(&env, &owner.pubkey(), 0, r, &signer);
+        if already_authorized {
+            assert!(send(&mut env.svm, &[ix.clone()], &signer, &[&signer]));
+        }
+        env.warp(31);
+        // The ten-minute deadline remains valid, but the journal day changed.
+        if already_authorized {
+            let r = report(&env, &owner.pubkey(), 20);
+            let key = permit_pda(&env, &owner.pubkey());
+            assert_err!(
+                collect(&mut env, &owner.pubkey(), 0, r, Some(key)),
+                InvalidCollection
+            );
+        } else {
+            assert_err!(
+                send(&mut env.svm, &[ix], &signer, &[&signer]),
+                InvalidCollection
+            );
+        }
+        assert_eq!(token_balance(&env.svm, &account), 100);
+        assert_eq!(env.consent_state(&owner.pubkey()).next_nonce, 0);
     }
 }
 
@@ -380,6 +487,7 @@ fn export_tracked_abi_fixture() {
     let data = endowment::instruction::AuthorizeCollection {
         nonce: 0,
         report: r,
+        observation: observation(&env),
     }
     .data();
     let r = report(&env, &owner.pubkey(), 20);

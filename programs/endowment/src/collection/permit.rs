@@ -15,6 +15,19 @@ pub const PERMIT_SEED: &[u8] = b"collection_permit";
 // uses a <=60-second report and independently checks history before signing.
 pub const PERMIT_SECONDS: i64 = 600;
 
+/// The observation boundary is signed with the amount. Reading these fields
+/// only when an authorization lands would silently rebind an old review to a
+/// new count, pause or operator after the reviewer had finished checking it.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct CollectionObservation {
+    pub collector: Pubkey,
+    pub reviewer: Pubkey,
+    pub count_at: i64,
+    pub refresher_epoch: u32,
+    pub pause_started_at: i64,
+    pub observation_day: i64,
+}
+
 /// Reused per wallet; the durable consent nonce makes each authorization
 /// single-use, including zero-amount collections. No funds are held here.
 #[account]
@@ -32,6 +45,7 @@ pub struct CollectionPermit {
     pub count_at: i64,
     pub refresher_epoch: u32,
     pub pause_started_at: i64,
+    pub observation_day: i64,
     pub evidence_hash: [u8; 32],
     pub bump: u8,
 }
@@ -69,6 +83,7 @@ pub fn authorize(
     ctx: Context<AuthorizeCollection>,
     nonce: u64,
     report: CollectionReport,
+    observation: CollectionObservation,
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let a = ctx.accounts;
@@ -86,6 +101,15 @@ pub fn authorize(
     require!(a.config.active, EndowmentError::NotActive);
     require!(
         CollectionPolicy::valid_roles(&a.policy.collector, &a.policy.reviewer),
+        EndowmentError::InvalidCollection
+    );
+    require!(
+        observation.collector == a.policy.collector
+            && observation.reviewer == a.policy.reviewer
+            && observation.count_at == a.config.last_count_at
+            && observation.refresher_epoch == a.config.refresher_epoch
+            && observation.pause_started_at == a.config.pause_started_at
+            && observation.observation_day == now.div_euclid(86_400),
         EndowmentError::InvalidCollection
     );
     require!(
@@ -114,16 +138,17 @@ pub fn authorize(
     a.permit.set_inner(CollectionPermit {
         config: a.config.key(),
         owner: a.owner.key(),
-        collector: a.policy.collector,
-        reviewer: a.policy.reviewer,
+        collector: observation.collector,
+        reviewer: observation.reviewer,
         consent_epoch: a.consent.epoch,
         nonce,
         expected_balance: report.expected_balance,
         amount: report.amount,
         valid_until: report.valid_until,
-        count_at: a.config.last_count_at,
-        refresher_epoch: a.config.refresher_epoch,
-        pause_started_at: a.config.pause_started_at,
+        count_at: observation.count_at,
+        refresher_epoch: observation.refresher_epoch,
+        pause_started_at: observation.pause_started_at,
+        observation_day: observation.observation_day,
         evidence_hash: report.evidence_hash,
         bump: ctx.bumps.permit,
     });
@@ -167,6 +192,7 @@ pub fn approved_amount(
             && permit.count_at == config.last_count_at
             && permit.refresher_epoch == config.refresher_epoch
             && permit.pause_started_at == config.pause_started_at
+            && permit.observation_day == now.div_euclid(86_400)
             && permit.evidence_hash != [0; 32],
         EndowmentError::InvalidCollection
     );
