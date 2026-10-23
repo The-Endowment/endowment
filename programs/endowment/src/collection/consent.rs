@@ -26,6 +26,16 @@ pub struct EnableCollection<'info> {
 }
 
 pub fn enable(ctx: Context<EnableCollection>) -> Result<()> {
+    enable_mode(ctx, false)
+}
+
+/// A distinct owner signature opts into history-based protection. Upgrading the
+/// program alone never changes a legacy holder's fixed-floor promise.
+pub fn enable_tracked(ctx: Context<EnableCollection>) -> Result<()> {
+    enable_mode(ctx, true)
+}
+
+fn enable_mode(ctx: Context<EnableCollection>, tracked: bool) -> Result<()> {
     let config = &ctx.accounts.config;
     require!(!config.retired && !config.milestone_reached, EndowmentError::Completed);
     let consent = &mut ctx.accounts.consent;
@@ -41,6 +51,7 @@ pub fn enable(ctx: Context<EnableCollection>) -> Result<()> {
     landlord.baseline = ctx.accounts.dividend_account.amount;
     landlord.index_at = config.reward_index;
     landlord.allowance = 0;
+    landlord.reserved[0] = u8::from(tracked);
     // Like re-approving the delegation, switching back on costs a count round.
     landlord.snapshot = 0;
     landlord.snapshot_valid = false;

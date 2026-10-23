@@ -17,6 +17,9 @@ pub struct EndowmentCreated {
 pub struct LandlordRegistered {
     pub config: Pubkey,
     pub owner: Pubkey,
+    /// Legacy mode: protected starting floor. Tracked mode: post-collection
+    /// checkpoint, not a floor. Read the owner's consent mode when interpreting
+    /// this existing event; CollectionHeld remains the custody receipt event.
     pub baseline: u64,
     pub coin_held: u64,
 }

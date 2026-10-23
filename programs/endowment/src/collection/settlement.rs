@@ -204,8 +204,10 @@ fn refund_memo(memo_program: Option<AccountInfo>) -> Result<()> {
     Ok(())
 }
 
-/// Raises the holder's baseline by a refund, so what came back stays theirs,
-/// and takes it out of their contribution total. A holder that has left has no
+/// Raises the legacy floor (or tracked checkpoint) by a refund and takes it
+/// out of the contribution total. Tracked workers must independently exclude
+/// refunds from eligibility; this checkpoint is not their spending authority.
+/// A holder that has left has no
 /// record (and nothing can be collected from it); rejoining sets a new baseline.
 #[inline(never)]
 fn protect_refund(info: &UncheckedAccount, config: &Pubkey, owner: &Pubkey, nonce: u64, refunded: u64) -> Result<()> {
