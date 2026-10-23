@@ -120,13 +120,15 @@ pub fn authorize(
         nonce == a.consent.next_nonce
             && report.consent_epoch == a.consent.epoch
             && report.expected_balance == a.dividend_account.amount
-            && report.amount > 0
             && report.valid_until > now
             && report.valid_until <= now.saturating_add(PERMIT_SECONDS)
             && report.evidence_hash != [0; 32],
         EndowmentError::InvalidCollection
     );
     a.config.settle_landlord(&mut a.landlord, now);
+    // Zero is an explicit revocation of a previous grant. It must remain
+    // possible after spending exhausts eligibility; all identity/context checks
+    // above still apply, and a zero permit cannot authorize a positive sweep.
     require!(
         report.amount
             <= a.dividend_account

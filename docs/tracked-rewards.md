@@ -24,6 +24,10 @@ The amount left after deducting eligible rewards is the holder's protected remai
 
 `authorize_collection(nonce, report, observation)` lets the configured reviewer create/update a `CollectionPermit` PDA at `["collection_permit", config, owner]`. No tokens move. It settles the current on-chain reward credit and refuses an amount above that credit, the delegated amount or the current balance. The reviewer funds the account rent once and later authorization fees.
 
+The reviewer can replace a permit with a smaller amount, including zero to revoke it. Zero still requires the authorized reviewer, current consent/nonce/balance and matching observation context; it grants no positive collection authority. Spending and repurchasing the same balance must trigger a reduction or revocation after independent history replay, not leave the old higher grant until expiry.
+
+Permit accounts are reused, not created per collection. This proposal does not close them after a holder leaves: the reviewer's rent stays in the per-wallet account, which holds no PUMP. Rent reclamation needs a separate lifecycle change that preserves nonce/consent replay protection. `Swept.baseline` remains the serialized Landlord field: a fixed floor in legacy mode, a checkpoint in tracked mode. Event consumers must check the consent mode; `CollectionHeld` retains its custody meaning.
+
 A permit contains config/owner, collector/reviewer, consent epoch, next collection nonce, exact current balance, amount, deadline, completed count timestamp, refresher epoch, pause timestamp, UTC observation day, evidence hash and PDA bump. The reviewer signs the observed roles, count, refresher epoch, pause timestamp and day in the instruction; they must still match when it executes. A delayed authorization cannot adopt a newer boundary. Its maximum life is ten minutes, covering a five-minute worker interval and a slow pass, and it cannot cross midnight. Each actual sweep report still expires within sixty seconds.
 
 For tracked holders, `sweep` requires this program-owned permit as the first remaining account. Every binding must match; the collector's requested amount cannot exceed the permit. The program then applies the existing balance, delegation, reward allowance, vault capacity, count, pause, goal and market checks. Accepted zero-amount and partial collections also consume the nonce, so unused permit capacity cannot be replayed. A successful token collection records the actual post-collection balance in `baseline` as a checkpoint, subsequently adjusted for refunds. It is no longer a fixed floor in this mode.
@@ -43,6 +47,8 @@ Daily/count observation-boundary resets and read-retry policy are unchanged in t
 ## Review and rollout
 
 Review both repositories together. Contract tests execute legacy and tracked sweeps, owner-only mode changes, below-floor rewards, authorization ceilings, nonce replay, changed balance/consent/count/refresher/roles/pause, delayed authorizations across a boundary, UTC day changes, wrong permits, expiry, partial/no-op collection and refunds. A public Rust-generated fixture checks the client ABI. Worker tests cover full history replay, purchases/refunds, spend-rebuy races, missing history, stale feed, durable authorization outboxes and persistent reviewer quarantine even when eligibility is zero.
+
+Regression tests also cover shrinking a same-balance permit, revoking it with zero even when reward credit is exhausted, normal wallet activity during authorization, and legacy re-enrollment while the tracked enrollment flag is on.
 
 Before any rollout: review the new trust/consent model and program build, test on an isolated deployment, and update both workers. Existing on-chain accounts and journals must remain intact. New tracked consent starts a fresh boundary and requires new eligibility/count checks. Do not backfill Roy's earlier payouts or lower his live floor as part of this PR.
 

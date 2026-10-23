@@ -364,8 +364,52 @@ fn reviewer_cannot_authorize_more_than_current_onchain_reward_credit() {
 }
 
 #[test]
+fn reviewer_can_shrink_or_revoke_a_permit_at_an_unchanged_balance() {
+    for remaining in [7, 0] {
+        let (mut env, owner, account) = tracked(100);
+        let key = permit_pda(&env, &owner.pubkey());
+        let r = report(&env, &owner.pubkey(), 20);
+        assert!(authorize(&mut env, &owner.pubkey(), 0, r, &reviewer()));
+        // The reviewer has replayed a spend and a purchase that restored the
+        // same balance. The old amount must not remain usable on chain.
+        env.set_balance(&account, 80);
+        env.airdrop_dividend(&account, 20);
+        let r = report(&env, &owner.pubkey(), remaining);
+        assert!(authorize(&mut env, &owner.pubkey(), 0, r, &reviewer()));
+        let r = report(&env, &owner.pubkey(), remaining + 1);
+        assert_err!(
+            collect(&mut env, &owner.pubkey(), 0, r, Some(key)),
+            InvalidCollection
+        );
+        assert_eq!(token_balance(&env.svm, &account), 100);
+        if remaining > 0 {
+            let r = report(&env, &owner.pubkey(), remaining);
+            assert!(collect(&mut env, &owner.pubkey(), 0, r, Some(key)));
+            assert_eq!(token_balance(&env.svm, &account), 100 - remaining);
+        }
+    }
+}
+
+#[test]
+fn reviewer_can_revoke_when_reward_credit_is_exhausted() {
+    let (mut env, owner, _) = tracked(100);
+    let r = report(&env, &owner.pubkey(), 20);
+    assert!(authorize(&mut env, &owner.pubkey(), 0, r, &reviewer()));
+    let key = landlord_pda(&env.config(), &owner.pubkey());
+    let mut account = env.svm.get_account(&key).unwrap();
+    let mut landlord = env.landlord_state(&owner.pubkey());
+    landlord.allowance = 0;
+    landlord.try_serialize(&mut &mut account.data[..]).unwrap();
+    env.svm.set_account(key, account).unwrap();
+    let r = report(&env, &owner.pubkey(), 0);
+    assert!(authorize(&mut env, &owner.pubkey(), 0, r, &reviewer()));
+    let permit = env.svm.get_account(&permit_pda(&env, &owner.pubkey())).unwrap();
+    assert_eq!(CollectionPermit::try_deserialize(&mut permit.data.as_slice()).unwrap().amount, 0);
+}
+
+#[test]
 fn malformed_or_unbounded_permits_cannot_be_created() {
-    for change in 0..7 {
+    for change in 0..6 {
         let (mut env, owner, _) = tracked(100);
         let mut r = report(&env, &owner.pubkey(), 20);
         let mut nonce = 0;
@@ -375,8 +419,7 @@ fn malformed_or_unbounded_permits_cannot_be_created() {
             2 => r.evidence_hash = [0; 32],
             3 => r.consent_epoch += 1,
             4 => r.expected_balance += 1,
-            5 => nonce = 1,
-            _ => r.amount = 0,
+            _ => nonce = 1,
         }
         assert_err!(
             authorize(&mut env, &owner.pubkey(), nonce, r, &reviewer()),
