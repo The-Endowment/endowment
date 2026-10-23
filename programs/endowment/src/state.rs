@@ -444,8 +444,9 @@ pub struct Landlord {
     pub dividend_account: Pubkey,
     /// The owner's coin associated token account, counted toward activation.
     pub coin_account: Pubkey,
-    /// Dividend the landlord keeps. Only the balance above this is swept. Only
-    /// the owner can change it (`resync_baseline`).
+    /// Fixed protection floor for legacy consent. With explicitly opted-in
+    /// tracked consent, this is the last post-collection balance checkpoint;
+    /// eligibility then requires an independent reviewer's short-lived permit.
     pub baseline: u64,
     pub total_contributed: u64,
     pub registered_at: i64,
@@ -487,11 +488,16 @@ pub struct Landlord {
     /// this separates leaving/rejoining even within one slot or second.
     pub first_collection_nonce: u64,
 
-    /// Room for future fields without a migration.
+    /// Byte 0: collection mode (0 = fixed floor, 1 = tracked rewards). Only an
+    /// owner-signed enable instruction chooses the mode. Remaining bytes unused.
     pub reserved: [u8; 20],
 }
 
 impl Landlord {
+    pub fn tracked_rewards(&self) -> bool {
+        self.reserved[0] == 1
+    }
+
     /// Adds what this landlord's counted coin earned since it was last settled
     /// to its allowance. Called before anything reads the allowance or changes
     /// `counted_amount`, so each stretch of time is credited at the amount that
@@ -519,7 +525,7 @@ impl Landlord {
         self.allowance = self.allowance.min(earned(reward_index.saturating_sub(carry_floor), earning));
     }
 
-    /// How much of `balance` is sweepable: only what sits above the baseline,
+    /// Legacy mode: how much of `balance` sits above the fixed baseline,
     /// capped by the remaining delegation. The baseline never moves here.
     pub fn sweepable(&self, balance: u64, delegated: u64) -> u64 {
         balance.saturating_sub(self.baseline).min(delegated)

@@ -78,6 +78,12 @@ pub mod endowment {
     pub fn enable_collection(ctx: Context<EnableCollection>) -> Result<()> {
         collection::consent::enable(ctx)
     }
+    pub fn enable_tracked_collection(ctx: Context<EnableCollection>) -> Result<()> {
+        collection::consent::enable_tracked(ctx)
+    }
+    pub fn authorize_collection(ctx: Context<AuthorizeCollection>, nonce: u64, report: CollectionReport) -> Result<()> {
+        collection::permit::authorize(ctx, nonce, report)
+    }
     pub fn disable_collection(ctx: Context<DisableCollection>) -> Result<()> {
         collection::consent::disable(ctx)
     }

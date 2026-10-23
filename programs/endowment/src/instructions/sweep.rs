@@ -164,11 +164,18 @@ pub fn handle_sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -
     let vault_cap = config.vault_cap();
     let (balance, delegated) = (dividend_account.amount, dividend_account.delegated_amount);
     let authority_bump = config.authority_bump;
+    let tracked = ctx.accounts.landlord.tracked_rewards();
+    let protection_limit = if tracked {
+        approved_amount(ctx.remaining_accounts.first(), &config_key, config, &ctx.accounts.policy,
+            &ctx.accounts.landlord.owner, consent, &report, now)?
+    } else {
+        ctx.accounts.landlord.sweepable(balance, delegated)
+    };
     let landlord = &mut ctx.accounts.landlord;
     // An omitted or invalidated balance cannot authorize a collection.
     config.settle_landlord(landlord, now);
-    let amount = landlord
-        .sweepable(balance, delegated)
+    let amount = protection_limit
+        .min(balance).min(delegated)
         .min(vault_cap.saturating_sub(committed))
         .min(report.amount)
         .min(landlord.allowance);
@@ -243,6 +250,11 @@ pub fn handle_sweep(ctx: Context<Sweep>, nonce: u64, report: CollectionReport) -
     });
 
     let landlord = &mut ctx.accounts.landlord;
+    if tracked {
+        // A checkpoint, not a permanently fixed floor. Future collections need
+        // another independently approved, nonce/balance-bound history report.
+        landlord.baseline = balance - amount;
+    }
     landlord.total_contributed = landlord
         .total_contributed
         .checked_add(amount)

@@ -4010,3 +4010,6 @@ mod count_outage;
 
 #[path = "regressions/incident_refunds.rs"]
 mod incident_refunds;
+
+#[path = "regressions/rolling_rewards.rs"]
+mod rolling_rewards;
